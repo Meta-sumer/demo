@@ -4,10 +4,10 @@
 # MongoDB Atlas (the free M0 tier is a replica set, so transactions work) and
 # paste its connection string when Render asks for MONGO_URI.
 #
-# The URLs below assume Render gives each service its own name as the
-# subdomain (https://<name>.onrender.com). If a name is taken Render adds a
-# suffix - then update CLIENT_URL / ADMIN_URL on the API and VITE_API_URL /
-# VITE_WS_URL on both static sites to the real addresses, and redeploy.
+# The URLs below are the addresses Render assigned. A name that was already
+# taken gets a suffix (the API is binary-trading-api-ih4v); if a service is
+# ever recreated under a new address, update CLIENT_URL / ADMIN_URL on the API
+# and VITE_API_URL / VITE_WS_URL on both static sites, and redeploy.
 
 services:
   # ---------------------------------------------------------------- API (Go)
@@ -71,9 +71,9 @@ services:
         destination: /index.html
     envVars:
       - key: VITE_API_URL
-        value: https://binary-trading-api.onrender.com
+        value: https://binary-trading-api-ih4v.onrender.com
       - key: VITE_WS_URL
-        value: wss://binary-trading-api.onrender.com/ws
+        value: wss://binary-trading-api-ih4v.onrender.com/ws
 
   # ------------------------------------------------------- admin console
   - type: web
@@ -87,9 +87,9 @@ services:
         destination: /index.html
     envVars:
       - key: VITE_API_URL
-        value: https://binary-trading-api.onrender.com
+        value: https://binary-trading-api-ih4v.onrender.com
       - key: VITE_WS_URL
-        value: wss://binary-trading-api.onrender.com/ws
+        value: wss://binary-trading-api-ih4v.onrender.com/ws
 
   # ---------------------------------------------------------------- Redis
   # Holds the expiry queue and live exposure counters, so nothing may be
