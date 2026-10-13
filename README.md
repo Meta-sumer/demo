@@ -504,4 +504,5 @@ behaviour most:
 | `WORKERS_ENABLED` | Set false on API-only replicas. |
 | `MONGO_PORT` | Host port for the dockerised MongoDB, if 27017 is taken. |
 #   b i n n a r y  
+ #   d e m o  
  
