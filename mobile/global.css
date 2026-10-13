@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * The theme variables themselves are not declared here: they are set on the
+ * root view from src/theme/tokens.ts, which is also what the Skia chart reads,
+ * so the palette has one source.
+ */
+
+@layer components {
+  .panel {
+    @apply rounded-xl border border-surface-700 bg-surface-900;
+  }
+}

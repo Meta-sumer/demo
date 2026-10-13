@@ -1,0 +1,29 @@
+{
+  "name": "binary-trading",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Binary options trading platform — client, admin (React) and a Go backend",
+  "workspaces": [
+    "client",
+    "admin"
+  ],
+  "engines": {
+    "node": ">=20.10.0"
+  },
+  "scripts": {
+    "dev": "npm-run-all --parallel dev:server dev:client dev:admin",
+    "dev:server": "node scripts/go.mjs run ./cmd/server",
+    "dev:client": "npm run dev --workspace client",
+    "dev:admin": "npm run dev --workspace admin",
+    "build": "node scripts/go.mjs build -o bin/server ./cmd/server && npm run build --workspace client && npm run build --workspace admin",
+    "typecheck": "node scripts/go.mjs vet ./... && npm run typecheck --workspace client && npm run typecheck --workspace admin",
+    "test": "node scripts/go.mjs test ./... && npm run test --workspace client",
+    "lint": "npm run lint --workspaces --if-present",
+    "infra:up": "docker compose up -d mongo redis",
+    "infra:down": "docker compose down",
+    "seed": "node scripts/go.mjs run ./cmd/seed"
+  },
+  "devDependencies": {
+    "npm-run-all": "^4.1.5"
+  }
+}

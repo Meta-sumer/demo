@@ -1,0 +1,72 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: bt-mongo
+    restart: unless-stopped
+    # Single-node replica set so that multi-document transactions are available.
+    # Settlement and wallet writes use them when ENABLE_MONGO_TRANSACTIONS=true.
+    #
+    # The port is parameterised so the stack can coexist with a MongoDB already
+    # bound to 27017 on the host: set MONGO_PORT in .env and the member is
+    # advertised on that same port, which keeps replica-set discovery correct.
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "${MONGO_PORT:-27017}"]
+    ports:
+      - "${MONGO_PORT:-27017}:${MONGO_PORT:-27017}"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mongosh",
+          "--quiet",
+          "--port",
+          "${MONGO_PORT:-27017}",
+          "--eval",
+          "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:${MONGO_PORT:-27017}'}]}).ok }",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: bt-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: ./server-go
+      dockerfile: Dockerfile
+    container_name: bt-server
+    restart: unless-stopped
+    profiles: ["full"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://mongo:${MONGO_PORT:-27017}/binary_trading?replicaSet=rs0
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "4000:4000"
+    volumes:
+      - uploads:/app/uploads
+
+volumes:
+  mongo-data:
+  redis-data:
+  uploads:

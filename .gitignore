@@ -1,0 +1,19 @@
+node_modules/
+dist/
+build/
+coverage/
+.env
+.env.local
+*.log
+.DS_Store
+.vite/
+.turbo/
+data/
+
+# Load-test account tokens
+loadtest-accounts.json
+uploads/
+
+# Go backend
+server-go/bin/
+server-go/uploads/
