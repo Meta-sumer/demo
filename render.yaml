@@ -1,0 +1,102 @@
+# Render Blueprint - API, trading client, admin console and Redis.
+#
+# MongoDB is not part of it: Render has no managed MongoDB. Create a cluster on
+# MongoDB Atlas (the free M0 tier is a replica set, so transactions work) and
+# paste its connection string when Render asks for MONGO_URI.
+#
+# The URLs below assume Render gives each service its own name as the
+# subdomain (https://<name>.onrender.com). If a name is taken Render adds a
+# suffix - then update CLIENT_URL / ADMIN_URL on the API and VITE_API_URL /
+# VITE_WS_URL on both static sites to the real addresses, and redeploy.
+
+services:
+  # ---------------------------------------------------------------- API (Go)
+  - type: web
+    name: binary-trading-api
+    runtime: docker
+    region: singapore
+    # Free instances sleep after 15 idle minutes, and the expiry and settlement
+    # workers sleep with them: trades due while it sleeps settle only once it
+    # wakes. Use `starter` or above for anything people actually trade on.
+    plan: free
+    dockerfilePath: ./server-go/Dockerfile
+    dockerContext: ./server-go
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: MONGO_URI
+        sync: false
+      - key: ENABLE_MONGO_TRANSACTIONS
+        value: "true"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: binary-trading-redis
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      # DEMO ONLY. The simulated feed is a random walk, not a real price - the
+      # server refuses it in production unless this override is set. Replace
+      # with a real MARKET_DATA_PROVIDER before taking real money.
+      - key: MARKET_DATA_PROVIDER
+        value: simulated
+      - key: ALLOW_SIMULATED_FEED_IN_PRODUCTION
+        value: "true"
+      # CORS: the API answers only these two origins.
+      - key: CLIENT_URL
+        value: https://binary-trading-client.onrender.com
+      - key: ADMIN_URL
+        value: https://binary-trading-admin.onrender.com
+    # Deposit screenshots are written to /app/uploads. Without a disk they are
+    # lost on every deploy or restart. Disks need a paid plan:
+    # disk:
+    #   name: uploads
+    #   mountPath: /app/uploads
+    #   sizeGB: 1
+
+  # ---------------------------------------------------- trading client (web)
+  - type: web
+    name: binary-trading-client
+    runtime: static
+    buildCommand: npm ci && npm run build --workspace client
+    staticPublishPath: ./client/dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        value: https://binary-trading-api.onrender.com
+      - key: VITE_WS_URL
+        value: wss://binary-trading-api.onrender.com/ws
+
+  # ------------------------------------------------------- admin console
+  - type: web
+    name: binary-trading-admin
+    runtime: static
+    buildCommand: npm ci && npm run build --workspace admin
+    staticPublishPath: ./admin/dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        value: https://binary-trading-api.onrender.com
+      - key: VITE_WS_URL
+        value: wss://binary-trading-api.onrender.com/ws
+
+  # ---------------------------------------------------------------- Redis
+  # Holds the expiry queue and live exposure counters, so nothing may be
+  # evicted. Reachable only from the services above.
+  - type: keyvalue
+    name: binary-trading-redis
+    region: singapore
+    plan: free
+    maxmemoryPolicy: noeviction
+    ipAllowList: []
