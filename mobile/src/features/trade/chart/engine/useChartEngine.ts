@@ -3,6 +3,7 @@ import { Gesture } from 'react-native-gesture-handler';
 import {
   cancelAnimation,
   runOnJS,
+  useAnimatedReaction,
   useDerivedValue,
   useSharedValue,
   withDecay,
@@ -80,7 +81,10 @@ export interface ChartEngine {
   setRestingOffset: (offset: number) => void;
   /** Zooms by a factor: about the live edge when following, about the middle otherwise. */
   zoom: (factor: number, min?: number, max?: number) => void;
-  /** Every bar on screen. */
+  /**
+   * Every bar on screen. Deferred until there are bars and a size to fit
+   * them into, so it can be asked for in the same breath as the data is set.
+   */
   fitContent: () => void;
   showCrosshairAt: (x: number, y: number) => void;
   hideCrosshair: () => void;
@@ -146,6 +150,23 @@ export function useChartEngine(options: EngineOptions): ChartEngine {
   const panStart = useSharedValue({ offset: 0, spacing: 0, axis: false });
   const pinchStart = useSharedValue({ offset: 0, spacing: 0, logical: 0, x: 0, follow: false });
   const pinching = useSharedValue(false);
+  const fitPending = useSharedValue(false);
+
+  // A fit asked for before the data or the layout has landed waits for both.
+  useAnimatedReaction(
+    () => fitPending.value && view.value.count > 0 && view.value.pw > 0,
+    (ready) => {
+      if (!ready) return;
+      const current = view.value;
+      const resting = restingOffset.value;
+      const raw = current.pw / (current.count + resting);
+      cancelAnimation(rightOffset);
+      cancelAnimation(spacing);
+      spacing.value = raw < minSpacing ? minSpacing : raw > maxSpacing ? maxSpacing : raw;
+      rightOffset.value = resting;
+      fitPending.value = false;
+    },
+  );
 
   const gesture = useMemo(() => {
     const placeCrosshair = (x: number, y: number) => {
@@ -157,8 +178,11 @@ export function useChartEngine(options: EngineOptions): ChartEngine {
       crosshair.value = { visible: true, index: indexAt(current, cx), y: cy };
     };
 
+    // Horizontal only: a scroll moves time, and a vertical drag is left to
+    // whatever the chart sits in - the trade window lives in a scrolling page.
     const pan = Gesture.Pan()
-      .minDistance(6)
+      .activeOffsetX([-6, 6])
+      .failOffsetY([-12, 12])
       .onStart((event) => {
         const current = view.value;
         cancelAnimation(rightOffset);
@@ -285,13 +309,8 @@ export function useChartEngine(options: EngineOptions): ChartEngine {
   );
 
   const fitContent = useCallback(() => {
-    const current = view.value;
-    if (current.count === 0 || current.pw <= 0) return;
-    const resting = restingOffset.value;
-    const next = Math.max(minSpacing, Math.min(maxSpacing, current.pw / (current.count + resting)));
-    spacing.value = next;
-    rightOffset.value = resting;
-  }, [view, spacing, rightOffset, restingOffset, minSpacing, maxSpacing]);
+    fitPending.value = true;
+  }, [fitPending]);
 
   const showCrosshairAt = useCallback(
     (x: number, y: number) => {

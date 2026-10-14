@@ -317,6 +317,7 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
       watermark: demo ? withAlpha(palette.strongText, WATERMARK_ALPHA[palette.theme]) : null,
       digits,
       lastPrice: true,
+      magnet: true,
     };
     engine.closeOnly.value = chartType === 'line' || chartType === 'area';
     engine.minMove.value = 1 / 10 ** digits;
@@ -346,9 +347,12 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
    */
   const mainAxisRef = useRef(0);
   const paneAxesRef = useRef(new Map<Oscillator, number>());
+  const appliedAxisRef = useRef(0);
   const applyAxisWidth = useCallback(() => {
     const widest = Math.max(44, mainAxisRef.current, ...paneAxesRef.current.values());
     const rounded = Math.ceil(widest);
+    if (rounded === appliedAxisRef.current) return;
+    appliedAxisRef.current = rounded;
     engine.axisW.value = rounded;
     setAxisWidth(rounded);
   }, [engine]);

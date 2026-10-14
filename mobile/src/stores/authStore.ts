@@ -31,13 +31,26 @@ export const useAuthStore = create<AuthState>((set) => ({
       return;
     }
     set({ status: 'loading' });
-    try {
-      const { user, wallet } = await api.auth.me();
-      set({ status: 'authenticated', user, wallet, error: null });
-    } catch {
-      clearTokens();
-      set({ status: 'anonymous', user: null, wallet: null });
+    // A phone opens the app on a flaky connection far more often than a
+    // browser opens a tab, and a sleeping server takes a while to answer its
+    // first request. One retry covers both before giving up.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const { user, wallet } = await api.auth.me();
+        set({ status: 'authenticated', user, wallet, error: null });
+        return;
+      } catch (err) {
+        const status = (err as { status?: number }).status ?? 0;
+        if (status === 401 || status === 403) {
+          clearTokens();
+          break;
+        }
+        // Unreachable is not refused: the stored session is kept, so the next
+        // launch can still restore it instead of asking to sign in again.
+        if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
     }
+    set({ status: 'anonymous', user: null, wallet: null });
   },
 
   async login(email, password) {

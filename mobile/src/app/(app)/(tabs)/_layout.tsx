@@ -4,6 +4,9 @@ import { TopBar } from '../../../components/TopBar';
 import { BottomNav } from '../../../components/BottomNav';
 import { useTokenColor } from '../../../utils/theme-colors';
 
+/** Signing in, or arriving from a deep link to a pushed screen, lands on Home. */
+export const unstable_settings = { initialRouteName: 'home' };
+
 /**
  * Primary destinations (brief section 5): Home · Markets · Trade · Trades ·
  * Account, under one top bar.

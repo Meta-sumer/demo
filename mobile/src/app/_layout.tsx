@@ -9,8 +9,14 @@ import { ThemeRoot } from '../theme/ThemeRoot';
 import { useAuthStore } from '../stores/authStore';
 import { initTokens, setUnauthorisedHandler } from '../services/http';
 import { useTokenColor } from '../utils/theme-colors';
+import { API_URL } from '../config';
 
 void SplashScreen.preventAutoHideAsync();
+
+// The deployed API sleeps when idle and takes a while to answer its first
+// request. Knocking now means it is usually awake by the time someone has
+// typed their password. Nothing waits on the answer.
+fetch(API_URL + '/health').catch(() => undefined);
 
 const queryClient = new QueryClient({
   defaultOptions: {

@@ -7,6 +7,9 @@ import { SettingsDrawer } from '../../components/SettingsDrawer';
 import { TradeResultToasts } from '../../features/trade/TradeResultToasts';
 import { useTokenColor } from '../../utils/theme-colors';
 
+/** A pushed screen opened from a link still has the tabs under it to go back to. */
+export const unstable_settings = { initialRouteName: '(tabs)' };
+
 /**
  * The signed-in shell.
  *

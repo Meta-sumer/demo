@@ -17,7 +17,7 @@ import {
   tag,
   verticalGradient,
 } from './paint';
-import { priceMarks, timeMarks, yOf } from './scale';
+import { priceAt, priceMarks, timeMarks, yOf } from './scale';
 import type { Crosshair, OverlayLine, SeriesData, View, ZoneInfo } from './types';
 
 /**
@@ -55,6 +55,20 @@ export interface MainStyle {
   digits: number;
   /** Show the last price's line and tag. */
   lastPrice: boolean;
+  /**
+   * The crosshair's horizontal line snaps to the bar's close (lightweight-
+   * charts' magnet mode, the price chart) or follows the finger (normal mode,
+   * the trade window).
+   */
+  magnet: boolean;
+}
+
+/** A horizontal price line with its value on the axis and a title beside it - the trade window's entry barrier. */
+export interface PriceLevel {
+  price: number;
+  color: string;
+  textColor: string;
+  title: string;
 }
 
 export interface MainFonts {
@@ -75,6 +89,7 @@ export function paintMain(
   cross: Crosshair,
   zone: ZoneInfo,
   fonts: MainFonts,
+  levels?: ReadonlyArray<PriceLevel>,
 ): void {
   'worklet';
   if (view.w <= 0 || view.h <= 0) return;
@@ -137,6 +152,15 @@ export function paintMain(
     }
   }
 
+  // Price levels.
+  if (levels && view.ok) {
+    for (let k = 0; k < levels.length; k += 1) {
+      const level = levels[k]!;
+      const ly = y(level.price);
+      if (ly >= 0 && ly <= view.ph) hLine(canvas, view, ly, level.color, null);
+    }
+  }
+
   // The last price's line.
   const n = series.c.length;
   const lastClose = n > 0 ? series.c[n - 1]! : Number.NaN;
@@ -153,10 +177,17 @@ export function paintMain(
   // The crosshair's lines.
   let crossY = Number.NaN;
   let crossX = Number.NaN;
+  let crossPrice = Number.NaN;
   if (cross.visible && view.ok && cross.index >= 0 && cross.index < view.count) {
     crossX = crisp(view.x0 + cross.index * view.s);
-    const close = series.c[cross.index]!;
-    crossY = close === close ? y(close) : Number.NaN;
+    if (style.magnet) {
+      const close = series.c[cross.index]!;
+      crossPrice = close;
+      crossY = close === close ? y(close) : Number.NaN;
+    } else {
+      crossY = cross.y;
+      crossPrice = priceAt(view, cross.y);
+    }
     const dashed = strokePaint(style.crosshair, 1, LARGE_DASHED);
     canvas.drawLine(crossX, 0, crossX, view.ph, dashed);
     if (crossY === crossY) canvas.drawLine(0, crisp(crossY), view.pw, crisp(crossY), dashed);
@@ -191,6 +222,20 @@ export function paintMain(
     }
   }
 
+  // The levels' values on the axis, and their titles beside it.
+  if (levels && view.ok) {
+    for (let k = 0; k < levels.length; k += 1) {
+      const level = levels[k]!;
+      const ly = y(level.price);
+      if (ly < 0 || ly > view.ph) continue;
+      tag(canvas, font, priceText(level.price, style.digits), view.pw + 1, ly, 'left', level.color, level.textColor, { padX: 5, radius: 2 });
+      if (level.title) {
+        const width = font.getTextWidth(level.title);
+        canvas.drawText(level.title, view.pw - 6 - width, ly - 4, fillPaint(level.color), font);
+      }
+    }
+  }
+
   // The last price's tag on the axis.
   if (style.lastPrice && lastY === lastY) {
     const clamped = lastY < 8 ? 8 : lastY > view.ph - 8 ? view.ph - 8 : lastY;
@@ -202,7 +247,7 @@ export function paintMain(
 
   // The crosshair's tags, over the axis labels.
   if (crossY === crossY && crossY >= 0 && crossY <= view.ph) {
-    tag(canvas, font, priceText(series.c[cross.index]!, style.digits), view.pw + 1, crossY, 'left', style.crosshair, style.crosshairText, {
+    tag(canvas, font, priceText(crossPrice, style.digits), view.pw + 1, crossY, 'left', style.crosshair, style.crosshairText, {
       padX: 5,
       radius: 2,
     });
