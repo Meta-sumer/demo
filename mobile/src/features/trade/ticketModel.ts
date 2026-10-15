@@ -92,6 +92,55 @@ export function durationRow(chips: DurationChip[], selected: number, max = MAX_D
   return { chips: shown, hidden: chips.length - shown.length };
 }
 
+/**
+ * "30 sec", "1 min", "1 min 30 sec", "1 hour", "1 hour 30 min": a duration in
+ * words, for the small line under each choice in the Time sheet, where the big
+ * line is the clock time the trade would end at.
+ */
+export function durationWords(seconds: number): string {
+  if (seconds < 60) return seconds + ' sec';
+  if (seconds < 3600) {
+    const minutes = Math.floor(seconds / 60);
+    const rest = seconds % 60;
+    return rest ? minutes + ' min ' + rest + ' sec' : minutes + ' min';
+  }
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.round((seconds % 3600) / 60);
+  return hours + (hours === 1 ? ' hour' : ' hours') + (minutes ? ' ' + minutes + ' min' : '');
+}
+
+export interface ExpiryGroup {
+  key: 'short' | 'medium' | 'long';
+  label: string;
+  /** Shortest first, as `durationChips` gives them. */
+  chips: DurationChip[];
+}
+
+/**
+ * The Time sheet's sections: up to five minutes, up to an hour, and longer.
+ *
+ * Every chip lands in exactly one section, so no duration the asset offers can
+ * fall out of the sheet. The middle section is named for what it holds - "15–60
+ * min." when its shortest choice is 15 minutes, as on the platforms traders
+ * know, and "5–60 min." when the asset offers something in between. Empty
+ * sections are left out.
+ */
+export function expiryGroups(chips: DurationChip[]): ExpiryGroup[] {
+  const short = chips.filter((chip) => chip.seconds <= 300);
+  const medium = chips.filter((chip) => chip.seconds > 300 && chip.seconds <= 3600);
+  const long = chips.filter((chip) => chip.seconds > 3600);
+  const groups: ExpiryGroup[] = [
+    { key: 'short', label: 'Up to 5 min.', chips: short },
+    {
+      key: 'medium',
+      label: medium.every((chip) => chip.seconds >= 900) ? '15–60 min.' : '5–60 min.',
+      chips: medium,
+    },
+    { key: 'long', label: 'Over 1 hour', chips: long },
+  ];
+  return groups.filter((group) => group.chips.length > 0);
+}
+
 /* -------------------------------------------------------------- stake limits */
 
 export interface StakeLimits {

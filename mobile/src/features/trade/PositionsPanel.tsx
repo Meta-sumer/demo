@@ -51,7 +51,7 @@ import type { Trade } from '../../types/api';
  * place to show its full terms (record 17, Pocket Option) - the detail screen
  * is one link further for everything else.
  *
- * On a phone this is the body of the sheet the ticket's Trades button opens.
+ * On a phone this is the body of the sheet the ticket's trade history button opens.
  * `onNavigate` runs before it leaves for another screen, so that sheet can
  * close first rather than stay over the screen it opened.
  */

@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
-import { ActivityIndicator, Keyboard, Pressable, ScrollView, TextInput, View } from 'react-native';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Keyboard, Pressable, ScrollView, View } from 'react-native';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { randomUUID } from 'expo-crypto';
 import * as Haptics from 'expo-haptics';
 import Animated, { useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
-import { ArrowDown, ArrowUp, CircleHelp, History, Minus, Plus, WifiOff } from 'lucide-react-native';
+import { ArrowDown, ArrowUp, CircleHelp, History, WifiOff } from 'lucide-react-native';
 import { api } from '../../services/api';
 import { ApiRequestError } from '../../services/http';
 import { useSettingsStore, type TradeMode } from '../../stores/settingsStore';
@@ -14,15 +14,17 @@ import { useAccountStore } from '../../stores/accountStore';
 import { useOrderPreviewStore, type PreviewDraft } from '../../stores/orderPreviewStore';
 import { currencySymbolFor, formatMoney, formatMoneyCompact, formatPrice } from '../../utils/format';
 import { cn } from '../../utils/cn';
-import { useTokenColor } from '../../utils/theme-colors';
 import { toast } from '../../hooks/useToast';
+import { useNow } from '../../hooks/useCountdown';
 import { Icon, Text } from '../../components/ui';
+import { ActiveTradesBadge } from '../../components/BottomNav';
 import { openFunds, useResetDemo } from '../account/funds';
 import { ContractInfo, type ContractSummary } from './ContractInfo';
 import { ConfirmTradeSheet } from './ConfirmTradeSheet';
-import { DurationSheet } from './DurationSheet';
+import { AmountSheet } from './AmountSheet';
+import { TimeSheet } from './TimeSheet';
 import { HowItWorksSheet } from './HowItWorks';
-import { DemoTag } from './tradeBits';
+import { DemoTag, useClockFormatter } from './tradeBits';
 import { useTicketStore } from './ticketStore';
 import { useTradingWallet } from './useTradingWallet';
 import { useConnectionState } from './useConnectionState';
@@ -33,12 +35,10 @@ import {
   amountStep,
   amountText,
   durationChips,
-  durationRow,
   parseAmount,
   pickDuration,
   stakeLimits,
   stepAmount,
-  type DurationChip,
 } from './ticketModel';
 import type { Asset, AssetSentiment, Direction } from '../../types/api';
 
@@ -65,18 +65,21 @@ import type { Asset, AssetSentiment, Direction } from '../../types/api';
  *     price it actually used.
  *
  * On a phone the ticket is docked under the chart, which keeps its own pan
- * and pinch, so nothing here may scroll the chart away. The set-up part -
- * duration, investment, contract information - scrolls inside the ticket when
- * the screen is short, while what stops a trade and the UP and DOWN buttons
- * stay pinned at the bottom, always in reach of the thumb.
+ * and pinch, so nothing here may scroll the chart away. Amount and time are
+ * one compact row, the way Binomo's mobile app lays them out - the Amount box,
+ * the trade history button, the Time box - and each box opens a sheet to
+ * change it. The set-up part - that row, the contract information - scrolls
+ * inside the ticket when the screen is short, while what stops a trade and
+ * the UP and DOWN buttons stay pinned at the bottom, always in reach of the
+ * thumb.
  */
 interface Props {
   asset: Asset | null;
   mode: TradeMode;
-  /** Whether the positions sheet is open. */
+  /** Whether the positions sheet (trade history) is open. */
   tradesOpen: boolean;
   onToggleTrades: () => void;
-  /** Open positions on this account, for the count on the Trades button. */
+  /** Open positions on this account, for the count on the trade history button. */
   openCount: number;
 }
 
@@ -132,11 +135,8 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
    */
   const sendingRef = useRef(false);
   const scrollRef = useRef<ScrollView | null>(null);
-  /** Where the investment block starts inside the ticket's scroll area. */
-  const investmentY = useRef(0);
-  const amountRef = useRef<TextInput | null>(null);
-  const [amountFocused, setAmountFocused] = useState(false);
-  const [durationsOpen, setDurationsOpen] = useState(false);
+  const [amountOpen, setAmountOpen] = useState(false);
+  const [timeOpen, setTimeOpen] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
 
   // The price this ticket is showing, which is what the guard compares against.
@@ -144,7 +144,6 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
     useMarketStore((s) => (asset ? s.ticks[asset.id]?.price : undefined)) ?? asset?.feed.lastPrice ?? null;
 
   const chips = useMemo(() => durationChips(asset), [asset]);
-  const row = useMemo(() => durationRow(chips, expirySeconds), [chips, expirySeconds]);
 
   // A duration the asset does not offer is replaced, without touching the
   // trader's saved default - another asset may still offer it.
@@ -155,7 +154,7 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
   }, [chips, expirySeconds]);
 
   // The durations belong to the asset they were listed for.
-  useEffect(() => setDurationsOpen(false), [asset?.id]);
+  useEffect(() => setTimeOpen(false), [asset?.id]);
 
   useEffect(() => setReQuote(null), [asset?.id, expirySeconds, text]);
 
@@ -175,14 +174,12 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
     setConfirming(null);
   }, [asset?.id, account, clearIntent]);
 
-  // "Trade Again" from a result: bring the amount into view, ready to change.
+  // "Trade Again" from a result: bring the amount into view, ready to change -
+  // the Amount sheet, its field focused with the amount selected.
   useEffect(() => {
     if (focusRequest === 0) return;
-    scrollRef.current?.scrollTo({ y: investmentY.current, animated: true });
-    const input = amountRef.current;
-    if (!input) return;
-    input.focus();
-    input.setSelection(0, useTicketStore.getState().amountText.length);
+    scrollRef.current?.scrollTo({ y: 0, animated: true });
+    setAmountOpen(true);
   }, [focusRequest]);
 
   const payout = useMemo(
@@ -416,9 +413,34 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
    */
   const currencySymbol = currencySymbolFor(currency);
   const selectedChip = chips.find((chip) => chip.seconds === expirySeconds);
-  // At least three columns, as the web's grid: two chips never stretch to half the row each.
-  const cells = row.chips.length + (row.hidden > 0 ? 1 : 0);
-  const spacers = Math.max(0, 3 - cells);
+  // The Amount box shows what the sheet holds: the amount when it reads as
+  // one, otherwise exactly what was typed, with the box marked as wrong.
+  const amountShown = parsed !== null ? formatMoneyCompact(parsed, currency) : currencySymbol + (text.trim() || '0');
+
+  /** What is wrong with the amount, and the one thing that fixes a short balance. */
+  const amountProblem = amountError ? (
+    <View accessibilityRole="alert" className="flex-row flex-wrap items-center gap-x-1.5">
+      <Text className="text-[11px] font-medium text-down">{amountError}</Text>
+      {amount.kind === 'insufficient' ? (
+        account === 'LIVE' ? (
+          <Pressable onPress={() => openFunds('DEPOSIT')} hitSlop={6} accessibilityRole="button">
+            <Text className="text-[11px] font-bold text-accent">Deposit</Text>
+          </Pressable>
+        ) : (
+          <Pressable
+            onPress={() => resetDemo.mutate()}
+            disabled={resetDemo.isPending}
+            hitSlop={6}
+            accessibilityRole="button"
+            accessibilityState={{ disabled: resetDemo.isPending }}
+            className={resetDemo.isPending ? 'opacity-50' : undefined}
+          >
+            <Text className="text-[11px] font-bold text-accent">Reset demo balance</Text>
+          </Pressable>
+        )
+      ) : null}
+    </View>
+  ) : null;
 
   return (
     <View className="shrink border-t border-surface-800 bg-surface-900">
@@ -440,198 +462,87 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
         keyboardDismissMode="on-drag"
         showsVerticalScrollIndicator={false}
       >
-        {/* Duration (UX-07). The duration is the value; the clock time it
-            expires at is in the contract information below. Four chips at
-            most: the rest, and the same choice written as end times, are behind
-            "More" (reference record 10). */}
-        <View accessibilityLabel="Duration">
-          <View className="mb-1.5 flex-row items-center justify-between gap-2">
-            <Text className="text-[11px] font-semibold uppercase tracking-wider text-content-400">Duration</Text>
-            {/* The in-context guide (reference record 19, Deriv's "How to trade
-                Rise/Fall?"): on the ticket's first line, where a first-time
-                trader starts reading, and on the heading's own line so it
-                costs no height. */}
-            <Pressable
-              onPress={() => setGuideOpen(true)}
-              hitSlop={8}
-              accessibilityRole="button"
-              accessibilityState={{ expanded: guideOpen }}
-              className="-my-1 flex-row items-center gap-1 py-1"
-            >
-              <Icon as={CircleHelp} size={14} className="text-accent" />
-              <Text className="text-[11px] font-semibold text-accent">How a trade works</Text>
-            </Pressable>
+        {/* The guide and the balance the amount is checked against, on one
+            small line over the controls they explain. The guide is the
+            in-context help (reference record 19, Deriv's "How to trade
+            Rise/Fall?"), where a first-time trader starts reading. */}
+        <View className="flex-row items-center justify-between gap-2">
+          <Pressable
+            onPress={() => setGuideOpen(true)}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityState={{ expanded: guideOpen }}
+            className="-my-1 flex-row items-center gap-1 py-1"
+          >
+            <Icon as={CircleHelp} size={14} className="text-accent" />
+            <Text className="text-[11px] font-semibold text-accent">How a trade works</Text>
+          </Pressable>
+          <View className="min-w-0 shrink flex-row items-center gap-1">
+            <DemoTag account={account} />
+            <Text numberOfLines={1} className="shrink text-[11px] text-content-400">
+              Available{' '}
+              <Text className="text-[11px] font-semibold tnum text-content-200">
+                {available !== null ? formatMoney(available, currency) : '--'}
+              </Text>
+            </Text>
           </View>
-          {chips.length === 0 ? (
-            <Text className="text-xs text-content-400">No durations available for this asset.</Text>
-          ) : (
-            <View className="flex-row gap-1.5">
-              {row.chips.map((chip) => (
-                <DurationButton
-                  key={chip.seconds}
-                  chip={chip}
-                  selected={chip.seconds === expirySeconds}
-                  onSelect={() => setExpiry(chip.seconds)}
-                />
-              ))}
-              {row.hidden > 0 ? (
-                <Pressable
-                  onPress={() => setDurationsOpen((open) => !open)}
-                  accessibilityRole="button"
-                  accessibilityState={{ expanded: durationsOpen }}
-                  accessibilityLabel={'More durations, ' + chips.length + ' in all'}
-                  className={cn(
-                    'min-w-0 flex-1 items-center rounded-lg border px-1 py-1.5',
-                    durationsOpen
-                      ? 'border-accent bg-accent/10'
-                      : 'border-dashed border-surface-600 bg-surface-850 active:border-surface-500',
-                  )}
-                >
-                  <Text
-                    className={cn(
-                      'text-sm font-bold leading-tight',
-                      durationsOpen ? 'text-content-100' : 'text-content-200',
-                    )}
-                  >
-                    More
-                  </Text>
-                  <Text className="text-[10px] font-semibold leading-tight tnum text-content-400">+{row.hidden}</Text>
-                </Pressable>
-              ) : null}
-              {Array.from({ length: spacers }, (_, index) => (
-                <View key={'spacer' + index} className="flex-1" />
-              ))}
-            </View>
-          )}
-          {selectedChip?.unavailableReason ? (
-            <Text className="mt-1 text-[11px] text-down">{selectedChip.unavailableReason}</Text>
-          ) : chips.some((chip) => chip.unavailableReason) ? (
-            <Text className="mt-1 text-[11px] text-content-400">Greyed durations have no payout on this asset.</Text>
-          ) : null}
         </View>
 
-        {/* Investment (UX-08). */}
-        <View
-          onLayout={(event) => {
-            investmentY.current = event.nativeEvent.layout.y;
-          }}
-        >
-          <View className="mb-1.5 flex-row items-center justify-between gap-2">
-            <Text className="text-[11px] font-semibold uppercase tracking-wider text-content-400">Investment</Text>
-            <View className="min-w-0 shrink flex-row items-center gap-1">
-              <DemoTag account={account} />
-              <Text numberOfLines={1} className="shrink text-[11px] text-content-400">
-                Available{' '}
-                <Text className="text-[11px] font-semibold tnum text-content-200">
-                  {available !== null ? formatMoney(available, currency) : '--'}
-                </Text>
-              </Text>
-            </View>
-          </View>
-
-          <View
-            className={cn(
-              'flex-row items-center gap-1 rounded-xl border bg-surface-850 p-1',
-              amountError ? 'border-down/60' : amountFocused ? 'border-accent' : 'border-surface-700',
-            )}
-          >
-            <StepButton
-              label="Decrease investment"
-              disabled={parsed !== null && parsed <= limits.min}
-              onPress={() => writeAmount(stepAmount(parsed, -amountStep(parsed === null ? null : parsed - 1), limits))}
-            >
-              <Icon as={Minus} size={16} className="text-content-300" />
-            </StepButton>
-            {/* The symbol is its own element rather than part of the value: a
-                currency prefix inside the field would be editable, and deleting
-                it - or typing in front of it - would fight the caret on every
-                keystroke. Tapping anywhere across the middle focuses the field. */}
+        {/* Investment (UX-08) and duration (UX-07) as one row, the way Binomo
+            lays them out: the Amount box, trade history, the Time box. Each
+            box opens a sheet to change it. */}
+        <View>
+          <View className="h-14 flex-row gap-2">
             <Pressable
-              onPress={() => amountRef.current?.focus()}
-              accessible={false}
-              className="min-w-0 flex-1 flex-row items-center justify-center gap-0.5"
+              onPress={() => setAmountOpen(true)}
+              accessibilityRole="button"
+              accessibilityLabel={'Amount, ' + amountShown}
+              accessibilityHint={amountError ? amountError + '. Opens the amount' : 'Opens the amount'}
+              className={cn(
+                'min-w-0 flex-1 justify-center rounded-xl border bg-surface-850 px-3 active:bg-surface-800',
+                amountError ? 'border-down/60' : 'border-surface-700',
+              )}
             >
-              <Text importantForAccessibility="no" className="text-lg font-bold tnum text-content-100">
-                {currencySymbol}
+              <Text className="text-[11px] text-content-400">Amount</Text>
+              <Text numberOfLines={1} className="text-lg font-bold leading-6 tnum text-content-100">
+                {amountShown}
               </Text>
-              <AmountInput
-                ref={amountRef}
-                value={text}
-                invalid={!!amountError}
-                onFocus={() => setAmountFocused(true)}
-                onBlur={() => setAmountFocused(false)}
-                onChangeText={(next) => {
-                  setText(next);
-                  const value = parseAmount(next);
-                  if (value !== null && value > 0) setDefaultStake(value);
-                }}
-              />
             </Pressable>
-            <StepButton
-              label="Increase investment"
-              disabled={parsed !== null && parsed >= limits.max}
-              onPress={() => writeAmount(stepAmount(parsed, amountStep(parsed), limits))}
+
+            {/* Trade history: the positions sheet, with its Active and History
+                tabs. Carries the open count, so a running trade is still
+                visible while the sheet is shut. */}
+            <Pressable
+              onPress={onToggleTrades}
+              accessibilityRole="button"
+              accessibilityState={{ expanded: tradesOpen }}
+              accessibilityLabel={'Trade history' + (openCount > 0 ? ', ' + openCount + ' active' : '')}
+              className={cn(
+                'relative h-14 w-14 items-center justify-center rounded-xl border',
+                tradesOpen ? 'border-accent/50 bg-surface-700' : 'border-surface-700 bg-surface-800 active:bg-surface-700',
+              )}
             >
-              <Icon as={Plus} size={16} className="text-content-300" />
-            </StepButton>
+              <Icon as={History} size={22} className={tradesOpen ? 'text-content-100' : 'text-content-200'} />
+              <ActiveTradesBadge count={openCount} className="-right-1 -top-1" />
+            </Pressable>
+
+            <TimeBox
+              expirySeconds={chips.length > 0 ? expirySeconds : null}
+              unavailable={!!selectedChip?.unavailableReason}
+              onPress={() => setTimeOpen(true)}
+            />
           </View>
 
-          {presets.length > 0 ? (
-            <View className="mt-1.5 flex-row flex-wrap gap-1">
-              {presets.map((preset) => {
-                const chosen = stake === preset.value;
-                return (
-                  <Pressable
-                    key={(preset.isMax ? 'max:' : '') + preset.value}
-                    onPress={() => writeAmount(preset.value)}
-                    accessibilityRole="button"
-                    accessibilityState={{ selected: chosen }}
-                    accessibilityHint={
-                      preset.isMax ? 'The most you can invest now: ' + formatMoney(preset.value, currency) : undefined
-                    }
-                    className={cn(
-                      'rounded-md border px-2.5 py-1',
-                      chosen ? 'border-accent/60 bg-accent/20' : 'border-transparent bg-surface-850 active:bg-surface-800',
-                    )}
-                  >
-                    <Text
-                      className={cn('text-[11px] font-semibold tnum', chosen ? 'text-content-100' : 'text-content-300')}
-                    >
-                      {preset.isMax ? 'Max' : formatMoneyCompact(preset.value, currency)}
-                    </Text>
-                  </Pressable>
-                );
-              })}
+          {chips.length === 0 || selectedChip?.unavailableReason || amountProblem ? (
+            <View className="mt-1.5 gap-1">
+              {chips.length === 0 ? (
+                <Text className="text-[11px] text-content-400">No durations available for this asset.</Text>
+              ) : selectedChip?.unavailableReason ? (
+                <Text className="text-[11px] text-down">{selectedChip.unavailableReason}</Text>
+              ) : null}
+              {amountProblem}
             </View>
           ) : null}
-
-          {amountError ? (
-            <View accessibilityRole="alert" className="mt-1.5 flex-row flex-wrap items-center gap-x-1.5">
-              <Text className="text-[11px] font-medium text-down">{amountError}</Text>
-              {amount.kind === 'insufficient' ? (
-                account === 'LIVE' ? (
-                  <Pressable onPress={() => openFunds('DEPOSIT')} hitSlop={6} accessibilityRole="button">
-                    <Text className="text-[11px] font-bold text-accent">Deposit</Text>
-                  </Pressable>
-                ) : (
-                  <Pressable
-                    onPress={() => resetDemo.mutate()}
-                    disabled={resetDemo.isPending}
-                    hitSlop={6}
-                    accessibilityRole="button"
-                    accessibilityState={{ disabled: resetDemo.isPending }}
-                    className={resetDemo.isPending ? 'opacity-50' : undefined}
-                  >
-                    <Text className="text-[11px] font-bold text-accent">Reset demo balance</Text>
-                  </Pressable>
-                )
-              ) : null}
-            </View>
-          ) : (
-            <Text className="mt-1.5 text-[11px] text-content-400">
-              {formatMoneyCompact(limits.min, currency)} to {formatMoneyCompact(limits.max, currency)}
-            </Text>
-          )}
         </View>
 
         <ContractInfo summary={summary} />
@@ -709,34 +620,11 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
           />
         </View>
 
-        <View className="flex-row items-center gap-2">
-          <Text className="min-w-0 flex-1 text-[11px] leading-4 text-content-400">
-            {confirmBeforeTrade
-              ? 'You review the trade before it is placed.'
-              : 'One-tap trading: pressing UP or DOWN places the trade.'}
-          </Text>
-
-          {/* Opens the positions sheet. Carries the count, so an open trade is
-              still visible while the sheet is shut. */}
-          <Pressable
-            onPress={onToggleTrades}
-            accessibilityRole="button"
-            accessibilityState={{ expanded: tradesOpen }}
-            accessibilityLabel={openCount > 0 ? 'Trades, ' + openCount + ' open' : 'Trades'}
-            className={cn(
-              'h-9 flex-row items-center justify-center gap-2 rounded-xl px-3',
-              tradesOpen ? 'bg-surface-700' : 'bg-surface-800 active:bg-surface-700',
-            )}
-          >
-            <Icon as={History} size={16} className={tradesOpen ? 'text-content-100' : 'text-content-200'} />
-            <Text className={cn('text-sm font-bold', tradesOpen ? 'text-content-100' : 'text-content-200')}>Trades</Text>
-            {openCount > 0 ? (
-              <View className="rounded-full bg-brand px-1.5 py-0.5">
-                <Text className="text-[10px] font-black tnum text-surface-950">{openCount}</Text>
-              </View>
-            ) : null}
-          </Pressable>
-        </View>
+        <Text className="text-center text-[11px] leading-4 text-content-400">
+          {confirmBeforeTrade
+            ? 'You review the trade before it is placed.'
+            : 'One-tap trading: pressing UP or DOWN places the trade.'}
+        </Text>
       </View>
 
       <ConfirmTradeSheet
@@ -753,9 +641,39 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
         onEdit={edit}
       />
 
-      <DurationSheet
-        open={durationsOpen}
-        onClose={() => setDurationsOpen(false)}
+      <AmountSheet
+        open={amountOpen}
+        onClose={() => setAmountOpen(false)}
+        text={text}
+        onChangeText={(next) => {
+          setText(next);
+          const value = parseAmount(next);
+          if (value !== null && value > 0) setDefaultStake(value);
+        }}
+        currency={currency}
+        currencySymbol={currencySymbol}
+        invalid={!!amountError}
+        canDecrease={!(parsed !== null && parsed <= limits.min)}
+        canIncrease={!(parsed !== null && parsed >= limits.max)}
+        onDecrease={() => writeAmount(stepAmount(parsed, -amountStep(parsed === null ? null : parsed - 1), limits))}
+        onIncrease={() => writeAmount(stepAmount(parsed, amountStep(parsed), limits))}
+        presets={presets}
+        stake={stake}
+        onPreset={writeAmount}
+        account={account}
+        available={available}
+        message={
+          amountProblem ?? (
+            <Text className="text-[11px] text-content-400">
+              {formatMoneyCompact(limits.min, currency)} to {formatMoneyCompact(limits.max, currency)}
+            </Text>
+          )
+        }
+      />
+
+      <TimeSheet
+        open={timeOpen}
+        onClose={() => setTimeOpen(false)}
         chips={chips}
         selected={expirySeconds}
         onSelect={setExpiry}
@@ -770,110 +688,45 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
   );
 }
 
-/** The amount field itself: bare, sized to what is typed, inside the stepper. */
-const AmountInput = ({
-  ref,
-  value,
-  invalid,
-  onChangeText,
-  onFocus,
-  onBlur,
-}: {
-  ref: Ref<TextInput>;
-  value: string;
-  invalid: boolean;
-  onChangeText: (text: string) => void;
-  onFocus: () => void;
-  onBlur: () => void;
-}) => {
-  const placeholder = useTokenColor('content-400');
-  const selection = useTokenColor('accent');
-  return (
-    <TextInput
-      ref={ref}
-      value={value}
-      onChangeText={onChangeText}
-      onFocus={onFocus}
-      onBlur={onBlur}
-      keyboardType="decimal-pad"
-      autoComplete="off"
-      autoCorrect={false}
-      accessibilityLabel="Investment amount"
-      accessibilityHint={invalid ? 'The amount needs changing; the reason is under the field' : undefined}
-      placeholder="0"
-      placeholderTextColor={placeholder}
-      selectionColor={selection}
-      maxFontSizeMultiplier={1.35}
-      className="min-w-[28px] max-w-[160px] p-0 text-left text-lg font-bold text-content-100"
-      style={{ fontVariant: ['tabular-nums'] }}
-    />
-  );
-};
-
-/** One duration and what it pays. */
-function DurationButton({
-  chip,
-  selected,
-  onSelect,
-}: {
-  chip: DurationChip;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  const unavailable = chip.unavailableReason !== null;
-  const payout = chip.payoutPercent !== null ? chip.payoutPercent + '%' : 'N/A';
-  return (
-    <Pressable
-      onPress={onSelect}
-      disabled={unavailable}
-      accessibilityRole="button"
-      accessibilityState={{ selected, disabled: unavailable }}
-      accessibilityLabel={chip.label + ', ' + payout + ' payout'}
-      accessibilityHint={chip.unavailableReason ?? undefined}
-      className={cn(
-        'min-w-0 flex-1 items-center rounded-lg border px-1 py-1.5',
-        selected ? 'border-accent bg-accent/15' : 'border-surface-700 bg-surface-850 active:border-surface-600',
-        unavailable && 'opacity-40',
-      )}
-    >
-      <Text className={cn('text-sm font-bold leading-tight tnum', selected ? 'text-content-100' : 'text-content-200')}>
-        {chip.label}
-      </Text>
-      <Text
-        className={cn(
-          'text-[10px] font-semibold leading-tight tnum',
-          unavailable ? 'text-content-400' : selected ? 'text-accent' : 'text-up',
-        )}
-      >
-        {payout}
-      </Text>
-    </Pressable>
-  );
-}
-
-function StepButton({
-  children,
+/**
+ * The Time box: the clock time a trade placed now would end at, to the second.
+ *
+ * This platform's expiry is relative - entry plus the duration - so the time
+ * is worked out from the clock every second rather than rounded to a minute
+ * mark, in the zone the trader chose for the chart (the expiry guide on the
+ * chart reads the same). Its own component, so the one-second tick redraws
+ * this box and not the whole ticket.
+ */
+function TimeBox({
+  expirySeconds,
+  unavailable,
   onPress,
-  disabled,
-  label,
 }: {
-  children: ReactNode;
+  /** Null when the asset offers no duration. */
+  expirySeconds: number | null;
+  /** The chosen duration has no payout on this asset. */
+  unavailable: boolean;
   onPress: () => void;
-  disabled?: boolean;
-  label: string;
 }) {
+  const now = useNow(1000);
+  const clock = useClockFormatter();
+  const endsAt = expirySeconds !== null ? clock(now + expirySeconds * 1000) : '--';
+
   return (
     <Pressable
       onPress={onPress}
-      disabled={disabled}
       accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ disabled: !!disabled }}
-      // Unboxed: inside a field of its own, a bordered button competes with
-      // the value it is there to nudge.
-      className={cn('h-9 w-9 items-center justify-center rounded-lg active:bg-surface-800', disabled && 'opacity-30')}
+      accessibilityLabel={'Time, ends at ' + endsAt}
+      accessibilityHint="Opens the time"
+      className={cn(
+        'min-w-0 flex-1 justify-center rounded-xl border bg-surface-850 px-3 active:bg-surface-800',
+        unavailable ? 'border-down/60' : 'border-surface-700',
+      )}
     >
-      {children}
+      <Text className="text-[11px] text-content-400">Time</Text>
+      <Text numberOfLines={1} className="text-lg font-bold leading-6 tnum text-content-100">
+        {endsAt}
+      </Text>
     </Pressable>
   );
 }

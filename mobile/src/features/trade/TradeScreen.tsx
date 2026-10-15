@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Keyboard, KeyboardAvoidingView, Platform, View } from 'react-native';
+import { View } from 'react-native';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../../services/api';
 import { useMarketStore } from '../../stores/marketStore';
@@ -9,7 +9,6 @@ import { useAccountStore } from '../../stores/accountStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useFavouritesStore } from '../../stores/favouritesStore';
 import { useMarketSubscription } from '../../hooks/useRealtime';
-import { cn } from '../../utils/cn';
 import { Sheet } from '../../components/ui';
 import { AssetPicker } from './AssetPicker';
 import { AssetTabs } from './AssetTabs';
@@ -31,11 +30,11 @@ import { accountOf } from './ticketModel';
  * the chart has pan and pinch of its own, and a page scrolling around it would
  * fight them. The chart takes whatever height the header and the ticket leave,
  * never less than 280; when that is not enough, the ticket's set-up part
- * scrolls inside the ticket instead. With the keyboard up (typing an amount)
- * the chart gives up its minimum, so the field stays in view.
+ * scrolls inside the ticket instead. Nothing on this screen takes typing - the
+ * amount is typed in its own sheet - so the keyboard never reshapes the chart.
  *
  * The positions panel the web keeps under the ticket is a sheet here, opened
- * from the ticket's Trades button. The web's second chart (two side by side,
+ * from the ticket's trade history button. The web's second chart (two side by side,
  * advanced mode on a wide screen) needs a desktop's width and is not offered.
  *
  * Nothing here decides a price - the chart draws what the server sent, and the
@@ -48,14 +47,13 @@ export function TradeScreen() {
   const mode = useSettingsStore((s) => s.tradeMode);
   const account = useAccountStore((s) => s.active);
   const pushRecent = useFavouritesStore((s) => s.pushRecent);
-  const keyboardUp = useKeyboardVisible();
 
   const allOpenTrades = useTradeStore((s) => s.openTrades);
   const openTrades = useMemo(
     () => allOpenTrades.filter((trade) => accountOf(trade) === account),
     [allOpenTrades, account],
   );
-  // The positions sheet is opened from the ticket's Trades button, so the
+  // The positions sheet is opened from the ticket's trade history button, so the
   // ticket needs to say whether it is open and the sheet needs to obey.
   const [tradesOpen, setTradesOpen] = useState(false);
   const setOpenTrades = useTradeStore((s) => s.setOpenTrades);
@@ -98,16 +96,13 @@ export function TradeScreen() {
   );
 
   return (
-    <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      className="flex-1 bg-surface-950"
-    >
+    <View className="flex-1 bg-surface-950">
       {/* The same header in both modes, so switching mode moves nothing.
           Advanced adds the asset tabs on the header's second line, beside the
           mode toggle, where they add no row. */}
       <TradeAssetHeader asset={active} tabs={mode === 'advanced' ? <AssetTabs assets={assets} /> : undefined} />
 
-      <View className={cn('min-w-0 flex-1', !keyboardUp && 'min-h-[280px]')}>
+      <View className="min-h-[280px] min-w-0 flex-1">
         <PriceChart asset={active} openTrades={openTrades} mode={mode} />
       </View>
 
@@ -130,24 +125,6 @@ export function TradeScreen() {
       </Sheet>
 
       <AssetPicker assets={assets} />
-    </KeyboardAvoidingView>
+    </View>
   );
-}
-
-/** Whether the on-screen keyboard is up. */
-function useKeyboardVisible(): boolean {
-  const [visible, setVisible] = useState(false);
-  useEffect(() => {
-    const show = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow', () =>
-      setVisible(true),
-    );
-    const hide = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide', () =>
-      setVisible(false),
-    );
-    return () => {
-      show.remove();
-      hide.remove();
-    };
-  }, []);
-  return visible;
 }

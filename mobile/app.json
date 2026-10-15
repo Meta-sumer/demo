@@ -3,7 +3,7 @@
     "name": "Binary Trading",
     "slug": "binary-trading",
     "scheme": "binarytrading",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
