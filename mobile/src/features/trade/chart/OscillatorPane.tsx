@@ -376,7 +376,8 @@ function paintPane(
 
   canvas.save();
   clipTo(canvas, 0, 0, view.pw, view.ph);
-  const grid = strokePaint(style.grid, 1);
+  // Dotted, as on the price above it.
+  const grid = strokePaint(style.grid, 1, [1, 3]);
   for (let i = 0; i < marks.length; i += 1) {
     const py = crisp(marks[i]!.y);
     canvas.drawLine(0, py, view.pw, py, grid);

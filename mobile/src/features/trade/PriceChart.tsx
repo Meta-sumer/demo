@@ -27,6 +27,7 @@ import { formatCountdown, formatMoney } from '../../utils/format';
 import { formatClock, resolveZone, zoneChip } from '../../utils/time';
 import { cn } from '../../utils/cn';
 import { BEGINNER_CHART_TYPES, ChartToolbar } from './ChartToolbar';
+import { ChartLegend } from './chart/ChartLegend';
 import { ChartOrderLayer } from './orders/ChartOrderLayer';
 import { useTicketStore } from './ticketStore';
 import { ChartZoomControls } from './chart/ChartZoomControls';
@@ -35,13 +36,13 @@ import { ExpiryGuide } from './chart/ExpiryGuide';
 import { IndicatorPicker } from './chart/IndicatorPicker';
 import { INDICATOR_CATALOG, INDICATOR_ORDER, isOscillator, type Oscillator } from './chart/indicatorCatalog';
 import { OscillatorPane } from './chart/OscillatorPane';
-import { clamp } from './chart/useFrameLoop';
+import { clamp, useFrameClock } from './chart/useFrameLoop';
 import { Pulse } from './chart/Pulse';
 import { useChartEngine } from './chart/engine/useChartEngine';
 import { useChartFonts, useDisplayFont } from './chart/engine/fonts';
-import { contrastText } from './chart/engine/colors';
-import { buildZoneInfo, priceText } from './chart/engine/format';
-import { paintMain, type MainStyle } from './chart/engine/mainPainter';
+import { chartLook, contrastText, type ChartLook } from './chart/engine/colors';
+import { barCountdownText, buildZoneInfo, priceText } from './chart/engine/format';
+import { DOTTED, paintMain, type MainStyle } from './chart/engine/mainPainter';
 import type { ChartHost, LayerKey, TapHandler } from './chart/engine/host';
 import { UTC_ZONE, type OverlayLine, type SeriesData, type ZoneInfo } from './chart/engine/types';
 import type { Asset, Candle, Trade } from '../../types/api';
@@ -99,8 +100,11 @@ const WATERMARK_ALPHA: Record<ChartPalette['theme'], number> = { dark: 0.06, twi
 /** The price scale's empty bands above and below the data, as on the web. */
 const MARGINS = { top: 0.12, bottom: 0.12 };
 
-/** Where the toolbar and the zoom controls sit: just above the 28px time axis. */
-const CONTROLS_BOTTOM = 36;
+/** Where "back to latest" sits: just above the 28px time axis. */
+const LIVE_BUTTON_BOTTOM = 34;
+
+/** How long the fullscreen modal takes to fade out before anything opens behind it. */
+const FULLSCREEN_EXIT_MS = 360;
 
 const DAY = 86_400_000;
 
@@ -152,7 +156,6 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
   const [fullscreen, setFullscreen] = useState(false);
   const [box, setBox] = useState({ w: 0, h: 0 });
   const [axisWidth, setAxisWidth] = useState(56);
-  const [toolbarRight, setToolbarRight] = useState(0);
 
   const storedChartType = useSettingsStore((s) => s.chartType);
   const chartType = advanced || BEGINNER_CHART_TYPES.includes(storedChartType) ? storedChartType : 'candles';
@@ -182,17 +185,16 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
   const demo = useAccountStore((s) => s.active) === 'DEMO';
   const drawingHere = useDrawingsStore((s) => advanced && !!asset && s.armed?.assetId === asset.id);
 
+  /*
+   * The chart is drawn the way TradingView's mobile app draws it (see
+   * chart/engine/colors): a black plot in the dark theme, a white one in the
+   * light, TradingView's candle colours. The trader's own up and down colours
+   * from Settings still win for the candles and for everything coloured by
+   * direction.
+   */
   const themePalette = useChartPalette();
-  const palette = useMemo<ChartPalette>(
-    () => ({
-      ...themePalette,
-      up: upOverride ?? themePalette.up,
-      down: downOverride ?? themePalette.down,
-      // Candles carry their own pair so an order accent stays distinguishable
-      // from the bar underneath it. An explicit override still wins for both.
-      bull: upOverride ?? themePalette.bull,
-      bear: downOverride ?? themePalette.bear,
-    }),
+  const palette = useMemo<ChartLook>(
+    () => chartLook(themePalette, upOverride, downOverride),
     [themePalette, upOverride, downOverride],
   );
 
@@ -307,8 +309,8 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
       crosshairText: contrastText(palette.crosshair),
       bull: palette.bull,
       bear: palette.bear,
-      bullText: contrastText(palette.bull),
-      bearText: contrastText(palette.bear),
+      bullText: palette.candleText,
+      bearText: palette.candleText,
       accent,
       accentText: contrastText(accent),
       accentTop: palette.accentFill[0],
@@ -318,24 +320,39 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
       digits,
       lastPrice: true,
       magnet: true,
+      gridDash: DOTTED,
+      axisStrong: palette.axisStrong,
+      priceLineFromBar: true,
+      countdown: !!asset?.marketOpen,
     };
     engine.closeOnly.value = chartType === 'line' || chartType === 'area';
     engine.minMove.value = 1 / 10 ** digits;
-  }, [palette, gridOpacity, chartType, demo, digits, style, engine]);
+  }, [palette, gridOpacity, chartType, demo, digits, asset?.marketOpen, style, engine]);
 
   const { view, series, crosshair } = engine;
   const axisFont = fonts.axis;
+  const boldFont = fonts.bold;
+  // The last-price tag counts down to the close of the bar being built; the
+  // clock behind it writes once a second, and only while the market is open.
+  const second = useFrameClock(engine, { enabled: !!asset?.marketOpen, maxFps: 10, secondsOnly: true });
   const basePicture = useDerivedValue(
     () =>
       createPicture((canvas) => {
         const current = style.value;
         if (!current) return;
-        paintMain(canvas, view.value, series.value, current, overlays.value, crosshair.value, zoneInfo.value, {
-          axis: axisFont,
-          watermark: watermarkFont,
-        });
+        paintMain(
+          canvas,
+          view.value,
+          series.value,
+          current,
+          overlays.value,
+          crosshair.value,
+          zoneInfo.value,
+          { axis: axisFont, bold: boldFont, watermark: watermarkFont },
+          { now: second.value },
+        );
       }),
-    [axisFont, watermarkFont],
+    [axisFont, boldFont, watermarkFont],
   );
 
   /* ------------------------------------------------------ the price axis */
@@ -361,12 +378,16 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
     (bars: ReadonlyArray<Ohlc>) => {
       let widest = 0;
       for (const bar of bars) widest = Math.max(widest, Math.abs(bar.high), Math.abs(bar.low));
-      const width = axisFont.getTextWidth(priceText(widest, digits)) + 16;
+      const width = Math.max(
+        boldFont.getTextWidth(priceText(widest, digits)),
+        // The bar countdown sits under the last price on the same tag.
+        axisFont.getTextWidth(barCountdownText(bucketMs >= 3_600_000 ? 36_000_000 : 3_599_000)),
+      ) + 16;
       if (Math.abs(width - mainAxisRef.current) < 0.5) return;
       mainAxisRef.current = width;
       applyAxisWidth();
     },
-    [axisFont, digits, applyAxisWidth],
+    [axisFont, boldFont, digits, bucketMs, applyAxisWidth],
   );
 
   const handlePaneAxis = useCallback(
@@ -508,7 +529,7 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
     });
 
     if (Math.abs(tick.price) > 0) {
-      const widest = axisFont.getTextWidth(priceText(Math.abs(tick.price), digits)) + 16;
+      const widest = boldFont.getTextWidth(priceText(Math.abs(tick.price), digits)) + 16;
       if (widest > mainAxisRef.current + 0.5) {
         mainAxisRef.current = widest;
         applyAxisWidth();
@@ -599,7 +620,9 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
   }, [asset?.id, timeframe, engine]);
 
   const hovered = hoveredIndex >= 0 ? (barsRef.current[hoveredIndex] ?? null) : null;
-  const readout = hovered ?? lastBucketRef.current;
+  // The legend's price: the live one, else what the market list last saw,
+  // else the newest bar's close.
+  const legendPrice = tick?.price ?? asset?.feed.lastPrice ?? lastBucketRef.current?.close ?? null;
 
   const soonest = relevantTrades.reduce<Trade | null>(
     (best, trade) => (!best || trade.expiryTimestamp < best.expiryTimestamp ? trade : best),
@@ -622,13 +645,31 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
     [engine],
   );
 
+  /*
+   * The market selector and the settings drawer live outside the chart. In
+   * fullscreen they would open underneath it, so fullscreen closes first and
+   * they open once it has gone.
+   */
+  const openOutside = useCallback(
+    (action: () => void) => {
+      if (!fullscreen) {
+        action();
+        return;
+      }
+      setFullscreen(false);
+      setTimeout(action, FULLSCREEN_EXIT_MS);
+    },
+    [fullscreen],
+  );
+
   const historyKey = (asset?.id ?? '') + '|' + String(timeframe) + '|' + String(candlesQuery.dataUpdatedAt);
+  const halo = { textShadowColor: palette.background, textShadowRadius: 3, textShadowOffset: { width: 0, height: 0 } };
 
   const body = (
-    <View className="flex-1 bg-surface-900">
-      {/* The price, and everything drawn over it. Oscillator bands follow
-          underneath, so this box takes whatever height they leave - but never
-          less than the readouts, the toolbar and a usable plot need. */}
+    <View className="flex-1" style={{ backgroundColor: palette.background }}>
+      {/* The price, and everything drawn over it. Oscillator bands and the
+          toolbar follow underneath, so this box takes whatever height they
+          leave - but never less than a usable plot needs. */}
       <View className="relative min-h-[160px] flex-1" onLayout={onMainLayout}>
         <GestureDetector gesture={engine.gesture}>
           <View style={StyleSheet.absoluteFill} collapsable={false}>
@@ -642,7 +683,11 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
         </GestureDetector>
 
         {candlesQuery.isLoading ? (
-          <View pointerEvents="none" className="absolute inset-0 items-center justify-center bg-surface-900/60">
+          <View
+            pointerEvents="none"
+            className="absolute inset-0 items-center justify-center"
+            style={{ backgroundColor: withAlpha(palette.background, 0.6) }}
+          >
             <Skeleton className="h-[70%] w-[92%]" />
           </View>
         ) : null}
@@ -660,63 +705,52 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
           />
         ) : null}
 
-        {/* Live figures the canvas does not draw itself. */}
-        <View pointerEvents="none" className="absolute left-3 top-3 gap-1.5" style={{ maxWidth: Math.max(120, box.w - axisWidth - 24) }}>
-          {readout ? (
-            <View className="flex-row flex-wrap items-center gap-x-2.5 gap-y-1 self-start rounded-md bg-surface-900/85 px-2 py-1">
-              <OhlcValue label="O" value={readout.open} digits={digits} />
-              <OhlcValue label="H" value={readout.high} digits={digits} />
-              <OhlcValue label="L" value={readout.low} digits={digits} />
-              <OhlcValue
-                label="C"
-                value={readout.close}
-                digits={digits}
-                tone={readout.close >= readout.open ? palette.up : palette.down}
-              />
-            </View>
-          ) : null}
+        {/* The legend: the instrument, its price and move (or the bar under
+            the crosshair), then the indicators, the feed clock and the
+            nearest expiry. */}
+        {asset ? (
+          <ChartLegend
+            asset={asset}
+            look={palette}
+            digits={digits}
+            hovered={hovered}
+            price={legendPrice}
+            maxWidth={Math.max(140, box.w - axisWidth - 16)}
+          >
+            {/* Which line is which, in the colour it is drawn in. */}
+            {overlayIds.length > 0 ? (
+              <View className="flex-row flex-wrap items-center gap-x-2.5 gap-y-1">
+                {overlayIds.map((id) => (
+                  <View key={id} className="flex-row items-center gap-1">
+                    <View className="h-0.5 w-3 rounded-full" style={{ backgroundColor: overlayColour[id] }} />
+                    <Text className="text-[11px] font-semibold" style={[halo, { color: palette.strongText }]}>
+                      {INDICATOR_CATALOG[id].short}
+                    </Text>
+                    <Text className="text-[11px] font-medium" style={[halo, { color: palette.text }]}>
+                      {INDICATOR_CATALOG[id].params}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            ) : null}
 
-          {tick ? (
-            <View className="flex-row items-center gap-1.5 self-start rounded-md bg-surface-900/85 px-2 py-1">
-              <View className="h-1.5 w-1.5 rounded-full bg-up" />
-              <Text className="text-[11px] font-medium text-content-300 tnum">
+            {tick ? (
+              <Text className="text-[10px] font-medium tnum" style={[halo, { color: palette.text }]}>
                 {formatClock(tick.timestamp, zone)} {zoneChip(zone)}
               </Text>
-            </View>
-          ) : null}
+            ) : null}
 
-          {/* Which line is which, in the colour it is drawn in. */}
-          {overlayIds.length > 0 ? (
-            <View className="flex-row flex-wrap items-center gap-x-2.5 gap-y-1 self-start rounded-md bg-surface-900/85 px-2 py-1">
-              {overlayIds.map((id) => (
-                <View key={id} className="flex-row items-center gap-1">
-                  <View className="h-0.5 w-3 rounded-full" style={{ backgroundColor: overlayColour[id] }} />
-                  <Text className="text-[10px] font-semibold text-content-300">{INDICATOR_CATALOG[id].short}</Text>
-                  <Text className="text-[10px] font-medium text-content-400">{INDICATOR_CATALOG[id].params}</Text>
-                </View>
-              ))}
-            </View>
-          ) : null}
+            {soonest && !hideTradeResults ? <ExpiryBadge trade={soonest} /> : null}
+          </ChartLegend>
+        ) : null}
 
-          {soonest && !hideTradeResults ? <ExpiryBadge trade={soonest} /> : null}
-        </View>
-
-        <ChartToolbar
-          assetId={asset?.id ?? null}
-          mode={mode}
-          fullscreen={fullscreen}
-          onToggleFullscreen={() => setFullscreen((current) => !current)}
-          onRowLayout={setToolbarRight}
-          indicatorsOpen={pickerOpen}
-          onOpenIndicators={() => setPickerOpen(true)}
-        />
-
-        <ChartZoomControls engine={engine} toolbarRight={toolbarRight} bottom={CONTROLS_BOTTOM} />
+        {/* Back to now, once the view has been dragged away from it. */}
+        <ChartZoomControls engine={engine} look={palette} bottom={LIVE_BUTTON_BOTTOM} />
 
         {/* Orders: the preview being considered and every position open on this
             instrument, each with its own entry line, marker and expiry. Above
-            the toolbar: a marker that cannot be reached is worse than a
-            toolbar button covered for a moment. */}
+            the legend: a marker that cannot be reached is worse than a line of
+            text covered for a moment. */}
         <ChartOrderLayer
           host={host}
           asset={asset}
@@ -764,8 +798,20 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
         />
       ))}
 
+      <ChartToolbar
+        asset={asset}
+        mode={mode}
+        look={palette}
+        fullscreen={fullscreen}
+        onToggleFullscreen={() => setFullscreen((current) => !current)}
+        indicatorsOpen={pickerOpen}
+        onOpenIndicators={() => setPickerOpen(true)}
+        onOutside={openOutside}
+      />
+
       {/* A dialog, rendered here rather than in the toolbar so it belongs to
-          the chart rather than to one row of buttons. */}
+          the chart rather than to one row of buttons - and opens inside the
+          fullscreen chart too. */}
       {advanced ? <IndicatorPicker open={pickerOpen} onClose={() => setPickerOpen(false)} /> : null}
     </View>
   );
@@ -773,14 +819,15 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
   if (!fullscreen) return body;
 
   /*
-   * Fullscreen: the same chart over the whole screen. The engine and the data
-   * live in this component, so the view the trader had - zoom, scroll,
-   * crosshair - carries across; only the canvas is mounted again inside the
-   * modal. The system back gesture, or the same button, brings it back.
+   * Fullscreen: the same chart over the whole screen - legend, axes and the
+   * toolbar with its exit button. The engine and the data live in this
+   * component, so the view the trader had - zoom, scroll, crosshair - carries
+   * across; only the canvas is mounted again inside the modal. The system
+   * back gesture, or the same button, brings it back.
    */
   return (
     <>
-      <View className="min-h-[160px] flex-1 bg-surface-900" />
+      <View className="min-h-[160px] flex-1" style={{ backgroundColor: palette.background }} />
       <RNModal
         visible
         animationType="fade"
@@ -789,21 +836,10 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
         onRequestClose={() => setFullscreen(false)}
       >
         <GestureHandlerRootView style={{ flex: 1 }}>
-          <SafeAreaView style={{ flex: 1, backgroundColor: palette.panel }}>{body}</SafeAreaView>
+          <SafeAreaView style={{ flex: 1, backgroundColor: palette.background }}>{body}</SafeAreaView>
         </GestureHandlerRootView>
       </RNModal>
     </>
-  );
-}
-
-function OhlcValue({ label, value, digits, tone }: { label: string; value: number; digits: number; tone?: string }) {
-  return (
-    <View className="flex-row items-baseline gap-1">
-      <Text className="text-[11px] font-medium text-content-400">{label}</Text>
-      <Text className="text-[11px] font-semibold text-content-100 tnum" style={tone ? { color: tone } : undefined}>
-        {value.toFixed(digits)}
-      </Text>
-    </View>
   );
 }
 

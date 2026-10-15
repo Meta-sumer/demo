@@ -1,21 +1,27 @@
 import { useState, type ComponentType, type ReactNode } from 'react';
-import { Pressable, View, type LayoutChangeEvent } from 'react-native';
+import { Pressable, View } from 'react-native';
 import {
   Activity,
   AreaChart,
   BarChart3,
   CandlestickChart,
   Check,
+  ChevronDown,
+  ChevronRight,
+  Ellipsis,
   Flag,
   LineChart,
   Maximize2,
   Minimize2,
   PenLine,
+  Redo2,
+  Settings2,
   Trash2,
+  Undo2,
 } from 'lucide-react-native';
 import { Icon, Sheet, Switch, Text, type IconGlyphProps } from '../../components/ui';
 import { cn } from '../../utils/cn';
-import { useTokenColor } from '../../utils/theme-colors';
+import { useTokenColor, withAlpha } from '../../utils/theme-colors';
 import {
   TIMEFRAMES,
   timeframeLabel,
@@ -24,30 +30,31 @@ import {
   type ChartType,
   type TradeMode,
 } from '../../stores/settingsStore';
-import { selectDrawings, useDrawingsStore } from '../../stores/drawingsStore';
+import { selectCanRedo, selectCanUndo, selectDrawings, useDrawingsStore } from '../../stores/drawingsStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { DRAWING_TOOLS, DrawingIcon, toolInfo } from './chart/drawingTools';
+import type { ChartLook } from './chart/engine/colors';
+import type { Asset } from '../../types/api';
 
 /**
- * Chart toolbar.
+ * Chart toolbar: a bar under the chart, the way TradingView's mobile app lays
+ * it out.
  *
- * A row along the chart's bottom-left: it stays clear of the newest candles
- * on the right, and the fixed order keeps each control in a place it can be
- * found without reading.
+ *   [GBPUSD v] [1m] [pen] [...]  |  [undo] [redo]            [fullscreen]
  *
- * Reading order is how often a control is reached for - timeframe, then chart
- * type, then indicators, then the drawing tools - rather than the order they
- * happen to be declared in.
+ * The symbol opens the market selector, the timeframe its sheet, the pen the
+ * drawing tools, and "..." everything about how the chart is drawn - the
+ * chart type, the expiry line, the indicators and the chart settings. Undo
+ * and redo step through the drawings on this instrument. Fullscreen sits on
+ * the far right in both modes: it is how a phone gets a chart big enough to
+ * read.
  *
- * Beginner mode stops after the chart type (brief UX-06: do not put every
- * tool on the beginner screen) and offers only the three chart types a
- * newcomer reads without help. Fullscreen is in both modes: it is how a phone
- * gets a chart big enough to read.
+ * Beginner mode leaves out the drawing tools, undo and redo and the
+ * indicators (brief UX-06: do not put every tool on the beginner screen), and
+ * offers only the three chart types a newcomer reads without help.
  *
- * Zoom and "back to latest" are not here: they sit bottom-centre, where every
- * reference platform puts them (record 08), and are placed by the chart.
- *
- * On the web each menu was a popover above its button; on a phone it is a
- * bottom sheet, which has room for full names and is reached with the thumb.
+ * Zoom is a pinch; "back to latest" appears on the chart itself once the view
+ * has left the live edge.
  */
 const CHART_TYPES: Array<{ value: ChartType; label: string; icon: ComponentType<IconGlyphProps> }> = [
   { value: 'candles', label: 'Candles', icon: CandlestickChart },
@@ -59,33 +66,40 @@ const CHART_TYPES: Array<{ value: ChartType; label: string; icon: ComponentType<
 /** Bars read like candles without the bodies, so they wait for advanced mode. */
 export const BEGINNER_CHART_TYPES: readonly ChartType[] = ['candles', 'line', 'area'];
 
+/** The bar's height; the chart reserves it under the plot. */
+export const TOOLBAR_HEIGHT = 44;
+
 interface Props {
-  assetId: string | null;
+  asset: Asset | null;
   mode: TradeMode;
+  look: ChartLook;
   fullscreen: boolean;
   onToggleFullscreen: () => void;
-  /** Where the row ends, so the zoom controls can keep clear of it. */
-  onRowLayout?: (right: number) => void;
-  /**
-   * The indicator picker is a dialog, and it is rendered by the chart rather
-   * than in here, so it is not tied to this row's lifetime or position.
-   */
+  /** The indicator picker is a dialog the chart renders; this only asks for it. */
   indicatorsOpen: boolean;
   onOpenIndicators: () => void;
+  /**
+   * Runs something that opens outside the chart - the market selector, the
+   * settings drawer - after leaving fullscreen, which would otherwise sit on
+   * top of it.
+   */
+  onOutside: (action: () => void) => void;
 }
 
-type Menu = 'timeframe' | 'type' | 'draw';
+type Menu = 'timeframe' | 'more' | 'draw';
 
 export function ChartToolbar({
-  assetId,
+  asset,
   mode,
+  look,
   fullscreen,
   onToggleFullscreen,
-  onRowLayout,
   indicatorsOpen,
   onOpenIndicators,
+  onOutside,
 }: Props) {
   const advanced = mode === 'advanced';
+  const assetId = asset?.id ?? null;
   const [open, setOpen] = useState<Menu | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
 
@@ -96,17 +110,22 @@ export function ChartToolbar({
   const indicatorCount = useSettingsStore((s) => s.indicators.length);
   const showExpiryGuide = useSettingsStore((s) => s.showExpiryGuide);
   const toggleExpiryGuide = useSettingsStore((s) => s.toggleExpiryGuide);
+  const setPickerOpen = useWorkspaceStore((s) => s.setAssetPickerOpen);
+  const setSettingsOpen = useWorkspaceStore((s) => s.setSettingsOpen);
 
   const drawings = useDrawingsStore((s) => selectDrawings(s, assetId));
   const armed = useDrawingsStore((s) => (assetId && s.armed?.assetId === assetId ? s.armed.kind : null));
   const selectedId = useDrawingsStore((s) => s.selectedId);
+  const canUndo = useDrawingsStore((s) => selectCanUndo(s, assetId));
+  const canRedo = useDrawingsStore((s) => selectCanRedo(s, assetId));
   const arm = useDrawingsStore((s) => s.arm);
   const disarm = useDrawingsStore((s) => s.disarm);
   const removeDrawing = useDrawingsStore((s) => s.remove);
   const clearDrawings = useDrawingsStore((s) => s.clear);
+  const undo = useDrawingsStore((s) => s.undo);
+  const redo = useDrawingsStore((s) => s.redo);
   const selectedHere = selectedId !== null && drawings.some((drawing) => drawing.id === selectedId);
 
-  const accentInk = useTokenColor('surface-950');
   const tileInk = useTokenColor('content-300');
 
   const close = () => {
@@ -121,82 +140,76 @@ export function ChartToolbar({
 
   const types = advanced ? CHART_TYPES : CHART_TYPES.filter((entry) => BEGINNER_CHART_TYPES.includes(entry.value));
   const activeType = types.find((entry) => entry.value === chartType) ?? types[0]!;
+  const symbol = asset?.symbol.replace('/', '') ?? '--';
 
   return (
-    /*
-     * Held clear of the time axis along the bottom - a 28px strip of tick
-     * labels, which is the part of the axis a trader actually reads - by
-     * sitting 36px up. (The web also had to dodge the charting library's
-     * attribution logo in the corner; this chart has none.)
-     */
     <View
-      className="absolute bottom-9 left-2 flex-row items-center gap-1"
-      onLayout={(event: LayoutChangeEvent) => {
-        const { x, width } = event.nativeEvent.layout;
-        onRowLayout?.(x + width);
-      }}
+      className="flex-row items-center px-1"
+      style={{ height: TOOLBAR_HEIGHT, backgroundColor: look.background, borderTopWidth: 1, borderTopColor: look.rule }}
     >
-      <ToolButton label="Timeframe" open={open === 'timeframe'} onPress={() => toggle('timeframe')}>
-        <Text className={cn('text-xs font-bold tnum', open === 'timeframe' ? 'text-content-100' : 'text-content-300')}>
+      <BarButton label={'Market: ' + symbol} onPress={() => onOutside(() => setPickerOpen(true))} disabled={!asset}>
+        <Text numberOfLines={1} className="text-[13px] font-bold" style={{ color: look.strongText, maxWidth: 104 }}>
+          {symbol}
+        </Text>
+        <Icon as={ChevronDown} size={14} color={look.text} />
+      </BarButton>
+
+      <BarButton label={'Timeframe: ' + timeframeName(timeframe)} onPress={() => toggle('timeframe')} active={open === 'timeframe'} look={look}>
+        <Text className="text-[13px] font-semibold tnum" style={{ color: open === 'timeframe' ? look.accent : look.strongText }}>
           {timeframeLabel(timeframe)}
         </Text>
-      </ToolButton>
+      </BarButton>
 
-      <ToolButton label="Chart type" open={open === 'type'} onPress={() => toggle('type')}>
-        <Icon as={activeType.icon} size={16} className={open === 'type' ? 'text-content-100' : 'text-content-300'} />
-      </ToolButton>
+      {advanced ? (
+        /* While a tool waits for its taps the button shows that tool, and
+           pressing it puts the tool down - the same way out as the hint's
+           Cancel. */
+        armed ? (
+          <BarButton
+            label={'Stop drawing: ' + toolInfo(armed).name}
+            onPress={() => {
+              close();
+              disarm();
+            }}
+            active
+            look={look}
+          >
+            <DrawingIcon kind={armed} size={18} color={look.accent} />
+          </BarButton>
+        ) : (
+          <BarButton label="Drawing tools" onPress={() => toggle('draw')} active={open === 'draw'} look={look} badge={drawings.length || undefined}>
+            <Icon as={PenLine} size={18} color={open === 'draw' ? look.accent : look.text} />
+          </BarButton>
+        )
+      ) : null}
+
+      <BarButton label="Chart options" onPress={() => toggle('more')} active={open === 'more'} look={look}>
+        <Icon as={Ellipsis} size={18} color={open === 'more' ? look.accent : look.text} />
+      </BarButton>
 
       {advanced ? (
         <>
-          <ToolButton
-            label={indicatorCount > 0 ? 'Indicators (' + indicatorCount + ' on)' : 'Indicators'}
-            active={indicatorsOpen}
-            badge={indicatorCount || undefined}
-            onPress={() => {
-              close();
-              onOpenIndicators();
-            }}
-          >
-            <Icon as={Activity} size={16} className={indicatorsOpen ? 'text-surface-950' : 'text-content-300'} />
-          </ToolButton>
-
-          {/* While a tool waits for its taps the button shows that tool, and
-              pressing it puts the tool down - the same way out as the hint's
-              Cancel. */}
-          {armed ? (
-            <ToolButton
-              label={'Stop drawing: ' + toolInfo(armed).name}
-              active
-              onPress={() => {
-                close();
-                disarm();
-              }}
-            >
-              <DrawingIcon kind={armed} size={16} color={accentInk} />
-            </ToolButton>
-          ) : (
-            <ToolButton
-              label="Drawing tools"
-              open={open === 'draw'}
-              badge={drawings.length || undefined}
-              onPress={() => toggle('draw')}
-            >
-              <Icon as={PenLine} size={16} className={open === 'draw' ? 'text-content-100' : 'text-content-300'} />
-            </ToolButton>
-          )}
+          <View className="mx-1 h-5 w-px" style={{ backgroundColor: look.rule }} />
+          <BarButton label="Undo" onPress={() => assetId && undo(assetId)} disabled={!canUndo}>
+            <Icon as={Undo2} size={18} color={look.text} />
+          </BarButton>
+          <BarButton label="Redo" onPress={() => assetId && redo(assetId)} disabled={!canRedo}>
+            <Icon as={Redo2} size={18} color={look.text} />
+          </BarButton>
         </>
       ) : null}
 
-      <ToolButton
+      <View className="flex-1" />
+
+      <BarButton
         label={fullscreen ? 'Exit fullscreen' : 'Fullscreen chart'}
-        active={fullscreen}
         onPress={() => {
           close();
           onToggleFullscreen();
         }}
       >
-        <Icon as={fullscreen ? Minimize2 : Maximize2} size={16} className={fullscreen ? 'text-surface-950' : 'text-content-300'} />
-      </ToolButton>
+        <Icon as={fullscreen ? Minimize2 : Maximize2} size={18} color={look.text} />
+      </BarButton>
 
       <Sheet open={open === 'timeframe'} onClose={close} title="Timeframe" bodyClassName="px-4 pb-2">
         {/* Two columns of full names. Ten abbreviations in three columns asked
@@ -231,7 +244,8 @@ export function ChartToolbar({
         </Text>
       </Sheet>
 
-      <Sheet open={open === 'type'} onClose={close} title="Chart type" bodyClassName="px-2 pb-2">
+      <Sheet open={open === 'more'} onClose={close} title="Chart" bodyClassName="px-2 pb-2">
+        <Text className="mb-1 px-2 text-[11px] font-bold uppercase tracking-widest text-content-400">Chart type</Text>
         <View className="gap-0.5">
           {types.map((entry) => (
             <MenuRow
@@ -243,7 +257,12 @@ export function ChartToolbar({
               }}
             >
               <Icon as={entry.icon} size={16} className="text-content-400" />
-              <Text className={cn('flex-1 text-sm font-medium', activeType.value === entry.value ? 'text-content-100' : 'text-content-300')}>
+              <Text
+                className={cn(
+                  'flex-1 text-sm font-medium',
+                  activeType.value === entry.value ? 'text-content-100' : 'text-content-300',
+                )}
+              >
                 {entry.label}
               </Text>
             </MenuRow>
@@ -252,7 +271,7 @@ export function ChartToolbar({
 
         {/* Chart settings that belong next to how the chart is drawn, the way
             the reference platforms keep "show area" under chart type. */}
-        <View className="mt-2 border-t border-surface-800 pt-2">
+        <View className="mt-2 gap-0.5 border-t border-surface-800 pt-2">
           <Pressable
             accessibilityRole="switch"
             accessibilityState={{ checked: showExpiryGuide }}
@@ -268,6 +287,27 @@ export function ChartToolbar({
             </View>
             <Switch value={showExpiryGuide} onValueChange={toggleExpiryGuide} accessibilityLabel="Expiry line" />
           </Pressable>
+
+          {advanced ? (
+            <LinkRow
+              icon={Activity}
+              label={indicatorCount > 0 ? 'Indicators (' + indicatorCount + ' on)' : 'Indicators'}
+              active={indicatorsOpen}
+              onPress={() => {
+                close();
+                onOpenIndicators();
+              }}
+            />
+          ) : null}
+
+          <LinkRow
+            icon={Settings2}
+            label="Chart settings"
+            onPress={() => {
+              close();
+              onOutside(() => setSettingsOpen(true));
+            }}
+          />
         </View>
       </Sheet>
 
@@ -335,49 +375,45 @@ export function ChartToolbar({
           )}
         </View>
         <Text className="mt-2 text-[11px] leading-snug text-content-400">
-          Saved on this device for this asset. Select a drawing to delete it.
+          Saved on this device for this asset. Select a drawing to delete it; undo brings it back.
         </Text>
       </Sheet>
     </View>
   );
 }
 
-function ToolButton({
+function BarButton({
   children,
   label,
-  active,
-  open,
-  badge,
   onPress,
+  active,
+  disabled,
+  badge,
+  look,
 }: {
   children: ReactNode;
   label: string;
-  /** A state that is on: filled in the accent. */
-  active?: boolean;
-  /** Its menu is open: outlined in the accent. */
-  open?: boolean;
-  badge?: number;
   onPress: () => void;
+  /** Its menu is open, or its state is on. */
+  active?: boolean;
+  disabled?: boolean;
+  badge?: number;
+  look?: ChartLook;
 }) {
   return (
     <Pressable
       onPress={onPress}
+      disabled={disabled}
       accessibilityRole="button"
       accessibilityLabel={label}
-      accessibilityState={{ selected: !!active, expanded: open }}
-      hitSlop={4}
-      className={cn(
-        'h-8 w-8 items-center justify-center rounded-lg border',
-        active
-          ? 'border-accent bg-accent'
-          : open
-            ? 'border-accent bg-surface-850'
-            : 'border-surface-700/70 bg-surface-900/80 active:border-surface-600',
-      )}
+      accessibilityState={{ disabled: !!disabled, selected: !!active }}
+      hitSlop={2}
+      className={cn('h-9 flex-row items-center gap-1 rounded-md px-2.5 active:opacity-60', disabled && 'opacity-30')}
+      style={active && look ? { backgroundColor: withAlpha(look.accent, 0.12) } : undefined}
     >
       {children}
       {badge ? (
-        <View className="absolute -right-1 -top-1 h-3.5 min-w-[14px] items-center justify-center rounded-full bg-accent px-1">
+        <View className="absolute right-0.5 top-0.5 h-3.5 min-w-[14px] items-center justify-center rounded-full bg-accent px-1">
           <Text className="text-[9px] font-bold leading-[12px] text-surface-950">{badge}</Text>
         </View>
       ) : null}
@@ -397,6 +433,30 @@ function MenuRow({ selected, onPress, children }: { selected: boolean; onPress: 
       <View style={{ opacity: selected ? 1 : 0 }}>
         <Icon as={Check} size={14} className="text-accent" />
       </View>
+    </Pressable>
+  );
+}
+
+function LinkRow({
+  icon,
+  label,
+  active,
+  onPress,
+}: {
+  icon: ComponentType<IconGlyphProps>;
+  label: string;
+  active?: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      onPress={onPress}
+      className={cn('flex-row items-center gap-2.5 rounded-lg px-2 py-2.5', active ? 'bg-accent/15' : 'active:bg-surface-850')}
+    >
+      <Icon as={icon} size={16} className="text-content-400" />
+      <Text className="flex-1 text-sm font-medium text-content-100">{label}</Text>
+      <Icon as={ChevronRight} size={16} className="text-content-400" />
     </Pressable>
   );
 }

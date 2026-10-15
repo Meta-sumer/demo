@@ -1,5 +1,5 @@
-import type { SkCanvas, SkFont } from '@shopify/react-native-skia';
-import { clockText, priceText } from './format';
+import { Skia, type SkCanvas, type SkFont } from '@shopify/react-native-skia';
+import { barCountdownText, clockText, priceText } from './format';
 import {
   areaPath,
   clipTo,
@@ -61,6 +61,17 @@ export interface MainStyle {
    * the trade window).
    */
   magnet: boolean;
+  /** Grid dash intervals - TradingView's dotted grid - or null for solid lines. */
+  gridDash?: number[] | null;
+  /** Round price labels in this colour and the bold face; null writes every label alike. */
+  axisStrong?: string | null;
+  /**
+   * The last-price line in the newest bar's own colour, dotted (TradingView),
+   * rather than the series' neutral price-line colour, dashed.
+   */
+  priceLineFromBar?: boolean;
+  /** Under the last price on its tag, the time left in the bar being built. */
+  countdown?: boolean;
 }
 
 /** A horizontal price line with its value on the axis and a title beside it - the trade window's entry barrier. */
@@ -73,12 +84,23 @@ export interface PriceLevel {
 
 export interface MainFonts {
   axis: SkFont;
+  /** The emphasised labels and the last-price tag. Falls back to `axis`. */
+  bold?: SkFont | null;
   watermark: SkFont | null;
 }
 
+export interface MainExtras {
+  levels?: ReadonlyArray<PriceLevel>;
+  /** Wall clock, for the bar countdown. */
+  now?: number;
+}
+
+/** TradingView's dotted rules. */
+export const DOTTED = [1, 3];
+
 /** Pixels between price labels, and between time labels. */
 const PRICE_GAP = 34;
-const TIME_GAP = 64;
+const TIME_GAP = 50;
 
 export function paintMain(
   canvas: SkCanvas,
@@ -89,9 +111,10 @@ export function paintMain(
   cross: Crosshair,
   zone: ZoneInfo,
   fonts: MainFonts,
-  levels?: ReadonlyArray<PriceLevel>,
+  extras?: MainExtras,
 ): void {
   'worklet';
+  const levels = extras?.levels;
   if (view.w <= 0 || view.h <= 0) return;
   rect(canvas, 0, 0, view.w, view.h, fillPaint(style.background));
 
@@ -120,7 +143,7 @@ export function paintMain(
   // Grid.
   canvas.save();
   clipTo(canvas, 0, 0, view.pw, view.ph);
-  const grid = strokePaint(style.grid, 1);
+  const grid = strokePaint(style.grid, 1, style.gridDash ?? null);
   for (let i = 0; i < prices.length; i += 1) {
     const py = crisp(prices[i]!.y);
     canvas.drawLine(0, py, view.pw, py, grid);
@@ -171,7 +194,8 @@ export function paintMain(
     style.kind === 'line' || style.kind === 'area' ? style.accentText : lastClose >= lastOpen ? style.bullText : style.bearText;
   const lastY = view.ok && lastClose === lastClose ? y(lastClose) : Number.NaN;
   if (style.lastPrice && lastY === lastY && lastY >= 0 && lastY <= view.ph) {
-    hLine(canvas, view, lastY, style.kind === 'candles' ? style.priceLine : lastColour, DASHED);
+    if (style.priceLineFromBar) hLine(canvas, view, lastY, lastColour, DOTTED);
+    else hLine(canvas, view, lastY, style.kind === 'candles' ? style.priceLine : lastColour, DASHED);
   }
 
   // The crosshair's lines.
@@ -203,10 +227,19 @@ export function paintMain(
   const textPaint = fillPaint(style.text);
   const metrics = font.getMetrics();
   const centreOffset = -(metrics.ascent + metrics.descent) / 2;
+  const strongPaint = style.axisStrong ? fillPaint(style.axisStrong) : textPaint;
+  const strongFont = style.axisStrong && fonts.bold ? fonts.bold : font;
   for (let i = 0; i < prices.length; i += 1) {
     const mark = prices[i]!;
     if (mark.y < 6 || mark.y > view.ph - 6) continue;
-    canvas.drawText(priceText(mark.value, style.digits), view.pw + 6, mark.y + centreOffset, textPaint, font);
+    const strong = mark.major && !!style.axisStrong;
+    canvas.drawText(
+      priceText(mark.value, style.digits),
+      view.pw + 6,
+      mark.y + centreOffset,
+      strong ? strongPaint : textPaint,
+      strong ? strongFont : font,
+    );
   }
 
   if (view.axisH > 0) {
@@ -236,13 +269,31 @@ export function paintMain(
     }
   }
 
-  // The last price's tag on the axis.
+  // The last price's tag on the axis - with, under the price, the time left
+  // in the bar being built while that bar is still open.
   if (style.lastPrice && lastY === lastY) {
-    const clamped = lastY < 8 ? 8 : lastY > view.ph - 8 ? view.ph - 8 : lastY;
-    tag(canvas, font, priceText(lastClose, style.digits), view.pw + 1, clamped, 'left', lastColour, lastTextColour, {
-      padX: 5,
-      radius: 2,
-    });
+    const now = extras?.now;
+    const remaining = n > 0 && now !== undefined ? series.t[n - 1]! + series.bucket - now : -1;
+    const counting = !!style.countdown && remaining >= 0 && remaining <= series.bucket;
+    if (counting) {
+      const tagFont = fonts.bold ?? font;
+      const price = priceText(lastClose, style.digits);
+      const left = barCountdownText(remaining);
+      const height = 31;
+      const top = Math.max(0, Math.min(view.ph - height, lastY - 9));
+      const paint = fillPaint(lastColour);
+      canvas.drawRRect(Skia.RRectXY(Skia.XYWHRect(view.pw + 1, top, view.axisW - 2, height), 2, 2), paint);
+      const ink = fillPaint(lastTextColour);
+      const metricsBold = tagFont.getMetrics();
+      canvas.drawText(price, view.pw + 6, top + 9 - (metricsBold.ascent + metricsBold.descent) / 2, ink, tagFont);
+      canvas.drawText(left, view.pw + 6, top + 22.5 + centreOffset, ink, font);
+    } else {
+      const clamped = lastY < 8 ? 8 : lastY > view.ph - 8 ? view.ph - 8 : lastY;
+      tag(canvas, style.priceLineFromBar && fonts.bold ? fonts.bold : font, priceText(lastClose, style.digits), view.pw + 1, clamped, 'left', lastColour, lastTextColour, {
+        padX: 5,
+        radius: 2,
+      });
+    }
   }
 
   // The crosshair's tags, over the axis labels.

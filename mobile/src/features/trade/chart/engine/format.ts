@@ -83,6 +83,19 @@ export function countdownText(msRemaining: number): string {
   return pad2(minutes) + ':' + pad2(seconds);
 }
 
+/**
+ * Time left in the bar being built, as the price tag shows it under the last
+ * price: mm:ss, or h:mm:ss for frames of an hour and more.
+ */
+export function barCountdownText(msRemaining: number): string {
+  'worklet';
+  const total = Math.max(0, Math.ceil(msRemaining / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return (hours > 0 ? hours + ':' : '') + pad2(minutes) + ':' + pad2(seconds);
+}
+
 /* -------------------------------------------------------------- JS thread */
 
 /**

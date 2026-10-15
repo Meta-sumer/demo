@@ -211,6 +211,8 @@ export function clampOffset(offset: number, count: number, pw: number, spacing: 
 export interface PriceMark {
   y: number;
   value: number;
+  /** A rounder number than its neighbours - TradingView writes these brighter. */
+  major: boolean;
 }
 
 const NICE = [1, 2, 2.5, 5, 10];
@@ -228,21 +230,29 @@ export function priceMarks(view: View, digits: number, gap: number): PriceMark[]
   const minStep = Math.pow(10, -Math.max(0, digits));
   const magnitude = Math.pow(10, Math.floor(Math.log10(rough)));
   let step = magnitude * 10;
+  let mantissa = 10;
   for (let i = 0; i < NICE.length; i += 1) {
     const candidate = NICE[i]! * magnitude;
     // 2.5 of the smallest unit cannot be written at this precision.
     if (NICE[i] === 2.5 && candidate < minStep * 10) continue;
     if (candidate >= rough) {
       step = candidate;
+      mantissa = NICE[i]!;
       break;
     }
   }
-  if (step < minStep) step = minStep;
+  if (step < minStep) {
+    step = minStep;
+    mantissa = 1;
+  }
+  // Every label that lands on the next round number up: 5 steps of 1 or 2,
+  // 4 of 2.5, 2 of 5.
+  const every = mantissa === 2.5 ? 4 : mantissa === 5 ? 2 : 5;
   const start = Math.ceil(view.lo / step);
   const end = Math.floor(view.hi / step);
   for (let k = start; k <= end && out.length < 64; k += 1) {
     const value = k * step;
-    out.push({ y: yOf(view, value), value });
+    out.push({ y: yOf(view, value), value, major: ((k % every) + every) % every === 0 });
   }
   return out;
 }

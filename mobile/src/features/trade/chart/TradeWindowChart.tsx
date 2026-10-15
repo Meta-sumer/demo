@@ -444,7 +444,7 @@ function WindowCanvas({ trade, data, precision, zone, palette, engine }: CanvasP
         const current = style.value;
         if (!current) return;
         const frame = view.value;
-        paintMain(canvas, frame, series.value, current, [], crosshair.value, zoneInfo.value, { axis: axisFont, watermark: null }, levels.value);
+        paintMain(canvas, frame, series.value, current, [], crosshair.value, zoneInfo.value, { axis: axisFont, watermark: null }, { levels: levels.value });
         paintMoments(canvas, frame, marks.value, {
           ink,
           background,

@@ -68,7 +68,25 @@ interface DrawingsState {
   remove: (assetId: string, id: string) => void;
   clear: (assetId: string) => void;
   select: (id: string | null) => void;
+
+  /**
+   * Per-asset undo and redo of what the trader drew. Adding, deleting and
+   * clearing can be undone; a new change after an undo drops the redo trail,
+   * the way every editor does. Kept for the session only - it is not saved.
+   */
+  history: Record<string, DrawingHistory>;
+  undo: (assetId: string) => void;
+  redo: (assetId: string) => void;
 }
+
+/** The asset's drawing list before each undoable change, and after each undo. */
+export interface DrawingHistory {
+  undo: Drawing[][];
+  redo: Drawing[][];
+}
+
+/** How many steps back an asset's history reaches. */
+export const MAX_HISTORY = 50;
 
 export const MAX_DRAWINGS_PER_ASSET = 50;
 
@@ -88,6 +106,7 @@ export const useDrawingsStore = create<DrawingsState>()(
       drawings: {},
       armed: null,
       selectedId: null,
+      history: {},
 
       arm: (kind, assetId) => set({ armed: { kind, assetId }, selectedId: null }),
       disarm: () => set({ armed: null }),
@@ -101,10 +120,7 @@ export const useDrawingsStore = create<DrawingsState>()(
         };
         set((state) => ({
           // Oldest drawings fall off rather than letting the chart fill up.
-          drawings: {
-            ...state.drawings,
-            [assetId]: [...(state.drawings[assetId] ?? []), drawing].slice(-MAX_DRAWINGS_PER_ASSET),
-          },
+          ...change(state, assetId, [...(state.drawings[assetId] ?? []), drawing].slice(-MAX_DRAWINGS_PER_ASSET)),
           armed: null,
           selectedId: drawing.id,
         }));
@@ -113,27 +129,62 @@ export const useDrawingsStore = create<DrawingsState>()(
 
       remove: (assetId, id) =>
         set((state) => {
-          const remaining = (state.drawings[assetId] ?? []).filter((drawing) => drawing.id !== id);
-          const next = { ...state.drawings };
-          // Removing the last one drops the key, so the asset falls back to
-          // the shared empty result instead of an empty array of its own.
-          if (remaining.length > 0) next[assetId] = remaining;
-          else delete next[assetId];
-          return { drawings: next, selectedId: state.selectedId === id ? null : state.selectedId };
+          const current = state.drawings[assetId] ?? [];
+          if (!current.some((drawing) => drawing.id === id)) return {};
+          return {
+            ...change(
+              state,
+              assetId,
+              current.filter((drawing) => drawing.id !== id),
+            ),
+            selectedId: state.selectedId === id ? null : state.selectedId,
+          };
         }),
 
       clear: (assetId) =>
         set((state) => {
-          const cleared = new Set((state.drawings[assetId] ?? []).map((drawing) => drawing.id));
-          const next = { ...state.drawings };
-          delete next[assetId];
+          const current = state.drawings[assetId] ?? [];
+          if (current.length === 0) return {};
+          const cleared = new Set(current.map((drawing) => drawing.id));
           return {
-            drawings: next,
+            ...change(state, assetId, []),
             selectedId: state.selectedId && cleared.has(state.selectedId) ? null : state.selectedId,
           };
         }),
 
       select: (selectedId) => set({ selectedId }),
+
+      undo: (assetId) =>
+        set((state) => {
+          const trail = state.history[assetId];
+          if (!trail || trail.undo.length === 0) return {};
+          const previous = trail.undo[trail.undo.length - 1]!;
+          const current = state.drawings[assetId] ?? [];
+          return {
+            drawings: withList(state.drawings, assetId, previous),
+            history: {
+              ...state.history,
+              [assetId]: { undo: trail.undo.slice(0, -1), redo: [...trail.redo, current].slice(-MAX_HISTORY) },
+            },
+            selectedId: keepSelection(state.selectedId, current, previous),
+          };
+        }),
+
+      redo: (assetId) =>
+        set((state) => {
+          const trail = state.history[assetId];
+          if (!trail || trail.redo.length === 0) return {};
+          const next = trail.redo[trail.redo.length - 1]!;
+          const current = state.drawings[assetId] ?? [];
+          return {
+            drawings: withList(state.drawings, assetId, next),
+            history: {
+              ...state.history,
+              [assetId]: { undo: [...trail.undo, current].slice(-MAX_HISTORY), redo: trail.redo.slice(0, -1) },
+            },
+            selectedId: keepSelection(state.selectedId, current, next),
+          };
+        }),
     }),
     {
       name: 'bt.drawings',
@@ -179,6 +230,49 @@ export function migrateDrawings(persisted: unknown, from: number): { drawings: R
   }
 
   return { drawings: (state.drawings as Record<string, Drawing[]> | undefined) ?? {} };
+}
+
+/**
+ * Removing an asset's last drawing drops its key, so the asset falls back to
+ * the shared empty result instead of an empty array of its own.
+ */
+function withList(drawings: Record<string, Drawing[]>, assetId: string, list: Drawing[]): Record<string, Drawing[]> {
+  const next = { ...drawings };
+  if (list.length > 0) next[assetId] = list;
+  else delete next[assetId];
+  return next;
+}
+
+/** An undoable change: the new list, with the old one kept to go back to and the redo trail dropped. */
+function change(
+  state: Pick<DrawingsState, 'drawings' | 'history'>,
+  assetId: string,
+  list: Drawing[],
+): Pick<DrawingsState, 'drawings' | 'history'> {
+  const trail = state.history[assetId];
+  const before = state.drawings[assetId] ?? [];
+  return {
+    drawings: withList(state.drawings, assetId, list),
+    history: { ...state.history, [assetId]: { undo: [...(trail?.undo ?? []), before].slice(-MAX_HISTORY), redo: [] } },
+  };
+}
+
+/** A selection survives an undo or redo only while the drawing it points at is still there. */
+function keepSelection(selectedId: string | null, before: Drawing[], after: Drawing[]): string | null {
+  if (!selectedId) return null;
+  // A selection on another asset is not this list's to drop.
+  if (!before.some((drawing) => drawing.id === selectedId)) return selectedId;
+  return after.some((drawing) => drawing.id === selectedId) ? selectedId : null;
+}
+
+/** Whether the asset has a change to undo. */
+export function selectCanUndo(state: Pick<DrawingsState, 'history'>, assetId: string | null): boolean {
+  return !!assetId && (state.history[assetId]?.undo.length ?? 0) > 0;
+}
+
+/** Whether the asset has an undone change to redo. */
+export function selectCanRedo(state: Pick<DrawingsState, 'history'>, assetId: string | null): boolean {
+  return !!assetId && (state.history[assetId]?.redo.length ?? 0) > 0;
 }
 
 function isComplete(kind: DrawingKind, points: ChartPoint[]): boolean {

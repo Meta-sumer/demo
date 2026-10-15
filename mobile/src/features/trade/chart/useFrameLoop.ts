@@ -22,11 +22,14 @@ export function useFrameClock(
     enabled = true,
     maxFps = 60,
     continuous = false,
+    secondsOnly = false,
   }: {
     enabled?: boolean;
     maxFps?: number;
     /** Write every frame: something is animating against the clock (a fade, a pulse). */
     continuous?: boolean;
+    /** Write only when the second changes: a countdown, and nothing that moves. */
+    secondsOnly?: boolean;
   } = {},
 ): SharedValue<number> {
   const now = useSharedValue(Date.now());
@@ -50,9 +53,13 @@ export function useFrameClock(
       // How long it takes the clock to move half a pixel at this zoom.
       const halfPixelMs = s > 0 && bucket > 0 ? (bucket / s) * 0.5 : 1000;
       const newSecond = Math.floor(time / 1000) !== Math.floor(previous / 1000);
+      if (secondsOnly) {
+        if (newSecond) now.value = time;
+        return;
+      }
       if (continuous || newSecond || time - previous >= halfPixelMs) now.value = time;
     },
-    [minInterval, continuous, lastRun, now, view, series],
+    [minInterval, continuous, secondsOnly, lastRun, now, view, series],
   );
   const callback = useFrameCallback(tick, false);
 
