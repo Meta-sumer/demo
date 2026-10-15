@@ -13,9 +13,8 @@ import { API_URL } from '../config';
 
 void SplashScreen.preventAutoHideAsync();
 
-// The deployed API sleeps when idle and takes a while to answer its first
-// request. Knocking now means it is usually awake by the time someone has
-// typed their password. Nothing waits on the answer.
+// Opens the connection to the server (DNS, TLS) while the splash screen is
+// up, so the first real request does not pay for it. Nothing waits on it.
 fetch(API_URL + '/health').catch(() => undefined);
 
 const queryClient = new QueryClient({

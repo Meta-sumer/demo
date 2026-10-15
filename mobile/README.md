@@ -13,10 +13,8 @@ npm install          # this folder is NOT part of the root npm workspace
 npm start            # Metro; press `a` for Android, or scan the QR code with Expo Go (SDK 54)
 ```
 
-By default the app talks to the deployed API on Render
-(`https://binary-trading-api-ih4v.onrender.com`). The free Render instance
-sleeps when idle, so the first request after a while can take 30-60 seconds;
-the app pings `/health` on launch to wake it early.
+By default the app talks to the production server at
+`https://wintratrade.online/api` (websocket `wss://wintratrade.online/ws`).
 
 To use a server on your own machine instead, create `mobile/.env.local`:
 
