@@ -12,7 +12,8 @@
       "env": {
         "EXPO_PUBLIC_API_URL": "https://wintratrade.online/api",
         "EXPO_PUBLIC_WS_URL": "wss://wintratrade.online/ws"
-      }
+      },
+      "autoIncrement": true
     },
     "production": {
       "autoIncrement": true,

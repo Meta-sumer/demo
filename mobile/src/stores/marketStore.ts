@@ -9,6 +9,8 @@ interface MarketState {
   feeds: Record<string, FeedHealth>;
 
   applyTick: (tick: Tick) => void;
+  /** The newest tick of several assets in one update (see useRealtime). */
+  applyTicks: (ticks: Tick[]) => void;
   setFeeds: (feeds: FeedHealth[]) => void;
   setFeed: (feed: FeedHealth) => void;
 }
@@ -24,6 +26,20 @@ export const useMarketStore = create<MarketState>((set, get) => ({
       ticks: { ...state.ticks, [tick.assetId]: tick },
       previous: current ? { ...state.previous, [tick.assetId]: current.price } : state.previous,
     }));
+  },
+
+  applyTicks(batch) {
+    if (batch.length === 0) return;
+    set((state) => {
+      const ticks = { ...state.ticks };
+      const previous = { ...state.previous };
+      for (const tick of batch) {
+        const current = ticks[tick.assetId];
+        if (current) previous[tick.assetId] = current.price;
+        ticks[tick.assetId] = tick;
+      }
+      return { ticks, previous };
+    });
   },
 
   setFeeds(feeds) {

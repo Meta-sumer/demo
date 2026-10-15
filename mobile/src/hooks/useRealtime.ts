@@ -13,6 +13,9 @@ import type { AccountType, SupportConversation, SupportMessage, Tick, Trade, Wal
 import { announceResult } from '../features/trade/announceResult';
 import { USDT_KEY } from '../features/usdt/queries';
 
+/** How often live prices reach the screen, at most. */
+const TICK_FLUSH_MS = 250;
+
 /** One cache entry for both balances; an `['wallet']` invalidation reaches it too. */
 export const ACCOUNTS_KEY = ['wallet', 'accounts'] as const;
 
@@ -62,9 +65,29 @@ export function useRealtime(): void {
       .then((thread) => useSupportStore.getState().setThread(thread))
       .catch(() => undefined);
 
+    /*
+     * Prices arrive up to 20 times a second per asset (the feed ticks every
+     * 50 ms). Applying each one re-renders the ticket, the header and the chart
+     * that often, which a phone's JS thread cannot keep up with: taps then
+     * queue behind the renders and land late, several at once. Only the newest
+     * tick per asset is kept and the store is updated at most every
+     * TICK_FLUSH_MS. Nothing here decides a price - the server fills and
+     * settles every trade on its own ticks.
+     */
+    const pendingTicks = new Map<string, Tick>();
+    let tickFlush: ReturnType<typeof setTimeout> | null = null;
+    const flushTicks = () => {
+      tickFlush = null;
+      const batch = [...pendingTicks.values()];
+      pendingTicks.clear();
+      useMarketStore.getState().applyTicks(batch);
+    };
+
     const unsubscribers = [
       socket.on(WsEvents.MARKET_TICK, (payload) => {
-        useMarketStore.getState().applyTick(payload as Tick);
+        const tick = payload as Tick;
+        pendingTicks.set(tick.assetId, tick);
+        if (tickFlush === null) tickFlush = setTimeout(flushTicks, TICK_FLUSH_MS);
       }),
 
       socket.on(WsEvents.WALLET_UPDATED, (payload) => {
@@ -128,6 +151,8 @@ export function useRealtime(): void {
 
     return () => {
       for (const off of unsubscribers) off();
+      if (tickFlush !== null) clearTimeout(tickFlush);
+      pendingTicks.clear();
       socket.disconnect();
       useSupportStore.getState().reset();
       // Balances belong to the session. Which account was in use (demo or

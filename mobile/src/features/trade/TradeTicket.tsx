@@ -122,6 +122,15 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
   /** Set when the server refused the fill because the price moved. */
   const [reQuote, setReQuote] = useState<{ direction: Direction; serverPrice: number } | null>(null);
   const cooldownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * True from the moment an order is sent until its cooldown ends.
+   *
+   * `pending` alone is not enough: it is state, so it only changes on the next
+   * render. When the phone is busy, several taps can queue up and all run
+   * before that render, each still reading `pending` as null - and each one
+   * would place a trade. A ref changes at once.
+   */
+  const sendingRef = useRef(false);
   const scrollRef = useRef<ScrollView | null>(null);
   /** Where the investment block starts inside the ticket's scroll area. */
   const investmentY = useRef(0);
@@ -317,11 +326,16 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
     onSettled: () => {
       // Short cooldown after the round trip - a fast double tap is almost never
       // two intended trades.
-      cooldownRef.current = setTimeout(() => setPending(null), 350);
+      cooldownRef.current = setTimeout(() => {
+        sendingRef.current = false;
+        setPending(null);
+      }, 350);
     },
   });
 
   function send(direction: Direction, quotedPrice: number | null) {
+    if (sendingRef.current) return;
+    sendingRef.current = true;
     setPending(direction);
     setSheetError(null);
     // Freeze the preview at the price and instant of the press. The chart's
@@ -336,7 +350,7 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
 
   /** UP or DOWN was pressed. */
   function press(direction: Direction) {
-    if (pending || cannotTrade) return;
+    if (pending || sendingRef.current || cannotTrade) return;
     Keyboard.dismiss();
     setReQuote(null);
     if (confirmBeforeTrade) {
