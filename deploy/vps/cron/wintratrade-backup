@@ -1,0 +1,4 @@
+# Nightly MongoDB backup + restore check for wintratrade.online (installed by deploy/vps/deploy.sh).
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+30 2 * * * root bash /opt/wintratrade/deploy/vps/backup-mongo.sh >> /var/log/wintratrade-backup.log 2>&1

@@ -8,7 +8,7 @@
 #   1. builds the client and admin inside a Node container (no Node on the host)
 #   2. publishes both builds to /var/www/wintratrade
 #   3. publishes the app download page (the APK itself is not in git)
-#   4. updates the shared nginx snippet and reloads nginx
+#   4. updates the shared nginx snippet and reloads nginx, installs the backup cron
 #   5. rebuilds and restarts the API container; MongoDB and Redis keep running
 #   6. waits until the API answers /ready
 #
@@ -39,6 +39,10 @@ echo "== nginx"
 # install, so it is never overwritten from here.
 cp deploy/vps/nginx/wintratrade-api.conf /etc/nginx/snippets/wintratrade-api.conf
 nginx -t -q && systemctl reload nginx
+
+echo "== backups"
+# Nightly dump + restore check of MongoDB (see backup-mongo.sh).
+install -m 644 deploy/vps/cron/wintratrade-backup /etc/cron.d/wintratrade-backup
 
 echo "== rebuild + restart API"
 $COMPOSE up -d --build server

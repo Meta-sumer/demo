@@ -41,6 +41,7 @@ server copy differs from GitHub.
 | `nginx/wintratrade-api.conf` | `/etc/nginx/snippets/wintratrade-api.conf`, copied on every deploy |
 | `nginx/wintratrade.conf` | `/etc/nginx/conf.d/wintratrade.conf`, first install only; certbot edits it afterwards |
 | `download/index.html` | `/var/www/wintratrade/downloads/index.html`, copied on every deploy |
+| `backup-mongo.sh` + `cron/wintratrade-backup` | `/etc/cron.d/wintratrade-backup`: nightly 02:30 dump of MongoDB to `/var/backups/wintratrade` (14 days kept), each archive verified by a scratch restore |
 | `bootstrap.sh`, `first-setup.sh` | fresh server only |
 
 Not in git, by design:
@@ -86,6 +87,16 @@ certbot --nginx --non-interactive --agree-tos --register-unsafely-without-email 
 Keep the folder name `/opt/wintratrade`: Docker names the data volumes after
 it (`wintratrade_mongo-data` and so on), so a different folder starts with an
 empty database.
+
+## Backups
+
+`backup-mongo.sh` runs every night at 02:30 (log: `/var/log/wintratrade-backup.log`).
+It writes `/var/backups/wintratrade/binary_trading-<UTC time>.archive.gz`,
+restores it into a scratch database to check that every collection came back,
+drops the scratch copy, and keeps 14 days. Run it by hand at any time with
+`bash /opt/wintratrade/deploy/vps/backup-mongo.sh`. The restore steps are at
+the top of the script. These archives are on the same server; copy them off
+the machine (or enable Hostinger's VPS backups) to survive losing the VPS.
 
 ## When something goes wrong
 

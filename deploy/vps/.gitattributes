@@ -1,3 +1,4 @@
 # These run on Linux; keep LF endings even in a Windows checkout.
 *.sh   text eol=lf
 *.conf text eol=lf
+cron/*  text eol=lf
