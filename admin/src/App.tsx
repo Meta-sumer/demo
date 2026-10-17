@@ -25,6 +25,7 @@ import { ReportsPage } from './pages/Reports';
 import { AuditLogsPage } from './pages/AuditLogs';
 import { ReconciliationPage } from './pages/Reconciliation';
 import { SettingsPage } from './pages/Settings';
+import { SecurityPage } from './pages/Security';
 import { SupportPage } from './pages/Support';
 import { UsdtDashboardPage } from './pages/usdt/UsdtDashboard';
 import { UsdtDepositsPage } from './pages/usdt/UsdtDeposits';
@@ -86,6 +87,8 @@ export function App() {
         }
       >
         <Route path="/admin/dashboard" element={<DashboardPage />} />
+        {/* Every admin manages their own two-factor here; no permission needed. */}
+        <Route path="/admin/security" element={<SecurityPage />} />
 
         {GUARDED_ROUTES.map((route) => (
           <Route

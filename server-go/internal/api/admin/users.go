@@ -2,6 +2,7 @@ package admin
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -9,7 +10,6 @@ import (
 	"binarytrading/internal/config"
 	"binarytrading/internal/models"
 	"binarytrading/internal/platform/httpx"
-	"binarytrading/internal/platform/util"
 	"binarytrading/internal/service/audit"
 	"binarytrading/internal/service/users"
 	"binarytrading/internal/service/wallets"
@@ -127,7 +127,8 @@ func patchUser(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	before, after, err := users.AdminUpdateUser(r.Context(), id.Hex(), in, actor.Role)
+	before, after, rev, err := users.AdminUpdateUserBy(r.Context(), id.Hex(), in,
+		users.UpdateActor{UserID: actor.UserID, Role: actor.Role, Permissions: actor.Permissions})
 	if err != nil {
 		return err
 	}
@@ -136,7 +137,11 @@ func patchUser(w http.ResponseWriter, r *http.Request) error {
 		action = audit.UserStatusChanged
 	}
 	e := entry(r, actor, action, "User", chi.URLParam(r, "id"))
-	e.Before, e.After = users.AuditDoc(before), users.AuditDoc(after)
+	afterDoc := users.AuditDoc(after)
+	if rev != nil {
+		afterDoc["sessionsRevoked"] = bson.M{"reason": rev.Reason, "refreshTokensRevoked": rev.RefreshTokensRevoked}
+	}
+	e.Before, e.After = users.AuditDoc(before), afterDoc
 	audit.Write(r.Context(), e)
 	return httpx.OK(w, after)
 }
@@ -165,46 +170,47 @@ func adjustWallet(w http.ResponseWriter, r *http.Request) error {
 	if err := b.err(); err != nil {
 		return err
 	}
+	// One key per attempt, required: a resent request (double click, retry
+	// after a timeout) replays the first result instead of adjusting twice.
+	idemKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if err := wallets.ValidateClientIdempotencyKey(idemKey); err != nil {
+		return err
+	}
 	amount := int64(amountF)
 	if account == models.AccountDemo {
 		if _, err := wallets.EnsureDemoWallet(r.Context(), id.Hex()); err != nil {
 			return err
 		}
 	}
-	ref := util.Reference("ADJ")
-	in := wallets.AdjustmentInput{
+	res, err := wallets.AdminAdjustWallet(r.Context(), wallets.AdminAdjustmentInput{
 		UserID:         id.Hex(),
 		AccountType:    account,
+		Direction:      direction,
 		Amount:         amount,
-		ReferenceType:  "AdminAdjustment",
-		ReferenceID:    ref,
-		IdempotencyKey: "adjust:" + ref,
-		Description:    reason,
-		Metadata:       map[string]any{"adjustedBy": actor.UserID},
-	}
-	var mutation wallets.MutationResult
-	if direction == "CREDIT" {
-		in.Type = models.WalletTransactionType("ADJUSTMENT_CREDIT")
-		mutation, err = wallets.CreditWallet(r.Context(), in)
-	} else {
-		in.Type = models.WalletTransactionType("ADJUSTMENT_DEBIT")
-		mutation, err = wallets.DebitWallet(r.Context(), in)
-	}
+		Reason:         reason,
+		ActorID:        actor.UserID,
+		IdempotencyKey: idemKey,
+	})
 	if err != nil {
 		return err
+	}
+	if res.Replayed {
+		// Already applied and audited by the original request.
+		w.Header().Set("Idempotent-Replayed", "true")
+		return httpx.OK(w, res.Wallet)
 	}
 
 	// A manual balance change is one of the most sensitive actions in the
 	// platform, so the audit row is written before the response.
 	e := entry(r, actor, audit.WalletAdjusted, "Wallet", chi.URLParam(r, "id"))
 	e.After = bson.D{
-		{Key: "reference", Value: ref},
+		{Key: "reference", Value: res.Reference},
 		{Key: "direction", Value: direction},
 		{Key: "accountType", Value: account},
 		{Key: "amount", Value: amount},
 		{Key: "reason", Value: reason},
-		{Key: "balanceAfter", Value: mutation.Wallet.Balance},
+		{Key: "balanceAfter", Value: res.Wallet.Balance},
 	}
 	audit.Write(r.Context(), e)
-	return httpx.OK(w, mutation.Wallet)
+	return httpx.OK(w, res.Wallet)
 }

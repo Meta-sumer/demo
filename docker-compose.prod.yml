@@ -32,3 +32,10 @@ services:
   server:
     ports: !override
       - "127.0.0.1:4000:4000"
+    environment:
+      # Nginx on the host reaches the API through Docker's bridge, so the peer
+      # the API sees is the bridge gateway (172.16.0.0/12), not 127.0.0.1.
+      # Without this every customer would share one address for rate limits.
+      # Safe because the port above is bound to 127.0.0.1: only the host
+      # (Nginx) can connect, and Nginx overwrites X-Forwarded-For.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.16.0.0/12}

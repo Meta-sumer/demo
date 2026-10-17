@@ -7,6 +7,7 @@ import { ApiRequestError } from '../services/http';
 import { useAuthStore } from '../stores/authStore';
 import { toast } from '../hooks/useToast';
 import { formatDateTime, formatMoney, formatSignedMoney, fromMinor, toMinor } from '../utils/format';
+import { createAttemptKey } from '../utils/idempotency';
 import { Badge, Panel, PanelHeader, Skeleton, Stat, StatusBadge } from '../components/ui';
 
 /**
@@ -46,14 +47,17 @@ export function UserDetailPage() {
     onError: (err) => toast('error', 'Update failed', err instanceof ApiRequestError ? err.message : undefined),
   });
 
+  // One key per attempt: resending the same adjustment (a retry after a
+  // timeout) reuses it, so the server applies it once.
+  const [adjustKey] = useState(() => createAttemptKey());
+
   const adjustMutation = useMutation({
-    mutationFn: () =>
-      api.users.adjustWallet(id, {
-        amount: adjustment.amountMinor,
-        direction: adjustment.direction,
-        reason: adjustment.reason,
-      }),
+    mutationFn: () => {
+      const input = { amount: adjustment.amountMinor, direction: adjustment.direction, reason: adjustment.reason };
+      return api.users.adjustWallet(id, input, adjustKey.for({ id, ...input }));
+    },
     onSuccess: () => {
+      adjustKey.reset();
       void queryClient.invalidateQueries({ queryKey: ['users', id] });
       setAdjustment((a) => ({ ...a, reason: '' }));
       toast('success', 'Wallet adjusted', 'The change is recorded in the audit log');

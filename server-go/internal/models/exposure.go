@@ -28,11 +28,14 @@ type Exposure struct {
 	UpPotentialPayout   int64         `bson:"upPotentialPayout"`
 	DownPotentialPayout int64         `bson:"downPotentialPayout"`
 	PotentialLiability  int64         `bson:"potentialLiability"`
-	OpenTrades          int64         `bson:"openTrades"`
-	HedgedNotional      int64         `bson:"hedgedNotional"`
-	UpdatedAt           time.Time     `bson:"updatedAt"`
-	CreatedAt           time.Time     `bson:"createdAt"`
-	V                   int64         `bson:"__v"`
+	// Liability by expiry bucket and with no netting (see ExposureSnapshot).
+	ExpiryLiability    int64     `bson:"expiryLiability"`
+	MaxPayoutLiability int64     `bson:"maxPayoutLiability"`
+	OpenTrades         int64     `bson:"openTrades"`
+	HedgedNotional     int64     `bson:"hedgedNotional"`
+	UpdatedAt          time.Time `bson:"updatedAt"`
+	CreatedAt          time.Time `bson:"createdAt"`
+	V                  int64     `bson:"__v"`
 }
 
 func init() {

@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { api } from '../services/api';
 import { clearTokens, loadTokens, saveTokens } from '../services/http';
-import type { AdminUser } from '../types/api';
+import type { AdminUser, AuthResult, MfaChallenge } from '../types/api';
 
 type AuthStatus = 'idle' | 'loading' | 'authenticated' | 'anonymous';
 
@@ -10,7 +10,13 @@ interface AuthState {
   user: AdminUser | null;
   error: string | null;
   hydrate: () => Promise<void>;
-  login: (email: string, password: string) => Promise<void>;
+  /**
+   * The password step. Resolves to null when signed in, or to the challenge
+   * when the account still needs its second factor (or has to enrol one).
+   */
+  login: (email: string, password: string) => Promise<MfaChallenge | null>;
+  /** Stores the session a finished second step returned. */
+  completeLogin: (result: AuthResult) => void;
   logout: () => Promise<void>;
   can: (permission: string) => boolean;
 }
@@ -39,12 +45,21 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ status: 'loading', error: null });
     try {
       const result = await api.auth.login(email, password);
-      saveTokens(result.tokens);
-      set({ status: 'authenticated', user: result.user });
+      if ('mfaRequired' in result) {
+        set({ status: 'anonymous' });
+        return result;
+      }
+      get().completeLogin(result);
+      return null;
     } catch (err) {
       set({ status: 'anonymous', error: (err as Error).message });
       throw err;
     }
+  },
+
+  completeLogin(result) {
+    saveTokens(result.tokens);
+    set({ status: 'authenticated', user: result.user, error: null });
   },
 
   async logout() {

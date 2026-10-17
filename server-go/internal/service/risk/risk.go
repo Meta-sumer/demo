@@ -46,6 +46,8 @@ type RiskInputs struct {
 	FeedStatus                 models.FeedStatus
 	SecondsToNearestExpiry     *int64
 	ExistingHedgeNotional      int64
+	// Platform-wide expiry liability; read only with a liability limit set.
+	PlatformLiability int64
 }
 
 var feedPenalty = map[models.FeedStatus]float64{
@@ -111,11 +113,29 @@ func AssessRisk(in RiskInputs) models.RiskAssessment {
 	// The binding constraint decides: whichever ceiling is closest to being hit.
 	utilisationPercent := max(grossUtilisation, netUtilisation, globalUtilisation)
 
-	if grossUtilisation >= netUtilisation && grossUtilisation >= globalUtilisation {
+	// Liability ceilings count only when configured (0 = off), and only win
+	// when strictly tighter, so the stake-based reasons stay as they were.
+	liabilityUtilisation, liabilityReason := 0.0, ""
+	if cfg.MaxAssetLiability > 0 {
+		liabilityUtilisation = util.SafePercent(float64(in.Exposure.ExpiryLiability), float64(cfg.MaxAssetLiability))
+		liabilityReason = "liability at " + toFixed(liabilityUtilisation, 1) + "% of the asset liability limit"
+	}
+	if cfg.MaxPlatformLiability > 0 {
+		if u := util.SafePercent(float64(in.PlatformLiability), float64(cfg.MaxPlatformLiability)); u > liabilityUtilisation {
+			liabilityUtilisation = u
+			liabilityReason = "platform liability at " + toFixed(u, 1) + "% of the global liability limit"
+		}
+	}
+
+	switch {
+	case liabilityUtilisation > utilisationPercent:
+		utilisationPercent = liabilityUtilisation
+		reasons = append(reasons, liabilityReason)
+	case grossUtilisation >= netUtilisation && grossUtilisation >= globalUtilisation:
 		reasons = append(reasons, "gross exposure at "+toFixed(grossUtilisation, 1)+"% of the asset limit")
-	} else if netUtilisation >= globalUtilisation {
+	case netUtilisation >= globalUtilisation:
 		reasons = append(reasons, "net exposure at "+toFixed(netUtilisation, 1)+"% of the asset limit")
-	} else {
+	default:
 		reasons = append(reasons, "platform gross exposure at "+toFixed(globalUtilisation, 1)+"% of the global limit")
 	}
 
@@ -149,6 +169,7 @@ func AssessRisk(in RiskInputs) models.RiskAssessment {
 		NetExposure:         in.Exposure.NetExposure,
 		GrossExposure:       in.Exposure.GrossExposure,
 		PotentialLiability:  in.Exposure.PotentialLiability,
+		ExpiryLiability:     in.Exposure.ExpiryLiability,
 		Reasons:             reasons,
 		HedgeDecision:       hedge.Decision,
 		TargetHedgeRatio:    hedge.Ratio,
@@ -303,6 +324,7 @@ func AssessAsset(ctx context.Context, assetID string) (models.RiskAssessment, er
 		FeedStatus:                 health.Status,
 		SecondsToNearestExpiry:     nearestExpry,
 		ExistingHedgeNotional:      hedged,
+		PlatformLiability:          portfolio.TotalExpiryLiability,
 	})
 
 	if err := cacheAssessment(ctx, assessment); err != nil {
@@ -456,6 +478,12 @@ type TradeLimitInput struct {
 	// trade count: it adds nothing to the house book, so the exposure,
 	// platform and concentration limits do not apply to it.
 	Demo bool
+	// Liability: the committed expiry liability of the asset and of the
+	// platform, and the committed counters of the expiry bucket the trade
+	// falls into. Read only when a liability limit is configured.
+	AssetLiability    int64
+	PlatformLiability int64
+	Bucket            exposure.BucketCounters
 }
 
 type LimitViolation struct {
@@ -503,12 +531,12 @@ func CheckTradeLimits(in TradeLimitInput) []LimitViolation {
 		userExposureLimit = *in.UserMaxExposure
 	}
 	if in.UserTotalExposure+stake > userExposureLimit {
-		violations = append(violations, LimitViolation{apperr.UserLimitExceeded, "This trade would exceed your open exposure limit"})
+		violations = append(violations, violationFor(exposure.RuleUserExposure, asset.Symbol))
 	}
 
 	projectedGross := exp.GrossExposure + stake
 	if projectedGross > min(asset.ExposureLimit, cfg.MaxAssetExposure) {
-		violations = append(violations, LimitViolation{apperr.ExposureLimitExceeded, "Exposure limit reached for " + asset.Symbol})
+		violations = append(violations, violationFor(exposure.RuleAssetGross, asset.Symbol))
 	}
 
 	projectedNet := exp.NetExposure - stake
@@ -519,11 +547,11 @@ func CheckTradeLimits(in TradeLimitInput) []LimitViolation {
 		projectedNet = -projectedNet
 	}
 	if projectedNet > asset.NetExposureLimit {
-		violations = append(violations, LimitViolation{apperr.ExposureLimitExceeded, "One-sided exposure limit reached for " + asset.Symbol})
+		violations = append(violations, violationFor(exposure.RuleAssetNet, asset.Symbol))
 	}
 
 	if in.GlobalGrossExposure+stake > cfg.MaxGrossExposure {
-		violations = append(violations, LimitViolation{apperr.RiskLimitExceeded, "Platform exposure limit reached, please try again shortly"})
+		violations = append(violations, violationFor(exposure.RulePlatformGross, asset.Symbol))
 	}
 
 	// Concentration. A share of the book is only meaningful once the book is
@@ -534,14 +562,53 @@ func CheckTradeLimits(in TradeLimitInput) []LimitViolation {
 	if projectedGross > userExposureLimit {
 		concentration := util.SafePercent(float64(in.UserAssetExposure+stake), float64(projectedGross))
 		if concentration > cfg.MaxUserAssetConcentrationPercent {
-			violations = append(violations, LimitViolation{
-				apperr.RiskLimitExceeded,
-				"Your share of the open book on " + asset.Symbol + " is too large",
-			})
+			violations = append(violations, violationFor(exposure.RuleConcentration, asset.Symbol))
+		}
+	}
+
+	// Liability: what the platform can lose, from the payout frozen on each
+	// trade, with UP and DOWN offsetting only inside one expiry bucket. A
+	// trade that does not raise the bucket's worst case is never refused here
+	// - refusing it would keep the book exactly as exposed as it is.
+	before := exposure.BucketLiability(in.Bucket)
+	after := exposure.BucketLiability(in.Bucket.With(in.Direction, stake, in.Profit))
+	if after > before {
+		if cfg.MaxExpiryLiability > 0 && after > cfg.MaxExpiryLiability {
+			violations = append(violations, violationFor(exposure.RuleExpiryLiability, asset.Symbol))
+		}
+		if cfg.MaxAssetLiability > 0 && in.AssetLiability-before+after > cfg.MaxAssetLiability {
+			violations = append(violations, violationFor(exposure.RuleAssetLiability, asset.Symbol))
+		}
+		if cfg.MaxPlatformLiability > 0 && in.PlatformLiability-before+after > cfg.MaxPlatformLiability {
+			violations = append(violations, violationFor(exposure.RulePlatformLiability, asset.Symbol))
 		}
 	}
 
 	return violations
+}
+
+// violationFor is the code and message of an exposure rule, shared by the
+// pure check and the atomic reservation so both refuse in the same words.
+func violationFor(rule, symbol string) LimitViolation {
+	switch rule {
+	case exposure.RuleUserExposure:
+		return LimitViolation{apperr.UserLimitExceeded, "This trade would exceed your open exposure limit"}
+	case exposure.RuleAssetGross:
+		return LimitViolation{apperr.ExposureLimitExceeded, "Exposure limit reached for " + symbol}
+	case exposure.RuleAssetNet:
+		return LimitViolation{apperr.ExposureLimitExceeded, "One-sided exposure limit reached for " + symbol}
+	case exposure.RulePlatformGross:
+		return LimitViolation{apperr.RiskLimitExceeded, "Platform exposure limit reached, please try again shortly"}
+	case exposure.RuleConcentration:
+		return LimitViolation{apperr.RiskLimitExceeded, "Your share of the open book on " + symbol + " is too large"}
+	case exposure.RuleExpiryLiability:
+		return LimitViolation{apperr.ExposureLimitExceeded, "Liability limit reached for " + symbol + " at this expiry"}
+	case exposure.RuleAssetLiability:
+		return LimitViolation{apperr.ExposureLimitExceeded, "Liability limit reached for " + symbol}
+	case exposure.RulePlatformLiability:
+		return LimitViolation{apperr.RiskLimitExceeded, "Platform liability limit reached, please try again shortly"}
+	}
+	return LimitViolation{apperr.RiskLimitExceeded, "Risk limit reached, please try again shortly"}
 }
 
 type TradeRiskContext struct {
@@ -554,6 +621,9 @@ type TradeRiskContext struct {
 	UserMaxExposure    *int64
 	// DEMO account: house-level limits are skipped (see TradeLimitInput.Demo).
 	Demo bool
+	// The trade's expiry, for its liability bucket (0 = unknown: the bucket
+	// is taken as empty).
+	ExpirySeconds int64
 }
 
 // AssertTradeWithinRiskLimits gathers live state and returns the first
@@ -571,6 +641,7 @@ func AssertTradeWithinRiskLimits(ctx context.Context, c TradeRiskContext) error 
 		portfolio  exposure.PortfolioExposure
 		userExp    exposure.UserExposure
 		openTrades int64
+		bucket     exposure.BucketCounters
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	account := models.AccountLive
@@ -582,6 +653,12 @@ func AssertTradeWithinRiskLimits(ctx context.Context, c TradeRiskContext) error 
 		g.Go(func() (err error) { snap, err = exposure.GetExposure(gctx, assetID, c.Asset.Symbol); return })
 		g.Go(func() (err error) { portfolio, err = exposure.GetPortfolioExposure(gctx); return })
 		g.Go(func() (err error) { userExp, err = exposure.GetUserExposure(gctx, c.UserID); return })
+		if c.ExpirySeconds > 0 {
+			// The trade's own expiry is fixed a moment later; this pre-check
+			// estimates its bucket, the atomic reservation uses the exact one.
+			expiry := util.NowMs() + c.ExpirySeconds*1000
+			g.Go(func() (err error) { bucket, err = exposure.GetBucketCounters(gctx, assetID, expiry); return })
+		}
 	}
 	// The open trade limit is per account, so practising cannot block real trading.
 	g.Go(func() (err error) {
@@ -607,6 +684,9 @@ func AssertTradeWithinRiskLimits(ctx context.Context, c TradeRiskContext) error 
 		UserMaxTradeAmount:  c.UserMaxTradeAmount,
 		UserMaxExposure:     c.UserMaxExposure,
 		Demo:                c.Demo,
+		AssetLiability:      snap.ExpiryLiability,
+		PlatformLiability:   portfolio.TotalExpiryLiability,
+		Bucket:              bucket,
 	})
 	if len(violations) > 0 {
 		first := violations[0]

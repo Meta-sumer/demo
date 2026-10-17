@@ -37,4 +37,6 @@ func Mount(r chi.Router) {
 	r.Route("/assets", func(r chi.Router) { r.Group(mountAssets) })
 	r.Route("/payment-methods", func(r chi.Router) { r.Group(mountPaymentMethods) })
 	r.Route("/support", func(r chi.Router) { r.Group(supportapi.MountAdmin) })
+	// Admin two-factor authentication and forced sign-out.
+	r.Route("/security", func(r chi.Router) { r.Group(mountSecurity) })
 }

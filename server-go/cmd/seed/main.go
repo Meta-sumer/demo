@@ -3,6 +3,11 @@
 // Creates the super admin, a demo trading account with a funded wallet, the
 // asset catalogue and its payout tables. Running it twice changes nothing.
 //
+// Passwords come from SEED_SUPER_ADMIN_PASSWORD, SEED_RISK_PASSWORD,
+// SEED_FINANCE_PASSWORD and SEED_TRADER_PASSWORD; any left unset is generated
+// and printed once when the account is created. `seed -reset-2fa <email>` is
+// the break-glass reset of an admin's two-factor enrolment.
+//
 // Forex and metals are only enabled for the simulated feed: neither Binance
 // nor a bare generic websocket prices them, and an asset with no feed would
 // simply refuse trades (which is the correct behaviour, but confusing in a
@@ -11,6 +16,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"flag"
 	"fmt"
 	"os"
 	"slices"
@@ -25,7 +32,9 @@ import (
 	"binarytrading/internal/platform/mongox"
 	"binarytrading/internal/platform/redisx"
 	"binarytrading/internal/service/assets"
+	"binarytrading/internal/service/audit"
 	"binarytrading/internal/service/auth"
+	"binarytrading/internal/service/auth/sessions"
 	"binarytrading/internal/service/payouts"
 	"binarytrading/internal/service/riskconfig"
 	"binarytrading/internal/service/wallets"
@@ -58,6 +67,9 @@ var seedAssets = []seedAsset{
 }
 
 func main() {
+	reset2FA := flag.String("reset-2fa", "", "break-glass: clear the two-factor enrolment of the admin account with this email, end its sessions, and exit")
+	flag.Parse()
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
@@ -66,6 +78,15 @@ func main() {
 	logx.Init(cfg.LogLevel, cfg.NodeEnv)
 
 	ctx := context.Background()
+	if *reset2FA != "" {
+		if err := resetTwoFactor(ctx, cfg, *reset2FA); err != nil {
+			logx.Error("2FA reset failed", "err", err.Error())
+			os.Exit(1)
+		}
+		_ = redisx.Disconnect()
+		_ = mongox.Disconnect(ctx)
+		return
+	}
 	if err := run(ctx, cfg); err != nil {
 		logx.Error("seed failed", "err", err.Error())
 		_ = redisx.Disconnect()
@@ -74,6 +95,46 @@ func main() {
 	}
 	_ = redisx.Disconnect()
 	_ = mongox.Disconnect(ctx)
+}
+
+// resetTwoFactor is the break-glass path for when no SUPER_ADMIN can sign in
+// (the last one lost their authenticator and recovery codes, or the
+// encryption key changed). It needs shell access to the server and is
+// audited like the console's reset.
+func resetTwoFactor(ctx context.Context, cfg *config.Env, email string) error {
+	if err := mongox.Connect(ctx, cfg.MongoURI, cfg.EnableMongoTransactions); err != nil {
+		return err
+	}
+	if err := redisx.Connect(ctx, cfg.RedisURL); err != nil {
+		logx.Warn("redis unavailable - sessions are still revoked in MongoDB", "err", err.Error())
+	}
+	var u models.User
+	email = strings.ToLower(strings.TrimSpace(email))
+	if err := mongox.C(models.CollUsers).FindOne(ctx, bson.M{"email": email}).Decode(&u); err != nil {
+		if mongox.IsNotFound(err) {
+			return fmt.Errorf("no account with email %s", email)
+		}
+		return err
+	}
+	wasEnabled, err := auth.ResetMFA(ctx, u.ID)
+	if err != nil {
+		return err
+	}
+	rev, err := sessions.RevokeAll(ctx, u.ID)
+	if err != nil {
+		return err
+	}
+	audit.Write(ctx, audit.Entry{
+		ActorRole:  "SYSTEM",
+		Action:     audit.AdminMFAReset,
+		Resource:   "User",
+		ResourceID: u.ID.Hex(),
+		Reason:     "break-glass reset from the seed command line",
+		Before:     map[string]any{"mfaEnabled": wasEnabled, "email": u.Email, "role": u.Role},
+		After:      map[string]any{"mfaEnabled": false, "sessionVersion": rev.Version, "refreshTokensRevoked": rev.RefreshTokensRevoked},
+	})
+	fmt.Printf("Two-factor authentication cleared for %s (%s); every session ended. It enrols again at its next sign-in.\n", u.Email, u.Role)
+	return nil
 }
 
 func run(ctx context.Context, cfg *config.Env) error {
@@ -95,20 +156,38 @@ func run(ctx context.Context, cfg *config.Env) error {
 	logx.Info("risk configuration ready", "version", rc.Version)
 
 	type account struct {
-		email, username, password, fullName string
-		role                                config.Role
+		email, username, fullName string
+		password                  string // "" = generate one
+		passwordEnv               string
+		role                      config.Role
 	}
+	// No password lives in this file: each comes from the environment, or is
+	// generated here and printed once (on stdout, not the log stream).
 	accounts := []account{
-		{cfg.SeedSuperAdminEmail, "superadmin", cfg.SeedSuperAdminPassword, "Platform Owner", config.RoleSuperAdmin},
-		{"risk@binary.local", "riskmanager", "Risk@12345", "Risk Manager", config.RoleRiskManager},
-		{"finance@binary.local", "financeops", "Finance@12345", "Finance Operations", config.RoleFinance},
-		{"trader@binary.local", "demotrader", "Trader@12345", "Demo Trader", config.RoleUser},
+		{cfg.SeedSuperAdminEmail, "superadmin", "Platform Owner", cfg.SeedSuperAdminPassword, "SEED_SUPER_ADMIN_PASSWORD", config.RoleSuperAdmin},
+		{"risk@binary.local", "riskmanager", "Risk Manager", cfg.SeedRiskPassword, "SEED_RISK_PASSWORD", config.RoleRiskManager},
+		{"finance@binary.local", "financeops", "Finance Operations", cfg.SeedFinancePassword, "SEED_FINANCE_PASSWORD", config.RoleFinance},
+		{"trader@binary.local", "demotrader", "Demo Trader", cfg.SeedTraderPassword, "SEED_TRADER_PASSWORD", config.RoleUser},
 	}
 	var traderID bson.ObjectID
+	var generated []string
 	for _, a := range accounts {
-		id, err := upsertUser(ctx, a.email, a.username, a.password, a.fullName, a.role)
+		password := a.password
+		if password != "" {
+			if err := checkPasswordPolicy(password); err != nil {
+				return fmt.Errorf("%s: %w", a.passwordEnv, err)
+			}
+		} else {
+			if password, err = randomPassword(); err != nil {
+				return err
+			}
+		}
+		id, created, err := upsertUser(ctx, a.email, a.username, password, a.fullName, a.role)
 		if err != nil {
 			return err
+		}
+		if created && a.password == "" {
+			generated = append(generated, fmt.Sprintf("  %-24s %-14s %s", a.email, a.role, password))
 		}
 		if _, err := wallets.GetOrCreateWallet(ctx, id.Hex(), models.AccountLive, ""); err != nil {
 			return err
@@ -143,10 +222,65 @@ func run(ctx context.Context, cfg *config.Env) error {
 		"riskManager", "risk@binary.local",
 		"finance", "finance@binary.local",
 		"trader", "trader@binary.local")
+	if len(generated) > 0 {
+		// Printed once, never logged, never stored in plain text: copy them now.
+		fmt.Println()
+		fmt.Println("Generated passwords for the accounts created by this run (shown once):")
+		for _, line := range generated {
+			fmt.Println(line)
+		}
+		fmt.Println("Administrative accounts enrol in two-factor authentication at their first sign-in.")
+		fmt.Println()
+	}
 	return nil
 }
 
-func upsertUser(ctx context.Context, email, username, password, fullName string, role config.Role) (bson.ObjectID, error) {
+// checkPasswordPolicy is the API's password rule (8..128 characters with a
+// lowercase letter, an uppercase letter and a digit).
+func checkPasswordPolicy(p string) error {
+	if len(p) < 8 || len(p) > 128 {
+		return fmt.Errorf("password must be 8 to 128 characters")
+	}
+	if !strings.ContainsAny(p, "abcdefghijklmnopqrstuvwxyz") || !strings.ContainsAny(p, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") ||
+		!strings.ContainsAny(p, "0123456789") {
+		return fmt.Errorf("password must contain a lowercase letter, an uppercase letter and a digit")
+	}
+	for _, published := range publishedPasswords {
+		if p == published {
+			return fmt.Errorf("that password was published in this project's documentation; choose another")
+		}
+	}
+	return nil
+}
+
+// publishedPasswords were once printed in the README and must never be used.
+var publishedPasswords = []string{"Admin@12345", "Risk@12345", "Finance@12345", "Trader@12345"}
+
+// randomPassword is 20 characters (~119 bits) that satisfy the policy.
+func randomPassword() (string, error) {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+	// Rejection sampling keeps every character equally likely.
+	limit := byte(256 - 256%len(alphabet))
+	for {
+		out := make([]byte, 0, 20)
+		buf := make([]byte, 64)
+		if _, err := rand.Read(buf); err != nil {
+			return "", err
+		}
+		for _, b := range buf {
+			if b < limit && len(out) < 20 {
+				out = append(out, alphabet[int(b)%len(alphabet)])
+			}
+		}
+		if p := string(out); len(out) == 20 && checkPasswordPolicy(p) == nil {
+			return p, nil
+		}
+	}
+}
+
+// upsertUser creates the account unless one with that email exists (an
+// existing account keeps its password). created reports which happened.
+func upsertUser(ctx context.Context, email, username, password, fullName string, role config.Role) (bson.ObjectID, bool, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	users := mongox.C(models.CollUsers)
 	var existing struct {
@@ -155,15 +289,15 @@ func upsertUser(ctx context.Context, email, username, password, fullName string,
 	err := users.FindOne(ctx, bson.M{"email": email}).Decode(&existing)
 	if err == nil {
 		logx.Info("user already exists", "email", email)
-		return existing.ID, nil
+		return existing.ID, false, nil
 	}
 	if !mongox.IsNotFound(err) {
-		return bson.NilObjectID, err
+		return bson.NilObjectID, false, err
 	}
 
 	hash, err := auth.HashPassword(password)
 	if err != nil {
-		return bson.NilObjectID, err
+		return bson.NilObjectID, false, err
 	}
 	now := mongox.Now()
 	u := models.User{
@@ -180,10 +314,10 @@ func upsertUser(ctx context.Context, email, username, password, fullName string,
 		UpdatedAt:     now,
 	}
 	if _, err := users.InsertOne(ctx, u); err != nil {
-		return bson.NilObjectID, err
+		return bson.NilObjectID, false, err
 	}
 	logx.Info("user created", "email", email, "role", role)
-	return u.ID, nil
+	return u.ID, true, nil
 }
 
 func seedAssetCatalogue(ctx context.Context, cfg *config.Env) error {

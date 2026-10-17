@@ -68,6 +68,17 @@ type RiskConfig struct {
 	// A single user may not hold more than this share of one asset's book.
 	MaxUserAssetConcentrationPercent float64 `bson:"maxUserAssetConcentrationPercent"`
 
+	// Liability ceilings, minor units; 0 disables the rule. Liability is the
+	// worst-case net payout of the open LIVE book using each trade's frozen
+	// profit, with UP and DOWN netted only inside one expiry bucket:
+	//   bucket   max(0, upProfit - downStake, downProfit - upStake)
+	//   asset    sum over its buckets
+	//   platform sum over assets
+	// A trade is refused only when it raises the figure above the ceiling.
+	MaxExpiryLiability   int64 `bson:"maxExpiryLiability"`
+	MaxAssetLiability    int64 `bson:"maxAssetLiability"`
+	MaxPlatformLiability int64 `bson:"maxPlatformLiability"`
+
 	// Hedging.
 	HedgeThresholdPercent   float64      `bson:"hedgeThresholdPercent"`
 	CriticalExposurePercent float64      `bson:"criticalExposurePercent"`
@@ -169,6 +180,9 @@ type RiskConfigLean struct {
 	MaxTradeAmount                   int64        `json:"maxTradeAmount"`
 	MaxOpenTradesPerUser             int64        `json:"maxOpenTradesPerUser"`
 	MaxUserAssetConcentrationPercent float64      `json:"maxUserAssetConcentrationPercent"`
+	MaxExpiryLiability               int64        `json:"maxExpiryLiability"`
+	MaxAssetLiability                int64        `json:"maxAssetLiability"`
+	MaxPlatformLiability             int64        `json:"maxPlatformLiability"`
 	HedgeThresholdPercent            float64      `json:"hedgeThresholdPercent"`
 	CriticalExposurePercent          float64      `json:"criticalExposurePercent"`
 	HedgeLevels                      []HedgeLevel `json:"hedgeLevels"`
@@ -210,6 +224,9 @@ func ToRiskConfigLean(c *RiskConfig) RiskConfigLean {
 		MaxTradeAmount:                   c.MaxTradeAmount,
 		MaxOpenTradesPerUser:             c.MaxOpenTradesPerUser,
 		MaxUserAssetConcentrationPercent: c.MaxUserAssetConcentrationPercent,
+		MaxExpiryLiability:               c.MaxExpiryLiability,
+		MaxAssetLiability:                c.MaxAssetLiability,
+		MaxPlatformLiability:             c.MaxPlatformLiability,
 		HedgeThresholdPercent:            c.HedgeThresholdPercent,
 		CriticalExposurePercent:          c.CriticalExposurePercent,
 		HedgeLevels:                      levels,

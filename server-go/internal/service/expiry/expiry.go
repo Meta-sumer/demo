@@ -1,12 +1,24 @@
 // Package expiry is the expiry engine (spec section 17).
 //
-// The expiry queue is a Redis sorted set scored by expiry time, so finding
-// what is due is one O(log n) range read rather than a table scan.
+// The expiry queue is a Redis sorted set scored by the time a trade is next
+// due for settlement (its expiry, or a later retry time set by settlement), so
+// finding what is due is one O(log n) range read rather than a table scan.
 //
-// A trade is only handed to settlement once a tick timestamped at or after
-// its expiry has been observed, or the grace window has elapsed. Without that
-// ordering a tick still in flight would be missed and the trade would settle
-// on a price older than the expiry instant.
+// A trade is only handed to settlement once a tick stamped after its expiry
+// has been observed, or the confirmation window has elapsed
+// (settlement.ExpiryConfirmed). Without that ordering a tick still in flight
+// would be missed.
+//
+// Concurrency (F-14). The expiry loop is leader-elected, but leadership can
+// briefly overlap (a paused leader whose lock lapsed). Every queue mutation it
+// makes therefore runs in a Redis script that first checks the leader token
+// (leader.Fence), so a former leader's hand-off is refused atomically. The
+// hand-off itself is a move - ZREM from the expiry queue and LPUSH onto the
+// settlement queue in one step, and only if the entry's score is still the
+// one that was read - so an entry settlement has just rescheduled is never
+// dropped. None of this is needed for correctness of outcomes (settlement is
+// guarded by the trade's state machine); it keeps the queues tidy and
+// prevents duplicate work and duplicate trade.expiring events.
 package expiry
 
 import (
@@ -20,17 +32,19 @@ import (
 
 	"binarytrading/internal/config"
 	"binarytrading/internal/models"
+	"binarytrading/internal/platform/leader"
 	"binarytrading/internal/platform/logx"
 	"binarytrading/internal/platform/mongox"
 	"binarytrading/internal/platform/redisx"
 	"binarytrading/internal/platform/ws"
-	"binarytrading/internal/service/marketdata"
 	"binarytrading/internal/service/metrics"
+	"binarytrading/internal/service/riskconfig"
 	"binarytrading/internal/service/settlement"
 )
 
-// ExpiryTickGraceMs: how long to wait for a post-expiry tick before settling
-// on what we have.
+// ExpiryTickGraceMs: the default confirmation window - how long to wait for a
+// post-expiry tick before handing a trade to settlement anyway. The effective
+// value is settlement policy (ConfirmationWindowMs).
 const ExpiryTickGraceMs = 2000
 
 // Defaults of the TS functions' optional parameters.
@@ -45,38 +59,97 @@ type DueTrade struct {
 	Symbol          string `json:"symbol"`
 	ExpiryTimestamp int64  `json:"expiryTimestamp"`
 	UserID          string `json:"userId"`
+	// The queue score the entry was read with (when it became due).
+	DueAt int64 `json:"dueAt"`
 }
 
 var liveStatuses = bson.A{string(models.TradeStatusOpen), string(models.TradeStatusSettling)}
 
+// Scripts. KEYS[last] is the leader lock key; ARGV[1] is "1" when the call is
+// fenced and ARGV[2] the token that must still hold it. A refused fence
+// returns -1 and changes nothing.
+var (
+	// Move due entries whose score is unchanged to the settlement queue.
+	handOffScript = redis.NewScript(`
+if ARGV[1] == '1' and redis.call('get', KEYS[3]) ~= ARGV[2] then return -1 end
+local moved = {}
+for i = 3, #ARGV, 2 do
+  local s = redis.call('zscore', KEYS[1], ARGV[i])
+  if s and tonumber(s) == tonumber(ARGV[i + 1]) then
+    redis.call('zrem', KEYS[1], ARGV[i])
+    redis.call('lpush', KEYS[2], ARGV[i])
+    moved[#moved + 1] = ARGV[i]
+  end
+end
+return moved`)
+
+	// Drop entries whose score is unchanged (orphans: no live trade).
+	dropScript = redis.NewScript(`
+if ARGV[1] == '1' and redis.call('get', KEYS[2]) ~= ARGV[2] then return -1 end
+local n = 0
+for i = 3, #ARGV, 2 do
+  local s = redis.call('zscore', KEYS[1], ARGV[i])
+  if s and tonumber(s) == tonumber(ARGV[i + 1]) then
+    redis.call('zrem', KEYS[1], ARGV[i])
+    n = n + 1
+  end
+end
+return n`)
+
+	// Push ids onto the settlement queue.
+	pushScript = redis.NewScript(`
+if ARGV[1] == '1' and redis.call('get', KEYS[2]) ~= ARGV[2] then return -1 end
+for i = 3, #ARGV do redis.call('lpush', KEYS[1], ARGV[i]) end
+return #ARGV - 2`)
+)
+
+// fenceArgs returns the lock key and the leading ARGV for a script. Outside a
+// leader loop (tests, manual runs) the call is unfenced.
+func fenceArgs(ctx context.Context) (string, []any, error) {
+	f := leader.FenceFromContext(ctx)
+	if f == nil {
+		return config.RedisKeys.ExpiryQueue, []any{"0", ""}, nil
+	}
+	if !f.LeaseValid() {
+		return "", nil, leader.ErrLeadershipLost
+	}
+	return f.Key, []any{"1", f.Token}, nil
+}
+
+func fenced(res any) error {
+	if n, ok := res.(int64); ok && n == -1 {
+		return leader.ErrLeadershipLost
+	}
+	return nil
+}
+
 // FindDueTrades reads due ids from the queue and drops those that no longer
 // correspond to an open trade.
 func FindDueTrades(ctx context.Context, at int64, limit int64) ([]DueTrade, error) {
-	ids, err := redisx.R().ZRangeByScore(ctx, config.RedisKeys.ExpiryQueue, &redis.ZRangeBy{
+	entries, err := redisx.R().ZRangeByScoreWithScores(ctx, config.RedisKeys.ExpiryQueue, &redis.ZRangeBy{
 		Min: "-inf", Max: strconv.FormatInt(at, 10), Offset: 0, Count: limit,
 	}).Result()
 	if err != nil {
 		return nil, err
 	}
-	if len(ids) == 0 {
+	if len(entries) == 0 {
 		return []DueTrade{}, nil
 	}
 
-	oids := make(bson.A, 0, len(ids))
-	for _, id := range ids {
+	oids := make(bson.A, 0, len(entries))
+	scores := make(map[string]int64, len(entries))
+	malformed := []redis.Z{}
+	for _, e := range entries {
+		id, _ := e.Member.(string)
 		oid, err := bson.ObjectIDFromHex(id)
 		if err != nil {
-			return nil, err
+			malformed = append(malformed, e)
+			continue
 		}
 		oids = append(oids, oid)
+		scores[id] = int64(e.Score)
 	}
 
-	cur, err := mongox.C(models.CollBinaryTrades).Find(ctx,
-		bson.M{"_id": bson.M{"$in": oids}, "status": bson.M{"$in": liveStatuses}},
-		options.Find().SetProjection(bson.M{"assetId": 1, "symbol": 1, "expiryTimestamp": 1, "userId": 1}))
-	if err != nil {
-		return nil, err
-	}
 	var trades []struct {
 		ID              bson.ObjectID `bson:"_id"`
 		AssetID         bson.ObjectID `bson:"assetId"`
@@ -84,35 +157,57 @@ func FindDueTrades(ctx context.Context, at int64, limit int64) ([]DueTrade, erro
 		ExpiryTimestamp int64         `bson:"expiryTimestamp"`
 		UserID          bson.ObjectID `bson:"userId"`
 	}
-	if err := cur.All(ctx, &trades); err != nil {
-		return nil, err
+	if len(oids) > 0 {
+		cur, err := mongox.C(models.CollBinaryTrades).Find(ctx,
+			bson.M{"_id": bson.M{"$in": oids}, "status": bson.M{"$in": liveStatuses}},
+			options.Find().SetProjection(bson.M{"assetId": 1, "symbol": 1, "expiryTimestamp": 1, "userId": 1}))
+		if err != nil {
+			return nil, err
+		}
+		if err := cur.All(ctx, &trades); err != nil {
+			return nil, err
+		}
 	}
 
-	// Ids in the queue that no longer correspond to an open trade are stale.
+	// Ids in the queue that no longer correspond to a live trade are stale.
 	found := make(map[string]bool, len(trades))
 	for _, t := range trades {
 		found[t.ID.Hex()] = true
 	}
-	orphans := []any{}
-	for _, id := range ids {
-		if !found[id] {
-			orphans = append(orphans, id)
+	orphans := malformed
+	for _, e := range entries {
+		id, _ := e.Member.(string)
+		if _, valid := scores[id]; valid && !found[id] {
+			orphans = append(orphans, e)
 		}
 	}
 	if len(orphans) > 0 {
-		if err := redisx.R().ZRem(ctx, config.RedisKeys.ExpiryQueue, orphans...).Err(); err != nil {
+		lockKey, args, err := fenceArgs(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range orphans {
+			args = append(args, o.Member, strconv.FormatInt(int64(o.Score), 10))
+		}
+		res, err := dropScript.Run(ctx, redisx.R(), []string{config.RedisKeys.ExpiryQueue, lockKey}, args...).Result()
+		if err != nil {
+			return nil, err
+		}
+		if err := fenced(res); err != nil {
 			return nil, err
 		}
 	}
 
 	out := make([]DueTrade, 0, len(trades))
 	for _, t := range trades {
+		id := t.ID.Hex()
 		out = append(out, DueTrade{
-			TradeID:         t.ID.Hex(),
+			TradeID:         id,
 			AssetID:         t.AssetID.Hex(),
 			Symbol:          t.Symbol,
 			ExpiryTimestamp: t.ExpiryTimestamp,
 			UserID:          t.UserID.Hex(),
+			DueAt:           scores[id],
 		})
 	}
 	return out, nil
@@ -127,52 +222,85 @@ type TickResult struct {
 // ProcessExpiries is one pass of the expiry worker: due trades are handed to
 // the settlement queue; nothing is settled here.
 func ProcessExpiries(ctx context.Context, at int64, limit int64) (TickResult, error) {
+	if _, _, err := fenceArgs(ctx); err != nil {
+		return TickResult{}, err
+	}
 	due, err := FindDueTrades(ctx, at, limit)
 	if err != nil {
 		return TickResult{}, err
 	}
-	queued, waiting := 0, 0
+	if len(due) == 0 {
+		return TickResult{}, nil
+	}
+	cfg, err := riskconfig.GetRiskConfig(ctx)
+	if err != nil {
+		return TickResult{}, err
+	}
+	policy, err := settlement.PolicyFor(ctx, cfg)
+	if err != nil {
+		return TickResult{}, err
+	}
 
+	ready := make([]DueTrade, 0, len(due))
+	waiting := 0
 	for _, trade := range due {
-		elapsed := at - trade.ExpiryTimestamp
-		if elapsed < ExpiryTickGraceMs {
-			confirmed, err := marketdata.HasTickAtOrAfter(ctx, trade.AssetID, trade.ExpiryTimestamp)
-			if err != nil {
-				return TickResult{}, err
-			}
-			if !confirmed {
-				waiting++
-				continue
-			}
+		confirmed, err := settlement.ExpiryConfirmed(ctx, trade.AssetID, trade.ExpiryTimestamp, at, policy)
+		if err != nil {
+			return TickResult{}, err
 		}
+		if !confirmed {
+			waiting++
+			continue
+		}
+		ready = append(ready, trade)
+	}
+	if len(ready) == 0 {
+		return TickResult{Due: len(due), Waiting: waiting}, nil
+	}
 
+	lockKey, args, err := fenceArgs(ctx)
+	if err != nil {
+		return TickResult{}, err
+	}
+	byID := make(map[string]DueTrade, len(ready))
+	for _, t := range ready {
+		byID[t.TradeID] = t
+		args = append(args, t.TradeID, strconv.FormatInt(t.DueAt, 10))
+	}
+	res, err := handOffScript.Run(ctx, redisx.R(),
+		[]string{config.RedisKeys.ExpiryQueue, config.RedisKeys.SettlementQueue, lockKey}, args...).Result()
+	if err != nil {
+		return TickResult{}, err
+	}
+	if err := fenced(res); err != nil {
+		return TickResult{}, err
+	}
+	moved, _ := res.([]any)
+
+	for _, m := range moved {
+		id, _ := m.(string)
+		trade, ok := byID[id]
+		if !ok {
+			continue
+		}
 		ws.Emit([]string{config.ChUser(trade.UserID)}, config.EvTradeExpiring, map[string]any{
 			"tradeId":         trade.TradeID,
 			"symbol":          trade.Symbol,
 			"expiryTimestamp": trade.ExpiryTimestamp,
 		})
-
-		if err := redisx.R().LPush(ctx, config.RedisKeys.SettlementQueue, trade.TradeID).Err(); err != nil {
-			return TickResult{}, err
-		}
-		// Remove it now so a second pass cannot enqueue the same trade;
-		// settlement is idempotent anyway, and the sweeper re-queues anything
-		// left behind.
-		if err := redisx.R().ZRem(ctx, config.RedisKeys.ExpiryQueue, trade.TradeID).Err(); err != nil {
-			return TickResult{}, err
-		}
-
-		metrics.RecordLatency(config.LatExpiryDetection, float64(elapsed))
-		queued++
+		metrics.RecordLatency(config.LatExpiryDetection, float64(at-trade.ExpiryTimestamp))
 	}
-
-	return TickResult{Due: len(due), Queued: queued, Waiting: waiting}, nil
+	return TickResult{Due: len(due), Queued: len(moved), Waiting: waiting}, nil
 }
 
-// SweepMissedExpiries is the safety net for trades the queue lost: anything
-// past expiry that is still OPEN, plus anything stuck in SETTLING after a
-// worker crash.
+// SweepMissedExpiries is the safety net that rebuilds the queues from the
+// trades themselves: anything past expiry that is still OPEN, plus anything
+// left in SETTLING (an interrupted settlement or early close). Duplicates are
+// harmless - settlement is idempotent and refuses to act early.
 func SweepMissedExpiries(ctx context.Context, at int64, limit int64) (int, error) {
+	if _, _, err := fenceArgs(ctx); err != nil {
+		return 0, err
+	}
 	staleBefore := time.UnixMilli(at - settlement.StaleSettlingMs).UTC()
 	cur, err := mongox.C(models.CollBinaryTrades).Find(ctx,
 		bson.M{"$or": bson.A{
@@ -193,11 +321,18 @@ func SweepMissedExpiries(ctx context.Context, at int64, limit int64) (int, error
 		return 0, nil
 	}
 
-	pipe := redisx.R().Pipeline()
-	for _, t := range missed {
-		pipe.LPush(ctx, config.RedisKeys.SettlementQueue, t.ID.Hex())
+	lockKey, args, err := fenceArgs(ctx)
+	if err != nil {
+		return 0, err
 	}
-	if _, err := pipe.Exec(ctx); err != nil {
+	for _, t := range missed {
+		args = append(args, t.ID.Hex())
+	}
+	res, err := pushScript.Run(ctx, redisx.R(), []string{config.RedisKeys.SettlementQueue, lockKey}, args...).Result()
+	if err != nil {
+		return 0, err
+	}
+	if err := fenced(res); err != nil {
 		return 0, err
 	}
 

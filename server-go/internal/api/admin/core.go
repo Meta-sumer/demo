@@ -40,8 +40,19 @@ func mountCore(r chi.Router) {
 	write(config.PermReconciliationResolve).Post("/reconciliation/{id}/resolve", httpx.H(resolveReconciliation))
 }
 
+// visibility is what the caller may see on the dashboard: exposure needs
+// exposure:read and P&L needs reports:read, as their own pages do. Any admin
+// reaches the dashboard; a SUPPORT agent sees activity, not the book.
+func visibility(r *http.Request) adminsvc.Visibility {
+	a := httpx.ActorFrom(r)
+	if a == nil {
+		return adminsvc.Visibility{}
+	}
+	return adminsvc.VisibilityFor(a.Role, a.Permissions)
+}
+
 func dashboard(w http.ResponseWriter, r *http.Request) error {
-	s, err := adminsvc.GetDashboardSummary(r.Context())
+	s, err := adminsvc.GetDashboardFor(r.Context(), visibility(r))
 	if err != nil {
 		return err
 	}
@@ -60,7 +71,7 @@ func dashboardSeries(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	series, err := adminsvc.GetDailySeries(r.Context(), days)
+	series, err := adminsvc.GetDailySeriesFor(r.Context(), days, visibility(r))
 	if err != nil {
 		return err
 	}
@@ -72,7 +83,7 @@ func dashboardAssets(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	rows, err := adminsvc.GetAssetVolume(r.Context(), days)
+	rows, err := adminsvc.GetAssetVolumeFor(r.Context(), days, visibility(r))
 	if err != nil {
 		return err
 	}
@@ -279,10 +290,19 @@ func listReconciliation(w http.ResponseWriter, r *http.Request) error {
 }
 
 func runReconciliation(w http.ResponseWriter, r *http.Request) error {
+	actor, err := httpx.RequireActor(r)
+	if err != nil {
+		return err
+	}
 	res, err := reconciliation.RunReconciliation(r.Context(), 0)
 	if err != nil {
 		return err
 	}
+	// Who ran a reconciliation, and what it found, belongs in the trail next
+	// to the resolutions of its alerts.
+	e := entry(r, actor, audit.ReconciliationRun, "ReconciliationRun", res.Reference)
+	e.After = map[string]any{"reference": res.Reference, "status": string(res.Status), "alerts": res.Alerts}
+	audit.Write(r.Context(), e)
 	return httpx.OK(w, res)
 }
 
@@ -308,6 +328,7 @@ func resolveReconciliation(w http.ResponseWriter, r *http.Request) error {
 	}
 	e := entry(r, actor, audit.ReconciliationResolved, "ReconciliationRun", chi.URLParam(r, "id"))
 	e.After = map[string]any{"note": note}
-	audit.Log(e)
+	// Awaited: closing a ledger discrepancy is acknowledged only once audited.
+	audit.Write(r.Context(), e)
 	return httpx.OK(w, map[string]bool{"resolved": true})
 }

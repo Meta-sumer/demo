@@ -23,7 +23,8 @@ type PayoutConfig struct {
 	ExpirySeconds int64         `bson:"expirySeconds"`
 	// Percentage of the stake paid as profit on a win, e.g. 82 => 82%.
 	PayoutPercent float64 `bson:"payoutPercent"`
-	// Optional per-expiry stake bounds, minor units; null falls back to the asset bounds.
+	// Optional per-expiry stake bounds, minor units; null means no per-expiry
+	// bound. The asset bounds apply either way.
 	MinStake      *int64         `bson:"minStake"`
 	MaxStake      *int64         `bson:"maxStake"`
 	Version       int64          `bson:"version"`
@@ -32,10 +33,27 @@ type PayoutConfig struct {
 	EffectiveTo   *time.Time     `bson:"effectiveTo"`
 	CreatedBy     *bson.ObjectID `bson:"createdBy"`
 	Note          *string        `bson:"note"`
-	CreatedAt     time.Time      `bson:"createdAt"`
-	UpdatedAt     time.Time      `bson:"updatedAt"`
-	V             int64          `bson:"__v"`
+	// Where the version is in the replacement protocol (PayoutActivation*).
+	// Absent on rows written before the protocol existed.
+	Activation *string `bson:"activation,omitempty"`
+	// The row this version replaced, and on a replaced row the version that
+	// replaced it: what a rollback uses to restore the previous terms.
+	Supersedes   *bson.ObjectID `bson:"supersedes,omitempty"`
+	SupersededBy *bson.ObjectID `bson:"supersededBy,omitempty"`
+	CreatedAt    time.Time      `bson:"createdAt"`
+	UpdatedAt    time.Time      `bson:"updatedAt"`
+	V            int64          `bson:"__v"`
 }
+
+// Replacement protocol states. A new version is inserted PENDING (never
+// visible to trading, which reads active rows only), the current row is closed,
+// and the new one is switched on as ACTIVATED. A replacement that fails is
+// ABANDONED and the row it closed is restored.
+const (
+	PayoutActivationPending   = "PENDING"
+	PayoutActivationActivated = "ACTIVATED"
+	PayoutActivationAbandoned = "ABANDONED"
+)
 
 func init() {
 	c := CollPayoutConfigs
@@ -50,6 +68,14 @@ func init() {
 			Collection: c,
 			Keys:       bson.D{{Key: "assetId", Value: 1}, {Key: "expirySeconds", Value: 1}},
 			Options:    options.Index().SetUnique(true).SetPartialFilterExpression(bson.D{{Key: "active", Value: true}}),
+		},
+		// At most one replacement in flight per (asset, expiry). Named, because
+		// the generated name would clash with the active-row index above.
+		mongox.Index{
+			Collection: c,
+			Keys:       bson.D{{Key: "assetId", Value: 1}, {Key: "expirySeconds", Value: 1}},
+			Options: options.Index().SetName("assetId_1_expirySeconds_1_pending").SetUnique(true).
+				SetPartialFilterExpression(bson.D{{Key: "activation", Value: PayoutActivationPending}}),
 		},
 	)
 }
@@ -66,6 +92,8 @@ type PayoutView struct {
 	EffectiveFrom iso.Time  `json:"effectiveFrom"`
 	EffectiveTo   *iso.Time `json:"effectiveTo"`
 	Note          *string   `json:"note"`
+	// PENDING / ACTIVATED / ABANDONED; omitted on rows that predate it.
+	Activation *string `json:"activation,omitempty"`
 }
 
 func ToPayoutView(p *PayoutConfig) PayoutView {
@@ -81,5 +109,6 @@ func ToPayoutView(p *PayoutConfig) PayoutView {
 		EffectiveFrom: iso.From(p.EffectiveFrom),
 		EffectiveTo:   iso.Ptr(p.EffectiveTo),
 		Note:          p.Note,
+		Activation:    p.Activation,
 	}
 }

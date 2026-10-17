@@ -96,6 +96,53 @@ export interface AuthResult {
   sessionId: string;
 }
 
+/**
+ * What /admin/login answers instead of a session when the account needs a
+ * second factor. The mfaToken is single use and only authorises the
+ * /admin/login/2fa steps.
+ */
+export interface MfaChallenge {
+  mfaRequired: true;
+  enrolmentRequired: boolean;
+  mfaToken: string;
+  expiresIn: number;
+  methods: string[];
+  user: { id: string; email: string; role: string };
+}
+
+/** A new authenticator secret, shown once while enrolling. */
+export interface MfaEnrolment {
+  secret: string;
+  secretGrouped: string;
+  otpauthUri: string;
+  issuer: string;
+  account: string;
+  algorithm: string;
+  digits: number;
+  period: number;
+  expiresIn: number;
+}
+
+export interface MfaStatus {
+  enabled: boolean;
+  required: boolean;
+  enrolledAt: string | null;
+  recoveryCodesRemaining: number;
+}
+
+export interface AdminMfaRow {
+  id: string;
+  email: string;
+  username: string;
+  fullName: string | null;
+  role: string;
+  status: string;
+  enabled: boolean;
+  enrolledAt: string | null;
+  recoveryCodesRemaining: number;
+  lastLoginAt: string | null;
+}
+
 export interface DashboardSummary {
   totalUsers: number;
   activeUsers: number;

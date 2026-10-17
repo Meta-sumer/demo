@@ -70,6 +70,8 @@ func RunReconciliation(ctx context.Context, windowMs int64) (*ReconciliationResu
 			return checkPlatformResultConsistency(ctx, windowFrom)
 		},
 		checkHedgeOrderIntegrity,
+		checkTransfersAgainstLedger,
+		checkStuckApprovedTransfers,
 		checkUsdtWalletLedgerAgainstBalances,
 		checkUsdtLockedAgainstOpenWithdrawals,
 		checkUsdtPaidDepositsCredited,
@@ -285,6 +287,15 @@ func checkLockedFundsAgainstOpenPositions(ctx context.Context) (models.Reconcili
 	if err != nil {
 		return models.ReconciliationCheck{}, err
 	}
+	// An APPROVED withdrawal keeps its reservation until its settlement is
+	// confirmed (lockedAmount is cleared in the same write as COMPLETED).
+	approvedLocks, err := sumByUser(ctx, models.CollTransfers, bson.M{
+		"kind": models.TransferKindWithdrawal, "status": models.TransferStatusApproved, "lockedAmount": bson.M{"$gt": 0},
+	}, "lockedAmount")
+	if err != nil {
+		return models.ReconciliationCheck{}, err
+	}
+	withdrawalLocks = append(withdrawalLocks, approvedLocks...)
 	// Trading wallets only: a USDT wallet's locks are withdrawals, checked by
 	// checkUsdtLockedAgainstOpenWithdrawals.
 	wcur, err := mongox.C(models.CollWallets).Find(ctx, bson.M{

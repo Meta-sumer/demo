@@ -41,8 +41,11 @@ type Settlement struct {
 	WalletTransactionID *bson.ObjectID `bson:"walletTransactionId"`
 	SettledBy           string         `bson:"settledBy"`
 	LatencyMs           *int64         `bson:"latencyMs"`
-	CreatedAt           time.Time      `bson:"createdAt"`
-	V                   int64          `bson:"__v"`
+	// How the outcome was decided (price, tick timestamps, provider, rule,
+	// risk-config version, policy). Absent on rows written before it existed.
+	Evidence  *SettlementEvidence `bson:"evidence,omitempty"`
+	CreatedAt time.Time           `bson:"createdAt"`
+	V         int64               `bson:"__v"`
 }
 
 func init() {

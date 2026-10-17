@@ -1,24 +1,50 @@
-// Package settlement is the settlement engine (spec section 18).
+// Package settlement is the settlement engine (spec section 18) and the one
+// state machine every trade outcome goes through - expiry settlement and the
+// customer's early close alike.
 //
-// A trade settles exactly once. Three independent guards make that structural
-// rather than hopeful:
+// State machine (durable, on the trade document):
 //
-//  1. the OPEN -> SETTLING claim is a conditional atomic update, so only one
-//     worker can take a trade;
-//  2. the wallet mutation is keyed `trade:settle:<id>` against a unique index,
-//     so the money moves at most once no matter how often this runs;
-//  3. `settlements.tradeId` is unique, so the ledger row cannot be duplicated.
+//	OPEN ──claim+intent──► SETTLING{intent} ──execute──► WON / LOST / DRAW / CLOSED_EARLY
 //
-// Everything is therefore safe to retry after a crash at any point.
+// Leaving OPEN is ONE conditional update that also records the immutable
+// SettlementIntent: the result, the single wallet operation, every amount and
+// the evidence it was decided on. Executing the intent is idempotent, so the
+// outcome is fixed the moment the trade leaves OPEN and a crash at any later
+// point is finished by whoever looks at the trade next, with the same result.
+//
+// Invariants for concurrent operation (any number of instances, any number of
+// queue copies of a trade, leader overlap in the expiry worker):
+//
+//  1. Exactly one claim. Both claims are conditional on status OPEN, and they
+//     are also disjoint in time by the database clock: an expiry claim needs
+//     expiryTimestamp <= $$NOW, an early-close claim needs expiryTimestamp >
+//     $$NOW + floor. Nothing settles at expiry before expiry, and nothing
+//     closes early at or after it.
+//  2. The intent never changes after the claim, except to adopt the outcome
+//     already booked on the wallet ledger by an earlier version (ledger wins),
+//     conditional on the intent id it replaces.
+//  3. One money movement: every outcome uses the wallet key
+//     trade:settle:<id> (partial unique index), so a replay moves nothing.
+//  4. One ledger row: settlements.tradeId is unique; the row is derived from
+//     the intent, so a replay writes the same row or finds it.
+//  5. One finalisation: SETTLING -> final is conditional on the intent id.
+//     Only the executor whose update matched releases exposure, emits
+//     trade.settled and notifies - so those happen once per trade too.
+//  6. Queues are hints. Losing, duplicating or reordering queue entries can
+//     delay an outcome but never change or repeat it; the database sweep
+//     rebuilds them from trades (expiry.SweepMissedExpiries,
+//     binary.RebuildExpiryQueue).
+//  7. A SETTLING trade without an intent can only come from an earlier version.
+//     Once stale it is finished from the wallet ledger / settlement row if
+//     money already moved, otherwise returned to OPEN - never settled before
+//     expiry.
 package settlement
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"binarytrading/internal/config"
 	"binarytrading/internal/models"
@@ -26,17 +52,12 @@ import (
 	"binarytrading/internal/platform/mongox"
 	"binarytrading/internal/platform/redisx"
 	"binarytrading/internal/platform/util"
-	"binarytrading/internal/platform/ws"
-	"binarytrading/internal/service/exposure"
-	"binarytrading/internal/service/marketdata"
 	"binarytrading/internal/service/metrics"
-	"binarytrading/internal/service/notifications"
 	"binarytrading/internal/service/riskconfig"
-	"binarytrading/internal/service/wallets"
 )
 
-// StaleSettlingMs: a trade stuck in SETTLING longer than this is assumed to be
-// an orphan.
+// StaleSettlingMs: a SETTLING trade untouched this long is assumed to be
+// abandoned by the process that claimed it.
 const StaleSettlingMs = 30_000
 
 // DefaultSettledBy is settleTrade's default settledBy.
@@ -46,8 +67,15 @@ const DefaultSettledBy = "settlement.worker"
 const (
 	StatusSettled          = "SETTLED"
 	StatusAlreadySettled   = "ALREADY_SETTLED"
-	StatusSkippedNoPrice   = "SKIPPED_NO_PRICE"
 	StatusClaimedElsewhere = "CLAIMED_ELSEWHERE"
+	// Deferred: no tick qualifies yet; retried at RetryAt (trade stays OPEN).
+	StatusSkippedNoPrice = "SKIPPED_NO_PRICE"
+	// Deferred: waiting for a tick stamped after expiry; retried at RetryAt.
+	StatusAwaitingTick = "AWAITING_POST_EXPIRY_TICK"
+	// Not expired yet: put back on the expiry queue for its expiry.
+	StatusNotDue = "NOT_DUE"
+	// Cancelled, unknown, or otherwise not something settlement acts on.
+	StatusNotSettleable = "NOT_SETTLEABLE"
 )
 
 type Outcome struct {
@@ -57,6 +85,10 @@ type Outcome struct {
 	ExpiryPrice    *float64            `json:"expiryPrice,omitempty"`
 	PayoutAmount   *int64              `json:"payoutAmount,omitempty"`
 	PlatformResult *int64              `json:"platformResult,omitempty"`
+	// The settlement rule that produced the result (models.SettlementRule*).
+	Rule string `json:"rule,omitempty"`
+	// For deferred outcomes: when the trade is due again, epoch ms.
+	RetryAt *int64 `json:"retryAt,omitempty"`
 }
 
 // DetermineResult is the pure comparison rule (spec section 17).
@@ -93,296 +125,228 @@ func ApplyDrawPolicy(result models.TradeResult, policy models.DrawPolicy) models
 	return models.TradeResultDraw
 }
 
-// SettleTrade settles one trade; settledBy "" means DefaultSettledBy.
+// Reschedule puts a trade back on the expiry queue so the expiry worker hands
+// it to settlement again at `at` (epoch ms). Idempotent.
+func Reschedule(ctx context.Context, tradeID string, at int64) error {
+	return redisx.R().ZAdd(ctx, config.RedisKeys.ExpiryQueue, redisZ(at, tradeID)).Err()
+}
+
+func loadTrade(ctx context.Context, oid bson.ObjectID) (*models.BinaryTrade, error) {
+	var t models.BinaryTrade
+	if err := mongox.C(models.CollBinaryTrades).FindOne(ctx, bson.M{"_id": oid}).Decode(&t); err != nil {
+		if mongox.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &t, nil
+}
+
+// SettleTrade drives one trade as far through the state machine as it can
+// go now; settledBy "" means DefaultSettledBy. Safe to call any number of
+// times, concurrently, on any instance.
 func SettleTrade(ctx context.Context, tradeID, settledBy string) (Outcome, error) {
 	if settledBy == "" {
 		settledBy = DefaultSettledBy
 	}
+	ctx = context.WithoutCancel(ctx)
 	startedAt := time.Now()
 
 	oid, err := bson.ObjectIDFromHex(tradeID)
 	if err != nil {
 		return Outcome{}, err
 	}
+	trade, err := loadTrade(ctx, oid)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if trade == nil {
+		_ = redisx.R().ZRem(ctx, config.RedisKeys.ExpiryQueue, tradeID).Err()
+		return Outcome{TradeID: tradeID, Status: StatusNotSettleable}, nil
+	}
 
-	var existing models.Settlement
-	err = mongox.C(models.CollSettlements).FindOne(ctx, bson.M{"tradeId": oid}).Decode(&existing)
-	if err == nil {
-		if err := ensureTradeFinalised(ctx, oid, tradeID, &existing); err != nil {
+	var outcome Outcome
+	switch trade.Status {
+	case models.TradeStatusSettling:
+		if trade.SettlementIntent != nil {
+			outcome, err = Execute(ctx, trade)
+		} else {
+			outcome, err = recoverWithoutIntent(ctx, trade, settledBy)
+		}
+	case models.TradeStatusOpen:
+		outcome, err = settleOpen(ctx, trade, settledBy)
+	case models.TradeStatusCancelled:
+		_ = redisx.R().ZRem(ctx, config.RedisKeys.ExpiryQueue, tradeID).Err()
+		outcome = Outcome{TradeID: tradeID, Status: StatusNotSettleable}
+	default:
+		_ = redisx.R().ZRem(ctx, config.RedisKeys.ExpiryQueue, tradeID).Err()
+		outcome = Outcome{TradeID: tradeID, Status: StatusAlreadySettled, Result: trade.Result}
+	}
+	if err != nil {
+		return Outcome{}, err
+	}
+	if outcome.Status == StatusSettled {
+		metrics.Since(config.LatSettlement, startedAt)
+	}
+	return outcome, nil
+}
+
+// settleOpen settles an OPEN trade at expiry: decide the price, then claim the
+// trade together with the outcome.
+func settleOpen(ctx context.Context, trade *models.BinaryTrade, settledBy string) (Outcome, error) {
+	tradeID := trade.ID.Hex()
+
+	// A settlement row on an OPEN trade predates the state machine (the row
+	// was written but the trade never updated): finish it from the books.
+	if intent, err := legacyIntent(ctx, trade, settledBy); err != nil {
+		return Outcome{}, err
+	} else if intent != nil {
+		claimed, err := attachIntent(ctx, trade, intent, models.TradeStatusOpen, settledBy)
+		if err != nil {
 			return Outcome{}, err
 		}
-		r := existing.Result
-		return Outcome{TradeID: tradeID, Status: StatusAlreadySettled, Result: &r}, nil
-	}
-	if !mongox.IsNotFound(err) {
-		return Outcome{}, err
-	}
-
-	claimed, err := claimTrade(ctx, oid)
-	if err != nil {
-		return Outcome{}, err
-	}
-	if claimed == nil {
-		return Outcome{TradeID: tradeID, Status: StatusClaimedElsewhere}, nil
+		if claimed == nil {
+			return Outcome{TradeID: tradeID, Status: StatusClaimedElsewhere}, nil
+		}
+		return Execute(ctx, claimed)
 	}
 
-	priceResult, err := marketdata.GetPriceAtOrBefore(ctx, claimed.AssetID.Hex(), claimed.ExpiryTimestamp)
-	if err != nil {
-		return Outcome{}, err
-	}
-	if priceResult == nil {
-		// No price at all: leave the trade claimed and retry later rather than
-		// settling on a guess. The stale-settling sweeper will pick it up again.
-		logx.Error("no expiry price available - settlement deferred", "tradeId", tradeID, "symbol", claimed.Symbol)
-		return Outcome{TradeID: tradeID, Status: StatusSkippedNoPrice}, nil
+	now := util.NowMs()
+	if now < trade.ExpiryTimestamp {
+		// Never settle early - whoever queued it (a duplicate entry, the
+		// sweeper, an operator) gets it back on the queue for its expiry.
+		if err := Reschedule(ctx, tradeID, trade.ExpiryTimestamp); err != nil {
+			return Outcome{}, err
+		}
+		at := trade.ExpiryTimestamp
+		return Outcome{TradeID: tradeID, Status: StatusNotDue, RetryAt: &at}, nil
 	}
 
 	cfg, err := riskconfig.GetRiskConfig(ctx)
 	if err != nil {
 		return Outcome{}, err
 	}
-	rawResult := DetermineResult(claimed.Direction, claimed.EntryPrice, priceResult.Price)
-	result := ApplyDrawPolicy(rawResult, cfg.DrawPolicy)
-
-	outcome, err := applySettlement(ctx, claimed, result, priceResult.Price, priceResult.Source, settledBy, startedAt)
+	policy, err := PolicyFor(ctx, cfg)
 	if err != nil {
 		return Outcome{}, err
 	}
-	metrics.Since(config.LatSettlement, startedAt)
-	return outcome, nil
-}
-
-// claimTrade is the atomic claim. It also re-claims trades orphaned by a
-// crashed worker. The claim refreshes updatedAt, which is what the staleness
-// test reads.
-func claimTrade(ctx context.Context, oid bson.ObjectID) (*models.BinaryTrade, error) {
-	now := mongox.Now()
-	staleBefore := time.UnixMilli(util.NowMs() - StaleSettlingMs).UTC()
-	var claimed models.BinaryTrade
-	err := mongox.C(models.CollBinaryTrades).FindOneAndUpdate(ctx,
-		bson.M{
-			"_id": oid,
-			"$or": bson.A{
-				bson.M{"status": string(models.TradeStatusOpen)},
-				bson.M{"status": string(models.TradeStatusSettling), "updatedAt": bson.M{"$lt": staleBefore}},
-			},
-		},
-		bson.M{"$set": bson.M{"status": string(models.TradeStatusSettling), "updatedAt": now}},
-		options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&claimed)
-	if err != nil {
-		if mongox.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &claimed, nil
-}
-
-func finalStatusFor(result models.TradeResult) models.TradeStatus {
-	switch result {
-	case models.TradeResultWin:
-		return models.TradeStatusWon
-	case models.TradeResultLoss:
-		return models.TradeStatusLost
-	}
-	return models.TradeStatusDraw
-}
-
-func applySettlement(ctx context.Context, trade *models.BinaryTrade, result models.TradeResult, expiryPrice float64,
-	priceSource, settledBy string, startedAt time.Time) (Outcome, error) {
-	tradeID := trade.ID.Hex()
-	userID := trade.UserID.Hex()
-
-	// Platform accounting (spec section 41).
-	//   WIN  - the stake is released and the profit is paid: the platform is
-	//          out `profit`, the user receives `stake + profit` back.
-	//   LOSS - the reserved stake leaves the wallet: the platform gains `stake`.
-	//   DRAW - the stake is released untouched: neither side gains.
-	var payoutAmount, platformResult, settlementAmount int64
-	switch result {
-	case models.TradeResultWin:
-		payoutAmount, platformResult, settlementAmount = trade.Stake+trade.Profit, -trade.Profit, trade.Profit
-	case models.TradeResultLoss:
-		payoutAmount, platformResult, settlementAmount = 0, trade.Stake, -trade.Stake
-	default:
-		if result == models.TradeResultDraw {
-			payoutAmount = trade.Stake
-		}
-	}
-
-	// 1. Money first - keyed so it can only ever be applied once.
-	live := models.NormAccountType(trade.AccountType) == models.AccountLive
-	funds := wallets.TradeFundsInput{UserID: userID, AccountType: trade.AccountType, Stake: trade.Stake, TradeID: tradeID}
-	var (
-		mutation wallets.MutationResult
-		err      error
-	)
-	switch result {
-	case models.TradeResultWin:
-		mutation, err = wallets.SettleTradeWin(ctx, funds, trade.Profit)
-	case models.TradeResultLoss:
-		mutation, err = wallets.SettleTradeLoss(ctx, funds)
-	default:
-		mutation, err = wallets.ReleaseTradeFunds(ctx, funds, wallets.ReleaseDraw)
-	}
+	assetHex := trade.AssetID.Hex()
+	candidates, err := loadExpiryCandidates(ctx, assetHex, trade.ExpiryTimestamp, policy)
 	if err != nil {
 		return Outcome{}, err
 	}
+	decision := DecideExpiryPrice(trade.ExpiryTimestamp, now, candidates, policy)
 
-	// 2. Settlement ledger row - the unique index is the final duplicate guard.
-	var walletTxID *bson.ObjectID
-	if mutation.TransactionID != "" {
-		id, err := bson.ObjectIDFromHex(mutation.TransactionID)
+	switch decision.Kind {
+	case DecisionAwaitConfirmation, DecisionDeferNoTick:
+		if err := Reschedule(ctx, tradeID, decision.RetryAt); err != nil {
+			return Outcome{}, err
+		}
+		status := StatusAwaitingTick
+		if decision.Kind == DecisionDeferNoTick {
+			status = StatusSkippedNoPrice
+			logx.Warn("no qualifying expiry price yet - settlement deferred",
+				"tradeId", tradeID, "symbol", trade.Symbol, "expiry", trade.ExpiryTimestamp,
+				"maxTickAgeMs", policy.MaxTickAgeMs, "deferUntil", trade.ExpiryTimestamp+policy.DeferWindowMs)
+		}
+		at := decision.RetryAt
+		return Outcome{TradeID: tradeID, Status: status, RetryAt: &at}, nil
+	}
+
+	evidence := models.SettlementEvidence{
+		Rule:                    decision.Rule,
+		Kind:                    models.SettlementKindExpiry,
+		DrawPolicy:              cfg.DrawPolicy,
+		PostExpiryTickSeen:      candidates.PostExpiryTickSeen,
+		PostExpiryTickTimestamp: candidates.PostExpiryTickTimestamp,
+		CandidatesConsidered:    int64(decision.Candidates),
+		ExpiryTimestamp:         trade.ExpiryTimestamp,
+		DecidedAt:               now,
+		RiskConfigVersion:       cfg.Version,
+		Policy:                  policy,
+	}
+	var intent models.SettlementIntent
+	if decision.Kind == DecisionPriced {
+		EvidenceFromTick(&evidence, decision.Tick, trade.ExpiryTimestamp, FeedProvider(ctx, assetHex), models.SettlementEvidenceSourceHist)
+		raw := DetermineResult(trade.Direction, trade.EntryPrice, decision.Tick.Price)
+		evidence.RawResult = &raw
+		price := decision.Tick.Price
+		intent = expiryIntent(trade, ApplyDrawPolicy(raw, cfg.DrawPolicy), &price, evidence, settledBy)
+	} else {
+		// Void: no price is compared, so the draw policy does not apply.
+		evidence.DrawPolicy = ""
+		evidence.Note = "no tick at or before expiry within the policy; voided and stake returned"
+		intent = expiryIntent(trade, models.TradeResultDraw, nil, evidence, settledBy)
+		logx.Error("no usable expiry price - trade voided under the no-price rule",
+			"tradeId", tradeID, "symbol", trade.Symbol, "expiry", trade.ExpiryTimestamp, "rule", policy.NoPriceRule)
+	}
+
+	claimed, err := claimExpiry(ctx, trade.ID, &intent, settledBy)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if claimed == nil {
+		current, err := loadTrade(ctx, trade.ID)
 		if err != nil {
 			return Outcome{}, err
 		}
-		walletTxID = &id
-	}
-	currency := trade.Currency
-	if currency == "" {
-		currency = models.BinaryTradeDefaultCurrency
-	}
-	latencyMs := int64(util.RoundHalfUp(float64(time.Since(startedAt).Microseconds()) / 1000))
-	row := models.Settlement{
-		TradeID:             trade.ID,
-		UserID:              trade.UserID,
-		AssetID:             trade.AssetID,
-		Symbol:              trade.Symbol,
-		Result:              result,
-		AccountType:         models.NormAccountType(trade.AccountType),
-		EntryPrice:          trade.EntryPrice,
-		ExpiryPrice:         expiryPrice,
-		ExpiryTimestamp:     trade.ExpiryTimestamp,
-		Stake:               trade.Stake,
-		PayoutPercent:       trade.PayoutPercent,
-		PayoutAmount:        payoutAmount,
-		PlatformResult:      platformResult,
-		Currency:            currency,
-		WalletTransactionID: walletTxID,
-		SettledBy:           settledBy,
-		LatencyMs:           &latencyMs,
-		CreatedAt:           mongox.Now(),
-	}
-	if _, err := mongox.C(models.CollSettlements).InsertOne(ctx, row); err != nil {
-		if mongox.IsDuplicateKey(err) {
-			logx.Warn("settlement row already existed - treating as already settled", "tradeId", tradeID)
-			r := result
-			return Outcome{TradeID: tradeID, Status: StatusAlreadySettled, Result: &r}, nil
+		if current != nil && current.Status == models.TradeStatusOpen {
+			// Still OPEN: the database clock has not reached expiry yet.
+			at := util.NowMs() + policy.RetryDelayMs
+			if err := Reschedule(ctx, tradeID, at); err != nil {
+				return Outcome{}, err
+			}
+			return Outcome{TradeID: tradeID, Status: StatusNotDue, RetryAt: &at}, nil
 		}
-		return Outcome{}, err
+		return Outcome{TradeID: tradeID, Status: StatusClaimedElsewhere}, nil
 	}
-
-	// 3. Final trade state.
-	finalStatus := finalStatusFor(result)
-	settledAt := mongox.Now()
-	settlementLatencyMs := util.NowMs() - trade.ExpiryTimestamp
-	var updated models.BinaryTrade
-	err = mongox.C(models.CollBinaryTrades).FindOneAndUpdate(ctx,
-		bson.M{"_id": trade.ID},
-		bson.M{"$set": bson.M{
-			"status":              string(finalStatus),
-			"result":              string(result),
-			"expiryPrice":         expiryPrice,
-			"expiryPriceSource":   priceSource,
-			"settlementAmount":    settlementAmount,
-			"platformResult":      platformResult,
-			"settledAt":           settledAt,
-			"settlementLatencyMs": settlementLatencyMs,
-			"updatedAt":           settledAt,
-		}},
-		options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&updated)
-	var view models.BinaryTradeView
-	switch {
-	case err == nil:
-		view = models.ToTradeView(&updated)
-	case mongox.IsNotFound(err):
-		fallback := *trade
-		r, ep, sa := result, expiryPrice, settlementAmount
-		fallback.Status, fallback.Result, fallback.ExpiryPrice, fallback.SettlementAmount = finalStatus, &r, &ep, &sa
-		view = models.ToTradeView(&fallback)
-	default:
-		return Outcome{}, err
-	}
-
-	// 4. Release the exposure this trade contributed and drop it from the queue.
-	if err := redisx.R().ZRem(ctx, config.RedisKeys.ExpiryQueue, tradeID).Err(); err != nil {
-		return Outcome{}, err
-	}
-	// DEMO trades never entered the book.
-	if live {
-		if _, err := exposure.ApplyExposureDelta(ctx, exposure.ExposureDelta{
-			AssetID:   trade.AssetID.Hex(),
-			Symbol:    trade.Symbol,
-			UserID:    userID,
-			Direction: trade.Direction,
-			Stake:     trade.Stake,
-			Profit:    trade.Profit,
-			Sign:      -1,
-		}); err != nil {
-			return Outcome{}, err
-		}
-	}
-
-	ws.Emit([]string{config.ChUser(userID), config.ChAdminOps}, config.EvTradeSettled, view)
-
-	// Fire and forget; CreateNotification emits notification.created itself.
-	lower := strings.ToLower(string(result))
-	notification := notifications.Input{
-		Type:  "TRADE_SETTLED",
-		Title: "Trade " + lower,
-		Body:  trade.Symbol + " " + string(trade.Direction) + " settled as " + string(result),
-		Data:  map[string]any{"tradeId": tradeID, "result": string(result), "payoutAmount": payoutAmount},
-	}
-	go func() {
-		nctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if _, err := notifications.CreateNotification(nctx, userID, notification); err != nil {
-			logx.Debug("failed to write settlement notification", "err", err.Error())
-		}
-	}()
-
-	metrics.IncrementCounter("settlements.total", 1, 0)
-	metrics.IncrementCounter("settlements."+lower, 1, 0)
-	if live {
-		metrics.IncrementCounter("platform.gross_result", float64(platformResult), 0)
-		metrics.IncrementCounter("customer.payout", float64(payoutAmount), 0)
-	}
-
-	logx.Info("trade settled",
-		"tradeId", tradeID, "symbol", trade.Symbol, "result", result, "entryPrice", trade.EntryPrice,
-		"expiryPrice", expiryPrice, "platformResult", platformResult)
-
-	r, ep, pa, pr := result, expiryPrice, payoutAmount, platformResult
-	return Outcome{TradeID: tradeID, Status: StatusSettled, Result: &r, ExpiryPrice: &ep, PayoutAmount: &pa, PlatformResult: &pr}, nil
+	return Execute(ctx, claimed)
 }
 
-// ensureTradeFinalised repairs a trade whose settlement row exists but whose
-// status never updated.
-func ensureTradeFinalised(ctx context.Context, oid bson.ObjectID, tradeID string, s *models.Settlement) error {
-	result := s.Result
-	finalStatus := finalStatusFor(result)
-	var settlementAmount int64
-	switch result {
-	case models.TradeResultWin:
-		settlementAmount = s.PayoutAmount - s.Stake
-	case models.TradeResultLoss:
-		settlementAmount = -s.Stake
+// recoverWithoutIntent handles a SETTLING trade an earlier version claimed
+// but never finished (invariant 7).
+func recoverWithoutIntent(ctx context.Context, trade *models.BinaryTrade, settledBy string) (Outcome, error) {
+	tradeID := trade.ID.Hex()
+	if trade.UpdatedAt.After(staleBefore()) {
+		// Possibly still being worked on; the sweeper brings it back once stale.
+		return Outcome{TradeID: tradeID, Status: StatusClaimedElsewhere}, nil
 	}
 
-	now := mongox.Now()
-	_, err := mongox.C(models.CollBinaryTrades).UpdateOne(ctx,
-		bson.M{"_id": oid, "status": bson.M{"$in": bson.A{string(models.TradeStatusOpen), string(models.TradeStatusSettling)}}},
-		bson.M{"$set": bson.M{
-			"status":           string(finalStatus),
-			"result":           string(result),
-			"expiryPrice":      s.ExpiryPrice,
-			"platformResult":   s.PlatformResult,
-			"settlementAmount": settlementAmount,
-			"settledAt":        now,
-			"updatedAt":        now,
-		}})
+	intent, err := legacyIntent(ctx, trade, settledBy)
 	if err != nil {
-		return err
+		return Outcome{}, err
 	}
-	return redisx.R().ZRem(ctx, config.RedisKeys.ExpiryQueue, tradeID).Err()
+	if intent != nil {
+		claimed, err := attachIntent(ctx, trade, intent, models.TradeStatusSettling, settledBy)
+		if err != nil {
+			return Outcome{}, err
+		}
+		if claimed == nil {
+			return Outcome{TradeID: tradeID, Status: StatusClaimedElsewhere}, nil
+		}
+		return Execute(ctx, claimed)
+	}
+
+	// No money moved and no row: the claim was abandoned before anything
+	// happened. Give the trade back to OPEN; it settles normally at expiry
+	// (or now, if expiry has passed) - never on a price taken before expiry.
+	reverted, err := revertToOpen(ctx, trade)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if !reverted {
+		return Outcome{TradeID: tradeID, Status: StatusClaimedElsewhere}, nil
+	}
+	current, err := loadTrade(ctx, trade.ID)
+	if err != nil || current == nil {
+		return Outcome{TradeID: tradeID, Status: StatusClaimedElsewhere}, err
+	}
+	if current.Status != models.TradeStatusOpen {
+		return Outcome{TradeID: tradeID, Status: StatusClaimedElsewhere}, nil
+	}
+	return settleOpen(ctx, current, settledBy)
+}
+
+func staleBefore() time.Time {
+	return time.UnixMilli(util.NowMs() - StaleSettlingMs).UTC()
 }

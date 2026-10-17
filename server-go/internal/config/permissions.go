@@ -18,9 +18,15 @@ var AllRoles = []Role{RoleUser, RoleSupport, RoleFinance, RoleRiskManager, RoleA
 
 var AdminRoles = []Role{RoleSupport, RoleFinance, RoleRiskManager, RoleAdmin, RoleSuperAdmin}
 
+// Every permission gates at least one route or channel; a permission that
+// gates nothing is a false promise in the role editor, so the unused
+// market-data:write, settings:read and admin:manage were removed. A stored
+// grant of one of them is dropped by PermissionsForRole.
 const (
-	PermUsersRead    = "users:read"
-	PermUsersWrite   = "users:write"
+	PermUsersRead  = "users:read"
+	PermUsersWrite = "users:write"
+	// PermUsersSuspend gates status changes (suspend / close / reactivate) and
+	// forced sign-out, on top of users:write.
 	PermUsersSuspend = "users:suspend"
 
 	PermTradesRead   = "trades:read"
@@ -48,18 +54,14 @@ const (
 	PermWithdrawalsRead    = "withdrawals:read"
 	PermWithdrawalsApprove = "withdrawals:approve"
 
-	PermMarketDataRead  = "market-data:read"
-	PermMarketDataWrite = "market-data:write"
+	PermMarketDataRead = "market-data:read"
 
 	PermReportsRead           = "reports:read"
 	PermAuditRead             = "audit:read"
 	PermReconciliationRead    = "reconciliation:read"
 	PermReconciliationResolve = "reconciliation:resolve"
 
-	PermSettingsRead  = "settings:read"
 	PermSettingsWrite = "settings:write"
-
-	PermAdminManage = "admin:manage"
 
 	PermSupportRead  = "support:read"
 	PermSupportWrite = "support:write"
@@ -76,10 +78,9 @@ var AllPermissions = []string{
 	PermHedgeRead, PermHedgeWrite,
 	PermWalletsRead, PermWalletsAdjust,
 	PermDepositsRead, PermDepositsApprove, PermWithdrawalsRead, PermWithdrawalsApprove,
-	PermMarketDataRead, PermMarketDataWrite,
+	PermMarketDataRead,
 	PermReportsRead, PermAuditRead, PermReconciliationRead, PermReconciliationResolve,
-	PermSettingsRead, PermSettingsWrite,
-	PermAdminManage,
+	PermSettingsWrite,
 	PermSupportRead, PermSupportWrite,
 }
 
@@ -103,7 +104,7 @@ var adminPermissions = unique(
 	riskManagerPermissions,
 	[]string{
 		PermUsersWrite, PermUsersSuspend, PermTradesCancel, PermAssetsWrite, PermPayoutsWrite,
-		PermMarketDataWrite, PermReportsRead, PermAuditRead, PermSettingsRead, PermReconciliationRead,
+		PermReportsRead, PermAuditRead, PermReconciliationRead,
 	},
 )
 
@@ -131,8 +132,15 @@ func unique(lists ...[]string) []string {
 }
 
 // PermissionsForRole returns the role's permissions plus any explicit extras.
+// Extras that are not (or are no longer) permissions are dropped.
 func PermissionsForRole(role Role, extra []string) []string {
-	return unique(RolePermissions[role], extra)
+	valid := make([]string, 0, len(extra))
+	for _, p := range extra {
+		if IsValidPermission(p) {
+			valid = append(valid, p)
+		}
+	}
+	return unique(RolePermissions[role], valid)
 }
 
 // HasPermission: the role's own set always counts, so a permission added to a

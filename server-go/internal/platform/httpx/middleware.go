@@ -3,7 +3,6 @@ package httpx
 import (
 	"context"
 	"mime"
-	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -18,7 +17,6 @@ import (
 	"binarytrading/internal/platform/authtoken"
 	"binarytrading/internal/platform/logx"
 	"binarytrading/internal/platform/mongox"
-	"binarytrading/internal/platform/redisx"
 )
 
 type ctxKey int
@@ -204,7 +202,20 @@ func withActor(r *http.Request, a *Actor) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), actorKey, a))
 }
 
-// Authenticate requires a valid access token.
+// actorFromSession builds the actor from a token that CheckSession accepted.
+// The live state's permissions are used: they are what a fresh token would
+// carry, so a grant removed since the token was signed no longer counts.
+func actorFromSession(c *authtoken.AccessClaims, s *authtoken.SessionState) *Actor {
+	a := actorFromClaims(c)
+	if s != nil {
+		a.Permissions = s.EffectivePermissions()
+	}
+	return a
+}
+
+// Authenticate requires a valid access token whose session is still live:
+// the account is active, its role unchanged and its sessions not revoked
+// since the token was issued (authtoken.CheckSession).
 func Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := bearer(r)
@@ -217,17 +228,24 @@ func Authenticate(next http.Handler) http.Handler {
 			WriteError(w, r, err)
 			return
 		}
-		next.ServeHTTP(w, withActor(r, actorFromClaims(claims)))
+		state, err := authtoken.CheckSession(r.Context(), claims)
+		if err != nil {
+			WriteError(w, r, err)
+			return
+		}
+		next.ServeHTTP(w, withActor(r, actorFromSession(claims, state)))
 	})
 }
 
-// OptionalAuthenticate attaches the actor when a valid token is present but
-// never rejects.
+// OptionalAuthenticate attaches the actor when a valid, live token is present
+// but never rejects.
 func OptionalAuthenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token := bearer(r); token != "" {
 			if claims, err := authtoken.VerifyAccess(token); err == nil {
-				r = withActor(r, actorFromClaims(claims))
+				if state, err := authtoken.CheckSession(r.Context(), claims); err == nil {
+					r = withActor(r, actorFromSession(claims, state))
+				}
 			}
 		}
 		next.ServeHTTP(w, r)
@@ -357,7 +375,10 @@ type RateLimitOptions struct {
 // Named limits used across the API (spec section 29).
 var RateLimits = struct {
 	Login, Register, Refresh, Trade, Wallet, Transfer, Chat, Read, Admin, AdminWrite RateLimitOptions
+	// MFA guards the second sign-in step (admin TOTP / recovery codes).
+	MFA RateLimitOptions
 }{
+	MFA:        RateLimitOptions{Bucket: "auth:mfa", Limit: 10, Window: time.Minute, By: "ip"},
 	Login:      RateLimitOptions{Bucket: "auth:login", Limit: 10, Window: time.Minute, By: "ip"},
 	Register:   RateLimitOptions{Bucket: "auth:register", Limit: 5, Window: time.Minute, By: "ip"},
 	Refresh:    RateLimitOptions{Bucket: "auth:refresh", Limit: 60, Window: time.Minute, By: "ip"},
@@ -371,7 +392,8 @@ var RateLimits = struct {
 }
 
 // RateLimit is a Redis fixed-window limiter shared across instances. If
-// Redis is unreachable it fails open and logs loudly.
+// Redis is unreachable it never fails open: the same limits are enforced per
+// instance in memory until Redis is back (see ratelimit_fallback.go).
 func RateLimit(o RateLimitOptions) func(http.Handler) http.Handler {
 	windowMs := o.Window.Milliseconds()
 	return func(next http.Handler) http.Handler {
@@ -380,15 +402,7 @@ func RateLimit(o RateLimitOptions) func(http.Handler) http.Handler {
 			window := time.Now().UnixMilli() / windowMs
 			key := config.RedisKeys.RateLimit(o.Bucket, identity) + ":" + strconv.FormatInt(window, 10)
 
-			pipe := redisx.R().Pipeline()
-			incr := pipe.Incr(r.Context(), key)
-			pipe.PExpire(r.Context(), key, o.Window)
-			if _, err := pipe.Exec(r.Context()); err != nil {
-				logx.Error("rate limiter unavailable - failing open", "bucket", o.Bucket, "err", err.Error())
-				next.ServeHTTP(w, r)
-				return
-			}
-			count := incr.Val()
+			count := countRequest(r.Context(), o.Bucket, key, o.Window, (window+1)*windowMs)
 			remaining := o.Limit - count
 			if remaining < 0 {
 				remaining = 0
@@ -433,15 +447,10 @@ func rateIdentity(r *http.Request, by string) string {
 
 // ── request metadata ────────────────────────────────────────────────────
 
+// ClientIP is the caller's address. Forwarding headers count only when the
+// direct peer is a trusted proxy (TRUSTED_PROXIES); see clientip.go.
 func ClientIP(r *http.Request) string {
-	if f := r.Header.Get("X-Forwarded-For"); f != "" {
-		return strings.TrimSpace(strings.Split(f, ",")[0])
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return clientIP(r)
 }
 
 // UserAgent is truncated to 512 characters; nil when absent.

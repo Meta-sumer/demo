@@ -91,10 +91,25 @@ type Transfer struct {
 	ReviewedAt          *time.Time     `bson:"reviewedAt"`
 	ReviewNote          *string        `bson:"reviewNote"`
 	WalletTransactionID *bson.ObjectID `bson:"walletTransactionId"`
-	CreatedAt           time.Time      `bson:"createdAt"`
-	UpdatedAt           time.Time      `bson:"updatedAt"`
-	V                   int64          `bson:"__v"`
+	// Failed attempts to apply an approval's wallet effect and the last
+	// error, so an approval that did not complete is visible, not silent.
+	CompletionAttempts int64      `bson:"completionAttempts,omitempty"`
+	LastError          *string    `bson:"lastError,omitempty"`
+	LastErrorAt        *time.Time `bson:"lastErrorAt,omitempty"`
+	CreatedAt          time.Time  `bson:"createdAt"`
+	UpdatedAt          time.Time  `bson:"updatedAt"`
+	V                  int64      `bson:"__v"`
 }
+
+// Ledger idempotency keys of a transfer's wallet movements. Reconciliation
+// matches transfers to the ledger by these, so they are part of the record.
+func DepositCreditKey(transferID string) string    { return "deposit:credit:" + transferID }
+func WithdrawalLockKey(transferID string) string   { return "withdrawal:lock:" + transferID }
+func WithdrawalSettleKey(transferID string) string { return "withdrawal:settle:" + transferID }
+func WithdrawalUnlockKey(transferID string) string { return "withdrawal:unlock:" + transferID }
+
+// TransferLedgerReference is the referenceType of every transfer ledger row.
+const TransferLedgerReference = "Transfer"
 
 func init() {
 	c := CollTransfers

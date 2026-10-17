@@ -67,13 +67,19 @@ npm run dev
 
 | Application | URL | Sign in |
 |---|---|---|
-| Trading client | http://localhost:5173 | `trader@binary.local` / `Trader@12345` |
-| Admin console | http://localhost:5174/admin/login | `admin@binary.local` / `Admin@12345` |
+| Trading client | http://localhost:5173 | `trader@binary.local` |
+| Admin console | http://localhost:5174/admin/login | `admin@binary.local` (SUPER_ADMIN) |
 | API | http://localhost:4000 | `GET /health`, `GET /ready` |
 
-The seed also creates `risk@binary.local` / `Risk@12345` (RISK_MANAGER) and
-`finance@binary.local` / `Finance@12345` (FINANCE) so the permission model can
-be seen working.
+The seed also creates `risk@binary.local` (RISK_MANAGER) and
+`finance@binary.local` (FINANCE) so the permission model can be seen working.
+
+**Passwords are not published.** The seed takes them from
+`SEED_SUPER_ADMIN_PASSWORD`, `SEED_RISK_PASSWORD`, `SEED_FINANCE_PASSWORD` and
+`SEED_TRADER_PASSWORD`; any that are unset get a random password, printed once
+by `npm run seed`. Admin accounts are asked to set up two-factor
+authentication (an authenticator app) at their first sign-in while
+`ADMIN_2FA_REQUIRED=true`.
 
 **MongoDB needs a replica set** for multi-document transactions. `docker-compose.yml`
 configures one and initialises it through the healthcheck. Against a standalone
@@ -470,7 +476,8 @@ Being explicit about this matters more than the feature list.
   licence, client-money segregation, and the disclosures your regulator
   mandates.
 - **Single region.** No multi-region failover or disaster recovery drill.
-- **Email and 2FA.** No verification emails, password reset, or second factor.
+- **Email and customer 2FA.** No verification emails, password reset, or second
+  factor for customers. Admin accounts have TOTP two-factor sign-in.
 
 ## Production checklist
 

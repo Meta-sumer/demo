@@ -4,6 +4,7 @@ package users
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,7 +14,9 @@ import (
 	"binarytrading/internal/config"
 	"binarytrading/internal/models"
 	"binarytrading/internal/platform/apperr"
+	"binarytrading/internal/platform/logx"
 	"binarytrading/internal/platform/mongox"
+	"binarytrading/internal/service/auth/sessions"
 	"binarytrading/internal/service/exposure"
 	"binarytrading/internal/service/wallets"
 )
@@ -272,20 +275,80 @@ type OptInt struct {
 	Value *int64 // nil with Set = null
 }
 
+// AdminUpdateUser is AdminUpdateUserBy for a caller known only by role (the
+// role's own permissions apply).
 func AdminUpdateUser(ctx context.Context, userID string, in AdminUpdateUserInput, actorRole string) (before, after models.UserView, err error) {
+	before, after, _, err = AdminUpdateUserBy(ctx, userID, in, UpdateActor{Role: actorRole})
+	return before, after, err
+}
+
+// UpdateActor is the administrator making a change.
+type UpdateActor struct {
+	UserID      string
+	Role        string
+	Permissions []string
+}
+
+func (a UpdateActor) can(p string) bool { return config.HasPermission(a.Role, a.Permissions, p) }
+
+// Revocation reports the sessions a change ended, for the audit trail.
+type Revocation struct {
+	Reason               string `json:"reason"`
+	RefreshTokensRevoked int64  `json:"refreshTokensRevoked"`
+}
+
+// AdminUpdateUserBy is PATCH /admin/users/{id}.
+//
+// Least privilege: status changes need users:suspend; roles and permissions,
+// and any change at all to an administrative account, need a SUPER_ADMIN; and
+// nobody changes their own status, role or permissions (no self-escalation,
+// no locking oneself out).
+//
+// Suspending or closing an account ends every session it has, and a role or
+// permission change ends its access tokens and sockets (the next refresh
+// signs the new privileges): the session-version bump is part of the same
+// update, so the change and the revocation cannot come apart.
+func AdminUpdateUserBy(ctx context.Context, userID string, in AdminUpdateUserInput, actor UpdateActor) (before, after models.UserView, rev *Revocation, err error) {
 	b, err := findUser(ctx, userID)
 	if err != nil {
-		return before, after, err
+		return before, after, nil, err
 	}
 	if b == nil {
-		return before, after, userNotFound()
+		return before, after, nil, userNotFound()
 	}
 
 	// Only a SUPER_ADMIN may alter administrative privileges, so an ADMIN cannot
 	// escalate their own or anyone else's access.
 	touchesPrivileges := in.Role != nil || in.Permissions != nil
-	if touchesPrivileges && actorRole != config.RoleSuperAdmin {
-		return before, after, apperr.Forbid("Only a super admin can change roles or permissions")
+	if touchesPrivileges && actor.Role != config.RoleSuperAdmin {
+		return before, after, nil, apperr.Forbid("Only a super admin can change roles or permissions")
+	}
+	if in.Status != nil && !actor.can(config.PermUsersSuspend) {
+		return before, after, nil, apperr.Forbid("Missing permission: " + config.PermUsersSuspend)
+	}
+	if config.IsAdminRole(b.Role) && actor.Role != config.RoleSuperAdmin {
+		return before, after, nil, apperr.Forbid("Only a super admin can change an administrative account")
+	}
+	if actor.UserID != "" && actor.UserID == b.ID.Hex() && (in.Status != nil || touchesPrivileges) {
+		return before, after, nil, apperr.Forbid("You cannot change your own status, role or permissions")
+	}
+	if in.Permissions != nil {
+		var issues []apperr.FieldIssue
+		for i, p := range *in.Permissions {
+			if !config.IsValidPermission(p) {
+				issues = append(issues, apperr.FieldIssue{Path: "permissions." + strconv.Itoa(i), Message: "Unknown permission '" + p + "'"})
+			}
+		}
+		if len(issues) > 0 {
+			return before, after, nil, apperr.Validation("Invalid request body", issues)
+		}
+	}
+
+	endsSessions := in.Status != nil && *in.Status != string(models.UserStatusActive)
+	changesPrivileges := (in.Role != nil && *in.Role != b.Role) || in.Permissions != nil
+	update := bson.M{}
+	if endsSessions || changesPrivileges {
+		update["$inc"] = sessions.IncVersion()
 	}
 
 	patch := bson.M{"updatedAt": mongox.Now()}
@@ -314,18 +377,38 @@ func AdminUpdateUser(ctx context.Context, userID string, in AdminUpdateUserInput
 	if in.Role != nil && *in.Role != "" && in.Permissions == nil {
 		patch["permissions"] = config.PermissionsForRole(*in.Role, nil)
 	}
+	update["$set"] = patch
 
-	var a models.User
-	err = mongox.C(models.CollUsers).FindOneAndUpdate(ctx, bson.M{"_id": b.ID}, bson.M{"$set": patch},
+	raw, err := mongox.C(models.CollUsers).FindOneAndUpdate(ctx, bson.M{"_id": b.ID}, update,
 		options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(models.UserPasswordHashExcluded),
-	).Decode(&a)
+	).Raw()
 	if err != nil {
 		if mongox.IsNotFound(err) {
-			return before, after, userNotFound()
+			return before, after, nil, userNotFound()
 		}
-		return before, after, err
+		return before, after, nil, err
 	}
-	return models.ToUserView(b), models.ToUserView(&a), nil
+	var a models.User
+	if err := bson.Unmarshal(raw, &a); err != nil {
+		return before, after, nil, err
+	}
+
+	if endsSessions || changesPrivileges {
+		rev = &Revocation{Reason: "privileges_changed"}
+		if endsSessions {
+			rev.Reason = "status_" + strings.ToLower(*in.Status)
+			// Refresh already refuses a disabled account; revoking the tokens
+			// also keeps a later reactivation from bringing old sessions back.
+			n, err := sessions.RevokeRefreshTokens(ctx, b.ID)
+			if err != nil {
+				logx.Error("refresh tokens not revoked after a status change - they are refused while the account is disabled",
+					"userId", b.ID.Hex(), "err", err.Error())
+			}
+			rev.RefreshTokensRevoked = n
+		}
+		sessions.PublishAfterWrite(ctx, b.ID, raw)
+	}
+	return models.ToUserView(b), models.ToUserView(&a), rev, nil
 }
 
 // AuditDoc turns a UserView into the object Mongoose stores for an audit

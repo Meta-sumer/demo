@@ -28,6 +28,20 @@ const (
 	AdminLogin       = "admin.login"
 	AdminLoginFailed = "admin.login_failed"
 
+	UserPasswordChanged = "user.password_changed"
+	// UserSessionsRevoked: an administrator forced a user's sessions to end.
+	UserSessionsRevoked = "user.sessions_revoked"
+
+	// Admin two-factor authentication.
+	AdminMFAChallenge          = "admin.mfa_challenge"
+	AdminMFAFailed             = "admin.mfa_failed"
+	AdminMFAEnrolled           = "admin.mfa_enrolled"
+	AdminMFARecoveryCodeUsed   = "admin.mfa_recovery_code_used"
+	AdminMFARecoveryRegenerate = "admin.mfa_recovery_codes_regenerated"
+	AdminMFAReset              = "admin.mfa_reset"
+
+	ReconciliationRun = "reconciliation.run"
+
 	TradeCreated   = "trade.created"
 	TradeRejected  = "trade.rejected"
 	TradeCancelled = "trade.cancelled"

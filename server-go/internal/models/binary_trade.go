@@ -69,6 +69,13 @@ type BinaryTrade struct {
 	// Which tick rule produced expiryPrice.
 	ExpiryPriceSource *string `bson:"expiryPriceSource"`
 
+	// Settlement state machine (models/settlement_evidence.go): who moved the
+	// trade out of OPEN, and the immutable outcome recorded with that claim.
+	// Absent on trades that are still OPEN and on trades settled before the
+	// state machine existed.
+	SettlementClaim  *SettlementClaim  `bson:"settlementClaim,omitempty"`
+	SettlementIntent *SettlementIntent `bson:"settlementIntent,omitempty"`
+
 	SettledAt           *time.Time `bson:"settledAt"`
 	SettlementLatencyMs *int64     `bson:"settlementLatencyMs"`
 	CancelReason        *string    `bson:"cancelReason"`

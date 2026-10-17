@@ -226,6 +226,24 @@ type ExposureSnapshot struct {
 	PotentialLiability int64 `json:"potentialLiability"`
 	OpenTrades         int64 `json:"openTrades"`
 	UpdatedAt          int64 `json:"updatedAt"`
+
+	// Liability model (added fields; the ones above keep their meaning).
+	// Platform net result if every open UP trade wins: upProfit - downStake
+	// (positive = the platform pays). DownWinNet is the mirror image.
+	UpWinNet   int64 `json:"upWinNet"`
+	DownWinNet int64 `json:"downWinNet"`
+	// Worst-case net liability with each expiry bucket settling on its own
+	// price: sum over buckets of max(0, upWinNet_b, downWinNet_b). UP and DOWN
+	// only offset each other inside a bucket, so this is >= potentialLiability.
+	ExpiryLiability int64 `json:"expiryLiability"`
+	// No netting at all - every open trade wins: upProfit + downProfit.
+	MaxPayoutLiability int64 `json:"maxPayoutLiability"`
+	// Non-empty expiry buckets.
+	ExpiryBuckets int64 `json:"expiryBuckets"`
+	// In-flight reservations: passed the atomic risk check, trade not yet
+	// written. Counted against every limit until committed or released.
+	ReservedStake  int64 `json:"reservedStake"`
+	ReservedTrades int64 `json:"reservedTrades"`
 }
 
 type RiskAssessment struct {
@@ -237,6 +255,7 @@ type RiskAssessment struct {
 	NetExposure         int64         `json:"netExposure"`
 	GrossExposure       int64         `json:"grossExposure"`
 	PotentialLiability  int64         `json:"potentialLiability"`
+	ExpiryLiability     int64         `json:"expiryLiability"`
 	Reasons             []string      `json:"reasons"`
 	HedgeDecision       HedgeDecision `json:"hedgeDecision"`
 	TargetHedgeRatio    float64       `json:"targetHedgeRatio"`

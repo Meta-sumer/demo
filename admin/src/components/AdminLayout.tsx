@@ -12,6 +12,7 @@ import {
   FileClock,
   Gauge,
   Headset,
+  KeyRound,
   Landmark,
   LayoutDashboard,
   LogOut,
@@ -102,6 +103,7 @@ const NAV_GROUPS: Array<{ title: string; items: NavItem[] }> = [
       { to: '/admin/reconciliation', label: 'Reconciliation', icon: FileClock, permission: 'reconciliation:read' },
       { to: '/admin/audit-logs', label: 'Audit log', icon: ScrollText, permission: 'audit:read' },
       { to: '/admin/settings', label: 'Settings', icon: Settings, permission: 'risk:read' },
+      { to: '/admin/security', label: 'Security', icon: KeyRound },
     ],
   },
 ];

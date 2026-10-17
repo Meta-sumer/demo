@@ -31,6 +31,8 @@ func mountAssets(r chi.Router) {
 	// than replacing one, and POST is what the admin console has always sent.
 	write(config.PermPayoutsWrite).Post("/{id}/payouts", httpx.H(upsertPayout))
 	write(config.PermPayoutsWrite).Delete("/payouts/{id}", httpx.H(deletePayout))
+	// Resolve payout replacements a failure left half done.
+	write(config.PermPayoutsWrite).Post("/payouts/repair", httpx.H(repairPayouts))
 }
 
 type assetWithPayouts struct {
@@ -335,4 +337,19 @@ func deletePayout(w http.ResponseWriter, r *http.Request) error {
 	e.After = map[string]any{"active": false}
 	audit.Write(r.Context(), e)
 	return httpx.OK(w, payout)
+}
+
+func repairPayouts(w http.ResponseWriter, r *http.Request) error {
+	actor, err := httpx.RequireActor(r)
+	if err != nil {
+		return err
+	}
+	res, err := payouts.RepairPayoutReplacements(r.Context())
+	if err != nil {
+		return err
+	}
+	e := entry(r, actor, audit.PayoutUpdated, "PayoutConfig", "")
+	e.After, e.Reason = auditDoc(res), "repaired unfinished payout replacements"
+	audit.Write(r.Context(), e)
+	return httpx.OK(w, res)
 }

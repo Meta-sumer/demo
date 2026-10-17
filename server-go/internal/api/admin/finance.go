@@ -2,11 +2,13 @@ package admin
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"binarytrading/internal/config"
 	"binarytrading/internal/models"
+	"binarytrading/internal/platform/apperr"
 	"binarytrading/internal/platform/httpx"
 	"binarytrading/internal/service/audit"
 	"binarytrading/internal/service/transfers"
@@ -29,6 +31,10 @@ func mountFinance(r chi.Router) {
 	write(config.PermDepositsApprove).Post("/deposits/{id}/approve", httpx.H(approveDeposit))
 	write(config.PermWithdrawalsApprove).Post("/withdrawals/{id}/approve", httpx.H(approveWithdrawal))
 	write(config.PermDepositsApprove, config.PermWithdrawalsApprove).Post("/transfers/{id}/reject", httpx.H(rejectTransfer))
+	// Finish an approval whose wallet effect did not complete; the permission
+	// is checked against the transfer's kind.
+	r.With(httpx.RateLimit(httpx.RateLimits.AdminWrite)).Post("/transfers/{id}/complete", httpx.H(completeTransfer))
+	write(config.PermDepositsApprove, config.PermWithdrawalsApprove).Post("/transfers/repair", httpx.H(repairTransfers))
 }
 
 func listWallets(w http.ResponseWriter, r *http.Request) error {
@@ -164,6 +170,83 @@ func rejectTransfer(w http.ResponseWriter, r *http.Request) error {
 	audit.Write(r.Context(), e)
 	return httpx.OK(w, transfer)
 }
+
+// completeTransfer is the retry path for an APPROVED transfer whose wallet
+// effect did not complete. Repeating it is harmless: the effect is keyed on
+// the transfer.
+func completeTransfer(w http.ResponseWriter, r *http.Request) error {
+	actor, err := httpx.RequireActor(r)
+	if err != nil {
+		return err
+	}
+	id, err := httpx.IDParam(r, "id")
+	if err != nil {
+		return err
+	}
+	b, err := readBody(r)
+	if err != nil {
+		return err
+	}
+	utr := b.optStr("utr", 6, 40)
+	if err := b.err(); err != nil {
+		return err
+	}
+	kind, err := transfers.GetTransferKind(r.Context(), id.Hex())
+	if err != nil {
+		return err
+	}
+	perm, action := config.PermDepositsApprove, audit.DepositApproved
+	if kind == models.TransferKindWithdrawal {
+		perm, action = config.PermWithdrawalsApprove, audit.WithdrawalApproved
+	}
+	if !config.HasPermission(actor.Role, actor.Permissions, perm) {
+		return apperr.Forbid()
+	}
+	transfer, err := transfers.CompleteTransfer(r.Context(), id.Hex(), actor.UserID, utr)
+	if err != nil {
+		return err
+	}
+	e := entry(r, actor, action, "Transfer", chi.URLParam(r, "id"))
+	e.After, e.Reason = auditDoc(transfer), "completed an approval that had not finished"
+	audit.Write(r.Context(), e)
+	return httpx.OK(w, transfer)
+}
+
+// repairTransfers finishes every transfer workflow an interruption left
+// behind: stuck approvals, and reservations that should have been released.
+func repairTransfers(w http.ResponseWriter, r *http.Request) error {
+	actor, err := httpx.RequireActor(r)
+	if err != nil {
+		return err
+	}
+	b, err := readBody(r)
+	if err != nil {
+		return err
+	}
+	grace := b.optInt("olderThanSeconds", numRule{Min: f(0), Max: f(86_400)})
+	if err := b.err(); err != nil {
+		return err
+	}
+	olderThan := transfers.DefaultRepairGrace
+	if grace != nil {
+		olderThan = time.Duration(*grace) * time.Second
+		if olderThan == 0 {
+			// 0 would mean the default inside the service; the operator asked for none.
+			olderThan = time.Nanosecond
+		}
+	}
+	res, err := transfers.RepairTransfers(r.Context(), actor.UserID, olderThan)
+	if err != nil {
+		return err
+	}
+	e := entry(r, actor, auditTransfersRepaired, "Transfer", "")
+	e.After = auditDoc(res)
+	audit.Write(r.Context(), e)
+	return httpx.OK(w, res)
+}
+
+// auditTransfersRepaired is the audit action of a repair pass.
+const auditTransfersRepaired = "transfer.repaired"
 
 // ── payment methods ─────────────────────────────────────────────────────
 

@@ -656,10 +656,10 @@ type LedgerQuery struct {
 	// of different currencies are never listed together.
 	Currency string
 	Type     *models.WalletTransactionType
-	From        *time.Time
-	To          *time.Time
-	Page        int64
-	Limit       int64
+	From     *time.Time
+	To       *time.Time
+	Page     int64
+	Limit    int64
 }
 
 // ListWalletTransactions returns ledger rows newest first, as lean documents.

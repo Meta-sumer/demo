@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -66,6 +67,23 @@ type Env struct {
 
 	SeedSuperAdminEmail    string
 	SeedSuperAdminPassword string
+	// Seed passwords for the non-admin demo accounts; "" = the seed generates
+	// one and prints it once.
+	SeedRiskPassword    string
+	SeedFinancePassword string
+	SeedTraderPassword  string
+
+	// TrustedProxies are the peers whose X-Forwarded-For / X-Real-IP headers
+	// are believed (TRUSTED_PROXIES). Default: loopback only.
+	TrustedProxies []netip.Prefix
+
+	// Admin two-factor authentication (TOTP). Admin2FARequired makes every
+	// administrative account enrol at its next sign-in.
+	Admin2FARequired bool
+	Admin2FAIssuer   string
+	// MFAEncryptionKey encrypts stored TOTP secrets; "" derives a key from
+	// JWT_SECRET (rotating JWT_SECRET then invalidates every enrolment).
+	MFAEncryptionKey string
 
 	// USDT wallet through BeeX Payments. Amounts are micro-USDT (1 USDT =
 	// 1_000_000).
@@ -232,8 +250,10 @@ func Load() (*Env, error) {
 		WSMaxConnectionsPerUser: int(l.integer("WS_MAX_CONNECTIONS_PER_USER", 5, 1)),
 		WSMaxConnectionsTotal:   int(l.integer("WS_MAX_CONNECTIONS_TOTAL", 10_000, 1)),
 
-		SeedSuperAdminEmail:    l.str("SEED_SUPER_ADMIN_EMAIL", "admin@binary.local"),
-		SeedSuperAdminPassword: l.str("SEED_SUPER_ADMIN_PASSWORD", "Admin@12345"),
+		SeedSuperAdminEmail: l.str("SEED_SUPER_ADMIN_EMAIL", "admin@binary.local"),
+		// No default: a published password is not a password. The seed generates
+		// one and prints it once when this is unset.
+		SeedSuperAdminPassword: l.str("SEED_SUPER_ADMIN_PASSWORD", ""),
 
 		UsdtEnabled:                  l.boolean("USDT_ENABLED", false),
 		BeexProvider:                 l.enum("BEEX_PROVIDER", "beex", "beex", "mock"),
@@ -250,6 +270,7 @@ func Load() (*Env, error) {
 	e.UsdtSuccessURL = l.str("USDT_SUCCESS_URL", strings.TrimRight(e.ClientURL, "/")+"/wallet/usdt/success")
 	e.UsdtCancelURL = l.str("USDT_CANCEL_URL", strings.TrimRight(e.ClientURL, "/")+"/wallet/usdt")
 	validateUsdt(l, e)
+	loadSecurity(l, e)
 
 	if e.BcryptRounds > 15 {
 		l.fail("BCRYPT_ROUNDS", "Number must be less than or equal to 15")

@@ -32,6 +32,12 @@ func Mount(r chi.Router) {
 // clash in chi).
 func MountAdminLogin(r chi.Router) {
 	r.With(httpx.RateLimit(httpx.RateLimits.Login)).Post("/login", httpx.H(adminLoginHandler))
+	// The second step (admin 2FA), authorised by the single-use mfaToken that
+	// /login returned instead of a session.
+	mfa := r.With(httpx.RateLimit(httpx.RateLimits.MFA))
+	mfa.Post("/login/2fa", httpx.H(adminLoginMFAHandler))
+	mfa.Post("/login/2fa/enrol", httpx.H(adminLoginEnrolHandler))
+	mfa.Post("/login/2fa/enrol/confirm", httpx.H(adminLoginEnrolConfirmHandler))
 }
 
 // ── validation (auth.schemas.ts) ────────────────────────────────────────
@@ -276,57 +282,191 @@ func changePasswordHandler(w http.ResponseWriter, r *http.Request) error {
 	if err := f.err(); err != nil {
 		return err
 	}
-	if err := svc.ChangePassword(r.Context(), actor.UserID, in); err != nil {
+	// Every session of the account ends, this one included; the response
+	// carries a fresh session so the device that made the change can stay
+	// signed in by storing it (older clients ignore it and sign in again).
+	next, err := svc.ChangePasswordAndReissue(r.Context(), actor.UserID, actor.SessionID, in, sessionContext(r), true)
+	if err != nil {
 		return err
 	}
 
 	e := audit.FromRequest(actor, httpx.AuditMeta(r))
-	e.Action = "user.password_changed"
+	e.Action = audit.UserPasswordChanged
 	e.Resource = "User"
 	e.ResourceID = actor.UserID
+	e.After = map[string]any{"sessionsRevoked": true}
 	audit.Log(e)
 
-	return httpx.OK(w, map[string]bool{"changed": true})
+	out := struct {
+		Changed   bool            `json:"changed"`
+		Tokens    *svc.AuthTokens `json:"tokens,omitempty"`
+		SessionID string          `json:"sessionId,omitempty"`
+	}{Changed: true}
+	if next != nil {
+		out.Tokens, out.SessionID = &next.Tokens, next.SessionID
+	}
+	return httpx.OK(w, out)
 }
 
-// adminLoginHandler: admin sign-in is the ordinary login flow with an extra
-// role gate, so a trading account cannot obtain an admin session through this
-// endpoint.
+// adminLoginHandler: admin sign-in is the password step with a role gate, so
+// a trading account cannot obtain an admin session through this endpoint.
+// When the account needs a second factor the answer is a challenge
+// ({mfaRequired: true, mfaToken, enrolmentRequired, ...}) instead of the
+// session; the console completes it through /admin/login/2fa[...].
 func adminLoginHandler(w http.ResponseWriter, r *http.Request) error {
 	in, err := parseLogin(r)
 	if err != nil {
 		return err
 	}
-	result, err := svc.Login(r.Context(), in, sessionContext(r))
+	out, err := svc.BeginAdminLogin(r.Context(), in, sessionContext(r))
 	if err != nil {
+		e := audit.FromRequest(nil, httpx.AuditMeta(r))
+		e.ActorRole = "ANONYMOUS"
+		e.ActorEmail = in.Email
+		if out.User != nil {
+			e.ActorID, e.ActorRole, e.ResourceID = out.User.ID.Hex(), out.User.Role, out.User.ID.Hex()
+		}
+		e.Action = audit.AdminLoginFailed
+		e.Resource = "User"
+		e.Failed = true
+		e.Reason = errMessage(err)
+		if svc.IsNotAdmin(err) {
+			e.Reason = "not an administrative account"
+			audit.Log(e)
+			return apperr.Forbid("This account cannot access the administration panel")
+		}
+		audit.Log(e)
 		return err
 	}
 
-	if !config.IsAdminRole(result.User.Role) {
-		refresh := result.Tokens.RefreshToken
-		if err := svc.Logout(r.Context(), svc.LogoutInput{UserID: result.User.ID, RefreshToken: &refresh}); err != nil {
-			return err
-		}
-		e := audit.FromRequest(nil, httpx.AuditMeta(r))
-		e.ActorID = result.User.ID
-		e.ActorRole = result.User.Role
-		e.Action = audit.AdminLoginFailed
-		e.Resource = "User"
-		e.ResourceID = result.User.ID
-		e.Failed = true
-		e.Reason = "not an administrative account"
-		audit.Log(e)
-		return apperr.Forbid("This account cannot access the administration panel")
-	}
-
 	e := audit.FromRequest(nil, httpx.AuditMeta(r))
-	e.ActorID = result.User.ID
-	e.ActorRole = result.User.Role
-	e.ActorEmail = result.User.Email
-	e.Action = audit.AdminLogin
+	e.ActorID = out.User.ID.Hex()
+	e.ActorRole = out.User.Role
+	e.ActorEmail = out.User.Email
 	e.Resource = "User"
-	e.ResourceID = result.User.ID
+	e.ResourceID = out.User.ID.Hex()
+	if out.Challenge != nil {
+		// The password was right; the session waits for the second factor.
+		e.Action = audit.AdminMFAChallenge
+		e.After = map[string]any{"enrolmentRequired": out.Challenge.EnrolmentRequired}
+		audit.Log(e)
+		return httpx.OK(w, out.Challenge)
+	}
+	e.Action = audit.AdminLogin
 	audit.Log(e)
+	return httpx.OK(w, out.Session)
+}
 
-	return httpx.OK(w, result)
+// parseSecondStep reads {mfaToken, code?, recoveryCode?}.
+func parseSecondStep(r *http.Request, allowRecovery bool) (token, code, recovery string, err error) {
+	f, err := decodeFields(r)
+	if err != nil {
+		return "", "", "", err
+	}
+	if s, ok := f.str("mfaToken", true); ok {
+		f.min("mfaToken", s, 10)
+		f.max("mfaToken", s, 128)
+		token = s
+	}
+	if s, ok := f.str("code", false); ok {
+		f.max("code", s, 16)
+		code = s
+	}
+	if allowRecovery {
+		if s, ok := f.str("recoveryCode", false); ok {
+			f.max("recoveryCode", s, 64)
+			recovery = s
+		}
+	}
+	if strings.TrimSpace(code) == "" && strings.TrimSpace(recovery) == "" {
+		f.v.Add("code", "Enter the 6-digit code from your authenticator app")
+	}
+	return token, code, recovery, f.err()
+}
+
+// secondStepAudit starts an audit row for a second-step request.
+func secondStepAudit(r *http.Request, step svc.SecondStep, action string) audit.Entry {
+	e := audit.FromRequest(nil, httpx.AuditMeta(r))
+	e.ActorRole = "ANONYMOUS"
+	if step.UserID != "" {
+		e.ActorID, e.ActorRole, e.ActorEmail, e.ResourceID = step.UserID, step.Role, step.Email, step.UserID
+	}
+	e.Action = action
+	e.Resource = "User"
+	return e
+}
+
+func adminLoginMFAHandler(w http.ResponseWriter, r *http.Request) error {
+	token, code, recovery, err := parseSecondStep(r, true)
+	if err != nil {
+		return err
+	}
+	result, step, err := svc.CompleteAdminLogin(r.Context(), token, code, recovery, sessionContext(r))
+	if err != nil {
+		e := secondStepAudit(r, step, audit.AdminMFAFailed)
+		e.Failed, e.Reason = true, errMessage(err)
+		audit.Log(e)
+		return err
+	}
+	if step.Factor.Method == "recovery" {
+		e := secondStepAudit(r, step, audit.AdminMFARecoveryCodeUsed)
+		e.After = map[string]any{"recoveryCodesRemaining": step.Factor.RecoveryCodesRemaining}
+		audit.Log(e)
+	}
+	e := secondStepAudit(r, step, audit.AdminLogin)
+	e.After = map[string]any{"secondFactor": step.Factor.Method}
+	audit.Log(e)
+	return httpx.OK(w, struct {
+		svc.AuthResult
+		RecoveryCodesRemaining int `json:"recoveryCodesRemaining"`
+	}{result, step.Factor.RecoveryCodesRemaining})
+}
+
+func adminLoginEnrolHandler(w http.ResponseWriter, r *http.Request) error {
+	f, err := decodeFields(r)
+	if err != nil {
+		return err
+	}
+	token, ok := f.str("mfaToken", true)
+	if ok {
+		f.min("mfaToken", token, 10)
+		f.max("mfaToken", token, 128)
+	}
+	if err := f.err(); err != nil {
+		return err
+	}
+	enr, step, err := svc.StartAdminLoginEnrolment(r.Context(), token)
+	if err != nil {
+		if step.UserID != "" {
+			e := secondStepAudit(r, step, audit.AdminMFAFailed)
+			e.Failed, e.Reason = true, errMessage(err)
+			audit.Log(e)
+		}
+		return err
+	}
+	return httpx.OK(w, enr)
+}
+
+func adminLoginEnrolConfirmHandler(w http.ResponseWriter, r *http.Request) error {
+	token, code, _, err := parseSecondStep(r, false)
+	if err != nil {
+		return err
+	}
+	result, codes, step, err := svc.ConfirmAdminLoginEnrolment(r.Context(), token, code, sessionContext(r))
+	if err != nil {
+		e := secondStepAudit(r, step, audit.AdminMFAFailed)
+		e.Failed, e.Reason = true, errMessage(err)
+		audit.Log(e)
+		return err
+	}
+	e := secondStepAudit(r, step, audit.AdminMFAEnrolled)
+	e.After = map[string]any{"during": "sign-in"}
+	audit.Log(e)
+	e = secondStepAudit(r, step, audit.AdminLogin)
+	e.After = map[string]any{"secondFactor": "enrol"}
+	audit.Log(e)
+	return httpx.OK(w, struct {
+		svc.AuthResult
+		RecoveryCodes []string `json:"recoveryCodes"`
+	}{result, codes})
 }

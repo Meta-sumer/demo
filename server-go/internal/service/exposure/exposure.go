@@ -1,9 +1,12 @@
 // Package exposure is the exposure engine (spec section 11).
 //
 // Counters live in Redis so a trade updates them in a single round trip; the
-// `exposures` collection is the durable snapshot, refreshed by the risk worker
-// and rebuilt from open trades at boot. Redis is a cache of a fact that MongoDB
-// owns, never the fact itself (rule 6).
+// `exposures` collection is the durable snapshot, refreshed by the risk worker.
+// Redis is a cache of a fact that MongoDB owns, never the fact itself (rule 6):
+// the open LIVE trades in binary_trades are the source of truth, and the book
+// (book.go) is rebuilt from them (rebuild.go) and reconciled against them
+// (reconcile.go). Every counter mutation is an atomic, per-trade idempotent
+// Lua script (lua.go).
 //
 // Definitions, all in minor units:
 //
@@ -14,6 +17,8 @@
 //	potentialLiability   - the platform's worst-case net loss across both
 //	                       outcomes: UP profits are only a loss to the extent
 //	                       they exceed the losing side's forfeited stakes.
+//	expiryLiability      - the same worst case taken per expiry bucket and
+//	                       summed (liability.go).
 package exposure
 
 import (
@@ -43,6 +48,12 @@ type RawCounters struct {
 	UpProfit   int64
 	DownProfit int64
 	OpenTrades int64
+	// Sum of the asset's expiry-bucket liabilities, and how many buckets.
+	ExpiryLiability int64
+	ExpiryBuckets   int64
+	// Live reservations on the asset.
+	ReservedStake  int64
+	ReservedTrades int64
 }
 
 type ExposureDelta struct {
@@ -54,27 +65,39 @@ type ExposureDelta struct {
 	Profit    int64
 	// +1 when a trade opens, -1 when it settles or is cancelled.
 	Sign int64
+	// Optional. With the trade id the delta is applied exactly once per trade
+	// (a repeated release is a no-op, a release before the open is
+	// remembered). Without it a release is matched to an open trade of the
+	// user with the same asset, side, stake and profit, which moves the same
+	// counters. ExpiryTimestamp places an opening trade in its expiry bucket.
+	TradeID         string
+	ExpiryTimestamp int64
 }
 
-// ApplyExposureDelta updates the asset and user counters in one pipeline and
-// returns the resulting snapshot.
+// ApplyExposureDelta applies a trade opening (+1) or a release (-1) to the
+// book through the per-trade idempotent scripts and returns the resulting
+// snapshot. New LIVE trades go through Reserve/Commit instead; this remains
+// the release path for settlement, early close and cancellation.
 func ApplyExposureDelta(ctx context.Context, delta ExposureDelta) (models.ExposureSnapshot, error) {
-	key := config.RedisKeys.Exposure(delta.AssetID)
-	stakeField, profitField := "downStake", "downProfit"
-	if delta.Direction == models.DirectionUp {
-		stakeField, profitField = "upStake", "upProfit"
+	var err error
+	switch {
+	case delta.Sign > 0:
+		id := delta.TradeID
+		if id == "" {
+			id = anonTradeID()
+		}
+		_, err = CommitTrade(ctx, OpenTrade{
+			TradeID: id, AssetID: delta.AssetID, Symbol: delta.Symbol, UserID: delta.UserID,
+			Direction: delta.Direction, Stake: delta.Stake, Profit: delta.Profit, ExpiryTimestamp: delta.ExpiryTimestamp,
+		})
+	case delta.Sign < 0:
+		if delta.TradeID != "" {
+			_, err = CloseTrade(ctx, delta.TradeID, delta.UserID)
+		} else {
+			_, err = closeByMatch(ctx, delta)
+		}
 	}
-	userKey := config.RedisKeys.UserExposure(delta.UserID)
-
-	pipe := redisx.R().Pipeline()
-	pipe.SAdd(ctx, config.RedisKeys.ExposureAssets, delta.AssetID)
-	pipe.HIncrBy(ctx, key, stakeField, delta.Sign*delta.Stake)
-	pipe.HIncrBy(ctx, key, profitField, delta.Sign*delta.Profit)
-	pipe.HIncrBy(ctx, key, "openTrades", delta.Sign)
-	pipe.HSet(ctx, key, "symbol", delta.Symbol, "updatedAt", strconv.FormatInt(util.NowMs(), 10))
-	pipe.HIncrBy(ctx, userKey, delta.AssetID, delta.Sign*delta.Stake)
-	pipe.HIncrBy(ctx, userKey, "total", delta.Sign*delta.Stake)
-	if _, err := pipe.Exec(ctx); err != nil {
+	if err != nil {
 		return models.ExposureSnapshot{}, err
 	}
 
@@ -82,9 +105,15 @@ func ApplyExposureDelta(ctx context.Context, delta ExposureDelta) (models.Exposu
 	if err != nil {
 		return models.ExposureSnapshot{}, err
 	}
+	announce(snapshot)
+	return snapshot, nil
+}
+
+// announce pushes the new snapshot to the admin risk channel and signals the
+// hedge worker that the asset needs re-evaluating.
+func announce(snapshot models.ExposureSnapshot) {
 	ws.Emit([]string{config.ChAdminRisk}, config.EvExposureUpdated, snapshot)
-	// Signal the hedge worker that this asset needs re-evaluating.
-	assetID := delta.AssetID
+	assetID := snapshot.AssetID
 	go func() {
 		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -92,7 +121,22 @@ func ApplyExposureDelta(ctx context.Context, delta ExposureDelta) (models.Exposu
 			logx.Warn("failed to queue hedge evaluation", "assetId", assetID, "err", err.Error())
 		}
 	}()
-	return snapshot, nil
+}
+
+// Notify announces an asset whose exposure just changed (after a commit),
+// off the caller's path: exposure.updated to admin:risk and a hedge
+// re-evaluation, as ApplyExposureDelta does.
+func Notify(assetID, symbol string) {
+	go func() {
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		snapshot, err := GetExposure(c, assetID, symbol)
+		if err != nil {
+			logx.Warn("failed to read exposure for notification", "assetId", assetID, "err", err.Error())
+			return
+		}
+		announce(snapshot)
+	}()
 }
 
 // num mirrors JS Number() on a Redis string: missing -> 0.
@@ -110,12 +154,29 @@ func num(raw map[string]string, field string) int64 {
 
 func countersFrom(raw map[string]string) RawCounters {
 	return RawCounters{
-		UpStake:    num(raw, "upStake"),
-		DownStake:  num(raw, "downStake"),
-		UpProfit:   num(raw, "upProfit"),
-		DownProfit: num(raw, "downProfit"),
-		OpenTrades: num(raw, "openTrades"),
+		UpStake:         num(raw, "upStake"),
+		DownStake:       num(raw, "downStake"),
+		UpProfit:        num(raw, "upProfit"),
+		DownProfit:      num(raw, "downProfit"),
+		OpenTrades:      num(raw, "openTrades"),
+		ExpiryLiability: num(raw, "bLiab"),
+		ExpiryBuckets:   num(raw, "nb"),
 	}
+}
+
+// sumReserved totals live reservations per asset: [stake, count].
+func sumReserved(raw map[string]string) map[string][2]int64 {
+	out := map[string][2]int64{}
+	for _, v := range raw {
+		f := splitPipe(v)
+		if len(f) < 4 {
+			continue
+		}
+		stake, _ := strconv.ParseInt(f[3], 10, 64)
+		cur := out[f[0]]
+		out[f[0]] = [2]int64{cur[0] + stake, cur[1] + 1}
+	}
+	return out
 }
 
 func updatedAtFrom(raw map[string]string, fallback int64) int64 {
@@ -126,15 +187,21 @@ func updatedAtFrom(raw map[string]string, fallback int64) int64 {
 }
 
 func readCounters(ctx context.Context, assetID string) (RawCounters, string, int64, error) {
-	raw, err := redisx.R().HGetAll(ctx, config.RedisKeys.Exposure(assetID)).Result()
-	if err != nil {
+	pipe := redisx.R().Pipeline()
+	assetCmd := pipe.HGetAll(ctx, config.RedisKeys.Exposure(assetID))
+	rsvCmd := pipe.HGetAll(ctx, BookNamespace()+":rsv")
+	if _, err := pipe.Exec(ctx); err != nil && !redisx.IsNil(err) {
 		return RawCounters{}, "", 0, err
 	}
+	raw := assetCmd.Val()
 	now := util.NowMs()
+	c := countersFrom(raw)
+	r := sumReserved(rsvCmd.Val())[assetID]
+	c.ReservedStake, c.ReservedTrades = r[0], r[1]
 	if len(raw) == 0 {
-		return RawCounters{}, "", now, nil
+		return c, "", now, nil
 	}
-	return countersFrom(raw), raw["symbol"], updatedAtFrom(raw, now), nil
+	return c, raw["symbol"], updatedAtFrom(raw, now), nil
 }
 
 // DeriveExposure is the pure derivation, unit tested without Redis. TS
@@ -157,6 +224,13 @@ func DeriveExposure(assetID, symbol string, c RawCounters, updatedAt int64) mode
 		PotentialLiability:  max(0, upProfit-downStake, downProfit-upStake),
 		OpenTrades:          max(0, c.OpenTrades),
 		UpdatedAt:           updatedAt,
+		UpWinNet:            upProfit - downStake,
+		DownWinNet:          downProfit - upStake,
+		ExpiryLiability:     max(0, c.ExpiryLiability),
+		MaxPayoutLiability:  upProfit + downProfit,
+		ExpiryBuckets:       max(0, c.ExpiryBuckets),
+		ReservedStake:       max(0, c.ReservedStake),
+		ReservedTrades:      max(0, c.ReservedTrades),
 	}
 }
 
@@ -193,9 +267,11 @@ func GetAllExposures(ctx context.Context) ([]models.ExposureSnapshot, error) {
 	for i, a := range list {
 		cmds[i] = pipe.HGetAll(ctx, config.RedisKeys.Exposure(a.ID.Hex()))
 	}
+	rsvCmd := pipe.HGetAll(ctx, BookNamespace()+":rsv")
 	if _, err := pipe.Exec(ctx); err != nil && !redisx.IsNil(err) {
 		return nil, err
 	}
+	reserved := sumReserved(rsvCmd.Val())
 
 	at := util.NowMs()
 	for i, a := range list {
@@ -203,7 +279,10 @@ func GetAllExposures(ctx context.Context) ([]models.ExposureSnapshot, error) {
 		if raw == nil {
 			raw = map[string]string{}
 		}
-		out = append(out, DeriveExposure(a.ID.Hex(), a.Symbol, countersFrom(raw), updatedAtFrom(raw, at)))
+		c := countersFrom(raw)
+		r := reserved[a.ID.Hex()]
+		c.ReservedStake, c.ReservedTrades = r[0], r[1]
+		out = append(out, DeriveExposure(a.ID.Hex(), a.Symbol, c, updatedAtFrom(raw, at)))
 	}
 	return out, nil
 }
@@ -214,6 +293,12 @@ type PortfolioExposure struct {
 	TotalPotentialLiability int64                     `json:"totalPotentialLiability"`
 	TotalOpenTrades         int64                     `json:"totalOpenTrades"`
 	Assets                  []models.ExposureSnapshot `json:"assets"`
+	// Added fields: liability totals (see ExposureSnapshot), live
+	// reservations, and the health of the book (READY means exact).
+	TotalExpiryLiability    int64       `json:"totalExpiryLiability"`
+	TotalMaxPayoutLiability int64       `json:"totalMaxPayoutLiability"`
+	TotalReservedStake      int64       `json:"totalReservedStake"`
+	Book                    *BookStatus `json:"book"`
 }
 
 func GetPortfolioExposure(ctx context.Context) (PortfolioExposure, error) {
@@ -227,7 +312,15 @@ func GetPortfolioExposure(ctx context.Context) (PortfolioExposure, error) {
 		p.TotalNetExposure += a.NetExposure
 		p.TotalPotentialLiability += a.PotentialLiability
 		p.TotalOpenTrades += a.OpenTrades
+		p.TotalExpiryLiability += a.ExpiryLiability
+		p.TotalMaxPayoutLiability += a.MaxPayoutLiability
+		p.TotalReservedStake += a.ReservedStake
 	}
+	book, err := GetBookStatus(ctx)
+	if err != nil {
+		return PortfolioExposure{}, err
+	}
+	p.Book = &book
 	return p, nil
 }
 
@@ -278,6 +371,8 @@ func PersistExposure(ctx context.Context, snapshot models.ExposureSnapshot, hedg
 				"upPotentialPayout":   snapshot.UpPotentialPayout,
 				"downPotentialPayout": snapshot.DownPotentialPayout,
 				"potentialLiability":  snapshot.PotentialLiability,
+				"expiryLiability":     snapshot.ExpiryLiability,
+				"maxPayoutLiability":  snapshot.MaxPayoutLiability,
 				"openTrades":          snapshot.OpenTrades,
 				"hedgedNotional":      hedgedNotional,
 				"updatedAt":           now,
@@ -307,149 +402,15 @@ func PersistAllExposures(ctx context.Context, hedgedByAsset map[string]int64) er
 var openStatuses = bson.M{"$in": bson.A{string(models.TradeStatusOpen), string(models.TradeStatusSettling)}}
 
 // RebuildExposureFromDatabase rebuilds the Redis counters from the open
-// trades in MongoDB. Run at boot and after any Redis incident: the durable
-// trade ledger is the source of truth, the cache is disposable.
+// trades in MongoDB: the durable trade ledger is the source of truth, the
+// cache is disposable. It is the coordinated rebuild (RebuildBook, forced):
+// lock-gated, built into temporary keys and swapped in atomically, with every
+// trade accepted or released meanwhile replayed. Returns the number of
+// registered assets.
 func RebuildExposureFromDatabase(ctx context.Context) (int, error) {
-	// DEMO trades are not part of the house book.
-	cur, err := mongox.C(models.CollBinaryTrades).Aggregate(ctx, bson.A{
-		bson.M{"$match": bson.M{"status": openStatuses, "accountType": models.NotDemo()}},
-		bson.M{"$group": bson.M{
-			"_id":    bson.M{"assetId": "$assetId", "direction": "$direction"},
-			"stake":  bson.M{"$sum": "$stake"},
-			"profit": bson.M{"$sum": "$profit"},
-			"count":  bson.M{"$sum": 1},
-			"symbol": bson.M{"$first": "$symbol"},
-		}},
-	})
+	res, err := RebuildBook(ctx, RebuildOptions{Reason: "requested", Wait: 30 * time.Second, Force: true})
 	if err != nil {
 		return 0, err
 	}
-	var grouped []struct {
-		ID struct {
-			AssetID   bson.ObjectID    `bson:"assetId"`
-			Direction models.Direction `bson:"direction"`
-		} `bson:"_id"`
-		Stake  int64  `bson:"stake"`
-		Profit int64  `bson:"profit"`
-		Count  int64  `bson:"count"`
-		Symbol string `bson:"symbol"`
-	}
-	if err := cur.All(ctx, &grouped); err != nil {
-		return 0, err
-	}
-
-	type entry struct {
-		symbol   string
-		counters RawCounters
-	}
-	perAsset := map[string]*entry{}
-	for _, row := range grouped {
-		id := row.ID.AssetID.Hex()
-		e := perAsset[id]
-		if e == nil {
-			e = &entry{symbol: row.Symbol}
-			perAsset[id] = e
-		}
-		if row.ID.Direction == models.DirectionUp {
-			e.counters.UpStake += row.Stake
-			e.counters.UpProfit += row.Profit
-		} else {
-			e.counters.DownStake += row.Stake
-			e.counters.DownProfit += row.Profit
-		}
-		e.counters.OpenTrades += row.Count
-	}
-
-	list, err := assets.ListAssetDocs(ctx, false)
-	if err != nil {
-		return 0, err
-	}
-	pipe := redisx.R().Pipeline()
-	for _, a := range list {
-		id := a.ID.Hex()
-		e := perAsset[id]
-		if e == nil {
-			e = &entry{symbol: a.Symbol}
-		}
-		key := config.RedisKeys.Exposure(id)
-		pipe.Del(ctx, key)
-		pipe.HSet(ctx, key, map[string]any{
-			"upStake":    strconv.FormatInt(e.counters.UpStake, 10),
-			"downStake":  strconv.FormatInt(e.counters.DownStake, 10),
-			"upProfit":   strconv.FormatInt(e.counters.UpProfit, 10),
-			"downProfit": strconv.FormatInt(e.counters.DownProfit, 10),
-			"openTrades": strconv.FormatInt(e.counters.OpenTrades, 10),
-			"symbol":     e.symbol,
-			"updatedAt":  strconv.FormatInt(util.NowMs(), 10),
-		})
-		pipe.SAdd(ctx, config.RedisKeys.ExposureAssets, id)
-	}
-	if len(list) > 0 {
-		if _, err := pipe.Exec(ctx); err != nil {
-			return 0, err
-		}
-	}
-
-	if err := rebuildUserExposure(ctx); err != nil {
-		return 0, err
-	}
-	logx.Info("exposure counters rebuilt from the trade ledger", "assets", len(list))
-	return len(list), nil
-}
-
-func rebuildUserExposure(ctx context.Context) error {
-	cur, err := mongox.C(models.CollBinaryTrades).Aggregate(ctx, bson.A{
-		bson.M{"$match": bson.M{"status": openStatuses, "accountType": models.NotDemo()}},
-		bson.M{"$group": bson.M{
-			"_id":   bson.M{"userId": "$userId", "assetId": "$assetId"},
-			"stake": bson.M{"$sum": "$stake"},
-		}},
-	})
-	if err != nil {
-		return err
-	}
-	var grouped []struct {
-		ID struct {
-			UserID  bson.ObjectID `bson:"userId"`
-			AssetID bson.ObjectID `bson:"assetId"`
-		} `bson:"_id"`
-		Stake int64 `bson:"stake"`
-	}
-	if err := cur.All(ctx, &grouped); err != nil {
-		return err
-	}
-
-	perUser := map[string]map[string]int64{}
-	for _, row := range grouped {
-		u := row.ID.UserID.Hex()
-		if perUser[u] == nil {
-			perUser[u] = map[string]int64{}
-		}
-		perUser[u][row.ID.AssetID.Hex()] = row.Stake
-	}
-
-	rdb := redisx.R()
-	existing, err := rdb.Keys(ctx, config.RedisKeys.UserExposure("*")).Result()
-	if err != nil {
-		return err
-	}
-	pipe := rdb.Pipeline()
-	for _, k := range existing {
-		pipe.Del(ctx, k)
-	}
-	for userID, stakes := range perUser {
-		fields := make(map[string]any, len(stakes)+1)
-		var total int64
-		for assetID, stake := range stakes {
-			fields[assetID] = strconv.FormatInt(stake, 10)
-			total += stake
-		}
-		fields["total"] = strconv.FormatInt(total, 10)
-		pipe.HSet(ctx, config.RedisKeys.UserExposure(userID), fields)
-	}
-	if pipe.Len() == 0 {
-		return nil
-	}
-	_, err = pipe.Exec(ctx)
-	return err
+	return res.Assets, nil
 }

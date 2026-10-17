@@ -11,14 +11,18 @@ import (
 	"binarytrading/internal/config"
 	"binarytrading/internal/platform/logx"
 	"binarytrading/internal/platform/redisx"
+	"binarytrading/internal/platform/util"
 )
 
 // Settlement worker (spec section 18).
 //
-// Unlike the other workers this one is NOT leader-elected: settlement is
-// idempotent by construction, so every instance can consume the queue and the
-// platform settles faster under load. BRPOP hands each trade to exactly one
-// consumer, and the guards in SettleTrade cover the rest.
+// Unlike the other workers this one is NOT leader-elected, and needs no
+// fencing: every side effect it makes is guarded by the trade's durable state
+// machine (see the package comment), not by who runs it. BRPOP hands each
+// queue entry to one consumer, but nothing depends on that - two instances
+// settling the same trade, or one trade queued many times, end in one outcome
+// with one wallet movement. A trade that cannot settle yet is put back on the
+// expiry queue for the time it can (Reschedule), never re-pushed in a loop.
 
 var (
 	workerMu   sync.Mutex
@@ -169,22 +173,23 @@ func drain(ctx context.Context, conn *redis.Client, limit int) ([]string, error)
 	return ids, nil
 }
 
+// errorRetryDelayMs: how soon a trade whose settlement failed is tried again.
+// Long enough not to spin on a persistent error, far shorter than the sweep.
+const errorRetryDelayMs = 5000
+
 // settleOne runs on a background context so a shutdown signal cannot abort a
 // settlement half way (the Node loop also finishes its current trade).
+// Deferred outcomes have already been rescheduled by SettleTrade; an error
+// leaves the trade where it was and retries it shortly (the sweeper is the
+// backstop if even that fails).
 func settleOne(tradeID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	outcome, err := SettleTrade(ctx, tradeID, "")
-	if err != nil {
-		logx.Error("settlement failed - trade left for the sweeper", "tradeId", tradeID, "err", err.Error())
-		return
-	}
-	if outcome.Status == StatusSkippedNoPrice {
-		// Put it back so the next pass can try again once a price arrives.
-		if c := currentConnection(); c != nil {
-			if err := c.LPush(ctx, config.RedisKeys.SettlementQueue, tradeID).Err(); err != nil {
-				logx.Error("settlement failed - trade left for the sweeper", "tradeId", tradeID, "err", err.Error())
-			}
+	if _, err := SettleTrade(ctx, tradeID, ""); err != nil {
+		logx.Error("settlement failed - retrying shortly", "tradeId", tradeID, "err", err.Error())
+		retryAt := util.NowMs() + errorRetryDelayMs
+		if rerr := Reschedule(ctx, tradeID, retryAt); rerr != nil {
+			logx.Error("settlement failed - trade left for the sweeper", "tradeId", tradeID, "err", rerr.Error())
 		}
 	}
 }

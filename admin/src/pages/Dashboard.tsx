@@ -17,6 +17,7 @@ import {
   YAxis,
 } from 'recharts';
 import { api } from '../services/api';
+import { useAuthStore } from '../stores/authStore';
 import { formatMoney, formatSignedMoney, fromMinor } from '../utils/format';
 import { Panel, PanelHeader, Skeleton, Stat } from '../components/ui';
 import { useChartPalette } from '../utils/theme-colors';
@@ -54,6 +55,14 @@ export function DashboardPage() {
   });
 
   const palette = useChartPalette();
+
+  // The server leaves out the figures a role may not read (a SUPPORT agent sees
+  // activity, not the book), so their cards are not drawn at all.
+  const can = useAuthStore((s) => s.can);
+  const seeBook = can('exposure:read');
+  const seePnl = can('reports:read');
+  const seeDeposits = can('deposits:read');
+  const seeWithdrawals = can('withdrawals:read');
 
   const axisStyle = { fontSize: 11, fill: palette.text };
   const tooltipStyle = {
@@ -110,30 +119,36 @@ export function DashboardPage() {
           label="Today's volume"
           value={summary ? formatMoney(summary.todayVolume) : <Skeleton className="h-6 w-24" />}
         />
-        <Stat
-          label="Today's P&L"
-          value={summary ? formatSignedMoney(summary.todayPlatformResult) : <Skeleton className="h-6 w-24" />}
-          tone={summary ? (summary.todayPlatformResult >= 0 ? 'up' : 'down') : 'neutral'}
-          hint="Platform gross result"
-        />
+        {seePnl ? (
+          <Stat
+            label="Today's P&L"
+            value={summary ? formatSignedMoney(summary.todayPlatformResult) : <Skeleton className="h-6 w-24" />}
+            tone={summary ? (summary.todayPlatformResult >= 0 ? 'up' : 'down') : 'neutral'}
+            hint="Platform gross result"
+          />
+        ) : null}
 
-        <Stat
-          label="Current exposure"
-          value={summary ? formatMoney(summary.currentExposure) : <Skeleton className="h-6 w-24" />}
-          hint={summary ? 'Net ' + formatSignedMoney(summary.currentNetExposure) : undefined}
-        />
-        <Stat
-          label="Hedged exposure"
-          value={summary ? formatMoney(summary.hedgedExposure) : <Skeleton className="h-6 w-24" />}
-          tone="accent"
-          hint={hedgeRatio + '% of net exposure'}
-        />
-        <Stat
-          label="Unhedged exposure"
-          value={summary ? formatMoney(summary.unhedgedExposure) : <Skeleton className="h-6 w-24" />}
-          tone={summary && summary.unhedgedExposure > 0 ? 'warn' : 'neutral'}
-          hint={summary ? 'Liability ' + formatMoney(summary.potentialLiability) : undefined}
-        />
+        {seeBook ? (
+          <>
+            <Stat
+              label="Current exposure"
+              value={summary ? formatMoney(summary.currentExposure) : <Skeleton className="h-6 w-24" />}
+              hint={summary ? 'Net ' + formatSignedMoney(summary.currentNetExposure) : undefined}
+            />
+            <Stat
+              label="Hedged exposure"
+              value={summary ? formatMoney(summary.hedgedExposure) : <Skeleton className="h-6 w-24" />}
+              tone="accent"
+              hint={hedgeRatio + '% of net exposure'}
+            />
+            <Stat
+              label="Unhedged exposure"
+              value={summary ? formatMoney(summary.unhedgedExposure) : <Skeleton className="h-6 w-24" />}
+              tone={summary && summary.unhedgedExposure > 0 ? 'warn' : 'neutral'}
+              hint={summary ? 'Liability ' + formatMoney(summary.potentialLiability) : undefined}
+            />
+          </>
+        ) : null}
         <Stat
           label="Feed latency"
           value={summary ? summary.feedLatencyP50 + ' ms' : <Skeleton className="h-6 w-16" />}
@@ -171,43 +186,45 @@ export function DashboardPage() {
           </div>
         </Panel>
 
-        <Panel>
-          <PanelHeader title="Platform P&L" description="Gross result against customer payouts" />
-          <div className="h-64 p-3">
-            {seriesQuery.isLoading ? (
-              <Skeleton className="h-full w-full" />
-            ) : (
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={series}>
-                  <CartesianGrid strokeDasharray="3 3" stroke={palette.grid} />
-                  <XAxis dataKey="date" tick={axisStyle} tickLine={false} axisLine={false} />
-                  <YAxis tick={axisStyle} tickLine={false} axisLine={false} width={70} />
-                  <Tooltip
-                    contentStyle={tooltipStyle}
-                    formatter={(value: number, name) => [formatMoney(Math.round(value * 100)), name]}
-                  />
-                  <Legend wrapperStyle={{ fontSize: 11 }} />
-                  <Line
-                    type="monotone"
-                    dataKey="resultMajor"
-                    name="Platform result"
-                    stroke={palette.up}
-                    strokeWidth={2}
-                    dot={false}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="payoutMajor"
-                    name="Customer payout"
-                    stroke={palette.warn}
-                    strokeWidth={2}
-                    dot={false}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            )}
-          </div>
-        </Panel>
+        {seePnl ? (
+          <Panel>
+            <PanelHeader title="Platform P&L" description="Gross result against customer payouts" />
+            <div className="h-64 p-3">
+              {seriesQuery.isLoading ? (
+                <Skeleton className="h-full w-full" />
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={series}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={palette.grid} />
+                    <XAxis dataKey="date" tick={axisStyle} tickLine={false} axisLine={false} />
+                    <YAxis tick={axisStyle} tickLine={false} axisLine={false} width={70} />
+                    <Tooltip
+                      contentStyle={tooltipStyle}
+                      formatter={(value: number, name) => [formatMoney(Math.round(value * 100)), name]}
+                    />
+                    <Legend wrapperStyle={{ fontSize: 11 }} />
+                    <Line
+                      type="monotone"
+                      dataKey="resultMajor"
+                      name="Platform result"
+                      stroke={palette.up}
+                      strokeWidth={2}
+                      dot={false}
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="payoutMajor"
+                      name="Customer payout"
+                      stroke={palette.warn}
+                      strokeWidth={2}
+                      dot={false}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          </Panel>
+        ) : null}
 
         <Panel>
           <PanelHeader title="Volume by asset" description="Last 7 days" />
@@ -260,21 +277,27 @@ export function DashboardPage() {
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Stat
-          label="Customer balances"
-          value={summary ? formatMoney(summary.totalCustomerBalance) : <Skeleton className="h-6 w-24" />}
-          hint={summary ? formatMoney(summary.totalLockedBalance) + ' locked' : undefined}
-        />
-        <Stat
-          label="Pending deposits"
-          value={summary ? summary.pendingDeposits : <Skeleton className="h-6 w-10" />}
-          tone={summary && summary.pendingDeposits > 0 ? 'warn' : 'neutral'}
-        />
-        <Stat
-          label="Pending withdrawals"
-          value={summary ? summary.pendingWithdrawals : <Skeleton className="h-6 w-10" />}
-          tone={summary && summary.pendingWithdrawals > 0 ? 'warn' : 'neutral'}
-        />
+        {seePnl ? (
+          <Stat
+            label="Customer balances"
+            value={summary ? formatMoney(summary.totalCustomerBalance) : <Skeleton className="h-6 w-24" />}
+            hint={summary ? formatMoney(summary.totalLockedBalance) + ' locked' : undefined}
+          />
+        ) : null}
+        {seeDeposits ? (
+          <Stat
+            label="Pending deposits"
+            value={summary ? summary.pendingDeposits : <Skeleton className="h-6 w-10" />}
+            tone={summary && summary.pendingDeposits > 0 ? 'warn' : 'neutral'}
+          />
+        ) : null}
+        {seeWithdrawals ? (
+          <Stat
+            label="Pending withdrawals"
+            value={summary ? summary.pendingWithdrawals : <Skeleton className="h-6 w-10" />}
+            tone={summary && summary.pendingWithdrawals > 0 ? 'warn' : 'neutral'}
+          />
+        ) : null}
         <Stat
           label="Trade acceptance p95"
           value={summary ? summary.tradeAcceptanceP95 + ' ms' : <Skeleton className="h-6 w-16" />}

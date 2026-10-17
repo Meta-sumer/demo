@@ -147,6 +147,9 @@ type RiskConfigPatch struct {
 	MaxTradeAmount                   *int64              `json:"maxTradeAmount"`
 	MaxOpenTradesPerUser             *int64              `json:"maxOpenTradesPerUser"`
 	MaxUserAssetConcentrationPercent *float64            `json:"maxUserAssetConcentrationPercent"`
+	MaxExpiryLiability               *int64              `json:"maxExpiryLiability"`
+	MaxAssetLiability                *int64              `json:"maxAssetLiability"`
+	MaxPlatformLiability             *int64              `json:"maxPlatformLiability"`
 	HedgeThresholdPercent            *float64            `json:"hedgeThresholdPercent"`
 	CriticalExposurePercent          *float64            `json:"criticalExposurePercent"`
 	HedgeLevels                      []models.HedgeLevel `json:"hedgeLevels"` // nil = unchanged
@@ -181,6 +184,9 @@ func (p *RiskConfigPatch) Apply(c *models.RiskConfig) {
 	setIf(&c.MaxTradeAmount, p.MaxTradeAmount)
 	setIf(&c.MaxOpenTradesPerUser, p.MaxOpenTradesPerUser)
 	setIf(&c.MaxUserAssetConcentrationPercent, p.MaxUserAssetConcentrationPercent)
+	setIf(&c.MaxExpiryLiability, p.MaxExpiryLiability)
+	setIf(&c.MaxAssetLiability, p.MaxAssetLiability)
+	setIf(&c.MaxPlatformLiability, p.MaxPlatformLiability)
 	setIf(&c.HedgeThresholdPercent, p.HedgeThresholdPercent)
 	setIf(&c.CriticalExposurePercent, p.CriticalExposurePercent)
 	if p.HedgeLevels != nil {
@@ -259,6 +265,10 @@ func ValidateConfig(c *models.RiskConfig) error {
 	}
 	if c.MinTradeAmount > c.MaxTradeAmount {
 		return apperr.Validation("minTradeAmount cannot exceed maxTradeAmount", nil)
+	}
+	// Liability ceilings: 0 means "no liability limit", never "nothing may trade".
+	if c.MaxExpiryLiability < 0 || c.MaxAssetLiability < 0 || c.MaxPlatformLiability < 0 {
+		return apperr.Validation("Liability limits cannot be negative", nil)
 	}
 	if c.HedgeThresholdPercent < 0 || c.HedgeThresholdPercent > 100 {
 		return apperr.Validation("hedgeThresholdPercent must be between 0 and 100", nil)

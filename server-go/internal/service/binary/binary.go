@@ -303,6 +303,7 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 		Direction:          input.Direction,
 		UserMaxTradeAmount: user.MaxTradeAmount,
 		UserMaxExposure:    user.MaxUserExposure,
+		ExpirySeconds:      input.ExpirySeconds,
 	}); err != nil {
 		return CreateTradeResult{}, err
 	}
@@ -312,6 +313,38 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 	tradeHex := tradeID.Hex()
 	entryTimestamp := util.NowMs()
 	expiryTimestamp := entryTimestamp + input.ExpirySeconds*1000
+
+	// 8b. LIVE only: atomic exposure reservation. The check above read the
+	//     book without holding anything, so concurrent requests could each
+	//     pass it; this re-checks every exposure limit against the committed
+	//     book plus all in-flight reservations and holds the headroom under
+	//     the trade id in one step. From here every failure releases it, and
+	//     the insert commits it. DEMO trades never touch the house book.
+	var resv *exposure.Reservation
+	if !demo {
+		resv, err = risk.ReserveTradeExposure(ctx, risk.ReservationRequest{
+			TradeID:         tradeHex,
+			UserID:          tc.UserID,
+			Asset:           asset,
+			Direction:       input.Direction,
+			Stake:           stake,
+			Profit:          profit,
+			ExpiryTimestamp: expiryTimestamp,
+			UserMaxExposure: user.MaxUserExposure,
+		})
+		if err != nil {
+			return CreateTradeResult{}, err
+		}
+	}
+	releaseReservation := func() {
+		if resv == nil {
+			return
+		}
+		if err := resv.Release(context.WithoutCancel(ctx)); err != nil {
+			// It lapses on its own and the sweeper releases it.
+			logx.Error("failed to release an exposure reservation", "tradeId", tradeHex, "err", err.Error())
+		}
+	}
 
 	// 9. Reserve the stake on the trade's account. The lock is keyed on the
 	//    trade id so a retry cannot double-reserve. A first DEMO trade opens
@@ -323,7 +356,28 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 	}
 	funds := wallets.TradeFundsInput{UserID: tc.UserID, AccountType: input.AccountType, Stake: stake, TradeID: tradeHex}
 	if _, err := wallets.LockTradeFunds(ctx, funds); err != nil {
+		releaseReservation()
 		return CreateTradeResult{}, err
+	}
+
+	// 9c. The funds lock can wait on the wallet; make sure the reservation is
+	//     still held (and extend it) before the trade becomes irreversible. A
+	//     reservation that lapsed may already have been given to another trade.
+	if resv != nil {
+		held, err := resv.Renew(ctx)
+		if err != nil || !held {
+			if _, relErr := wallets.ReleaseTradeFunds(ctx, funds, wallets.ReleaseCancelled); relErr != nil {
+				logx.Error("failed to release funds after losing the exposure reservation", "tradeId", tradeHex, "err", relErr.Error())
+			}
+			releaseReservation()
+			detail := "reservation lapsed"
+			if err != nil {
+				detail = "redis"
+			}
+			return CreateTradeResult{}, apperr.New(apperr.ServiceUnavailable,
+				"Trading is temporarily unavailable while risk limits are verified. Please try again shortly.", 503,
+				map[string]any{"reason": "EXPOSURE_BOOK_UNAVAILABLE", "detail": detail})
+		}
 	}
 
 	// 10. Persist the trade.
@@ -369,6 +423,9 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 		if _, relErr := wallets.ReleaseTradeFunds(ctx, funds, wallets.ReleaseCancelled); relErr != nil {
 			logx.Error("failed to release funds after a lost race", "tradeId", tradeHex, "err", relErr.Error())
 		}
+		// If the insert did land after all (an ambiguous network error), the
+		// reconciler counts the trade from MongoDB.
+		releaseReservation()
 		if mongox.IsDuplicateKey(err) && truthy(idempotencyKey) {
 			var winner models.BinaryTrade
 			findErr := mongox.C(models.CollBinaryTrades).FindOne(ctx, bson.M{"userId": uid, "idempotencyKey": *idempotencyKey}).Decode(&winner)
@@ -383,23 +440,23 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 	}
 	metrics.Since(config.LatTradePersistence, persistStarted)
 
-	// 11. Exposure, expiry scheduling and notifications.
+	// 11. Exposure, expiry scheduling and notifications. The reservation is
+	//     committed first: the trade exists now, and its exposure must count
+	//     whatever happens next.
+	// DEMO trades are not the house's risk: no exposure, no hedge evaluation.
+	if resv != nil {
+		if _, err := resv.Commit(ctx); err != nil {
+			// The trade is written, so it is not refused now. The reservation
+			// still holds its headroom and the sweeper commits it from MongoDB
+			// once it lapses (or a rebuild counts the trade).
+			logx.Error("failed to commit an exposure reservation", "tradeId", tradeHex, "err", err.Error())
+			metrics.IncrementCounter("exposure.commit_failed", 1, 0)
+		} else {
+			exposure.Notify(asset.ID.Hex(), asset.Symbol)
+		}
+	}
 	if err := redisx.R().ZAdd(ctx, config.RedisKeys.ExpiryQueue, redis.Z{Score: float64(expiryTimestamp), Member: tradeHex}).Err(); err != nil {
 		return CreateTradeResult{}, err
-	}
-	// DEMO trades are not the house's risk: no exposure, no hedge evaluation.
-	if !demo {
-		if _, err := exposure.ApplyExposureDelta(ctx, exposure.ExposureDelta{
-			AssetID:   asset.ID.Hex(),
-			Symbol:    asset.Symbol,
-			UserID:    tc.UserID,
-			Direction: input.Direction,
-			Stake:     stake,
-			Profit:    profit,
-			Sign:      1,
-		}); err != nil {
-			return CreateTradeResult{}, err
-		}
 	}
 
 	if truthy(idempotencyKey) {

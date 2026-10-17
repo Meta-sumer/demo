@@ -62,7 +62,108 @@ func sumIfNull(field string) bson.M {
 	return bson.M{"$sum": bson.M{"$ifNull": bson.A{field, 0}}}
 }
 
+// Visibility says which aggregate figures a caller may see (least privilege:
+// a SUPPORT agent runs the desk without seeing the book).
+type Visibility struct {
+	// Exposure: gross/net exposure, potential liability, hedged/unhedged
+	// (exposure:read - the same figures as GET /admin/exposure).
+	Exposure bool
+	// PnL: the platform's result, customer payouts and the customer balance
+	// totals, i.e. what the platform owes (reports:read).
+	PnL bool
+	// Deposits / Withdrawals: the pending queues (deposits:read /
+	// withdrawals:read).
+	Deposits    bool
+	Withdrawals bool
+}
+
+// FullVisibility is every figure.
+var FullVisibility = Visibility{Exposure: true, PnL: true, Deposits: true, Withdrawals: true}
+
+// VisibilityFor derives what a role with these permissions may see.
+func VisibilityFor(role string, permissions []string) Visibility {
+	has := func(p string) bool { return config.HasPermission(role, permissions, p) }
+	return Visibility{
+		Exposure:    has(config.PermExposureRead),
+		PnL:         has(config.PermReportsRead),
+		Deposits:    has(config.PermDepositsRead),
+		Withdrawals: has(config.PermWithdrawalsRead),
+	}
+}
+
+// DashboardView is GET /admin/dashboard for one caller: a figure the caller
+// may not see is absent (not zero, which would be a lie).
+type DashboardView struct {
+	TotalUsers           int64    `json:"totalUsers"`
+	ActiveUsers          int64    `json:"activeUsers"`
+	OpenTrades           int64    `json:"openTrades"`
+	TodayTrades          float64  `json:"todayTrades"`
+	TodayVolume          float64  `json:"todayVolume"`
+	TodayPlatformResult  *float64 `json:"todayPlatformResult,omitempty"`
+	CurrentExposure      *int64   `json:"currentExposure,omitempty"`
+	CurrentNetExposure   *int64   `json:"currentNetExposure,omitempty"`
+	PotentialLiability   *int64   `json:"potentialLiability,omitempty"`
+	HedgedExposure       *int64   `json:"hedgedExposure,omitempty"`
+	UnhedgedExposure     *int64   `json:"unhedgedExposure,omitempty"`
+	ActiveAssets         int64    `json:"activeAssets"`
+	FeedLatencyP50       float64  `json:"feedLatencyP50"`
+	FeedLatencyP95       float64  `json:"feedLatencyP95"`
+	FeedLatencyP99       float64  `json:"feedLatencyP99"`
+	TradeAcceptanceP95   float64  `json:"tradeAcceptanceP95"`
+	TotalCustomerBalance *float64 `json:"totalCustomerBalance,omitempty"`
+	TotalLockedBalance   *float64 `json:"totalLockedBalance,omitempty"`
+	PendingDeposits      *int64   `json:"pendingDeposits,omitempty"`
+	PendingWithdrawals   *int64   `json:"pendingWithdrawals,omitempty"`
+	// Redacted names the figure groups withheld from this caller.
+	Redacted []string `json:"redacted"`
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// GetDashboardFor is the dashboard limited to what v allows; the withheld
+// figures are not even computed.
+func GetDashboardFor(ctx context.Context, v Visibility) (DashboardView, error) {
+	s, err := getDashboard(ctx, v)
+	if err != nil {
+		return DashboardView{}, err
+	}
+	out := DashboardView{
+		TotalUsers: s.TotalUsers, ActiveUsers: s.ActiveUsers, OpenTrades: s.OpenTrades,
+		TodayTrades: s.TodayTrades, TodayVolume: s.TodayVolume, ActiveAssets: s.ActiveAssets,
+		FeedLatencyP50: s.FeedLatencyP50, FeedLatencyP95: s.FeedLatencyP95, FeedLatencyP99: s.FeedLatencyP99,
+		TradeAcceptanceP95: s.TradeAcceptanceP95, Redacted: []string{},
+	}
+	if v.Exposure {
+		out.CurrentExposure, out.CurrentNetExposure = ptr(s.CurrentExposure), ptr(s.CurrentNetExposure)
+		out.PotentialLiability = ptr(s.PotentialLiability)
+		out.HedgedExposure, out.UnhedgedExposure = ptr(s.HedgedExposure), ptr(s.UnhedgedExposure)
+	} else {
+		out.Redacted = append(out.Redacted, "exposure")
+	}
+	if v.PnL {
+		out.TodayPlatformResult = ptr(s.TodayPlatformResult)
+		out.TotalCustomerBalance, out.TotalLockedBalance = ptr(s.TotalCustomerBalance), ptr(s.TotalLockedBalance)
+	} else {
+		out.Redacted = append(out.Redacted, "pnl")
+	}
+	if v.Deposits {
+		out.PendingDeposits = ptr(s.PendingDeposits)
+	} else {
+		out.Redacted = append(out.Redacted, "deposits")
+	}
+	if v.Withdrawals {
+		out.PendingWithdrawals = ptr(s.PendingWithdrawals)
+	} else {
+		out.Redacted = append(out.Redacted, "withdrawals")
+	}
+	return out, nil
+}
+
 func GetDashboardSummary(ctx context.Context) (DashboardSummary, error) {
+	return getDashboard(ctx, FullVisibility)
+}
+
+func getDashboard(ctx context.Context, vis Visibility) (DashboardSummary, error) {
 	dayStart := time.UnixMilli(util.StartOfUTCDay(util.NowMs())).UTC()
 	var s DashboardSummary
 
@@ -113,34 +214,42 @@ func GetDashboardSummary(ctx context.Context) (DashboardSummary, error) {
 			}},
 		}, &today)
 	})
-	g.Go(func() (err error) {
-		portfolio, err = exposure.GetPortfolioExposure(gctx)
-		return
-	})
-	g.Go(func() (err error) {
-		hedgedByAsset, err = hedging.GetHedgedNotionalByAsset(gctx)
-		return
-	})
+	if vis.Exposure {
+		g.Go(func() (err error) {
+			portfolio, err = exposure.GetPortfolioExposure(gctx)
+			return
+		})
+		g.Go(func() (err error) {
+			hedgedByAsset, err = hedging.GetHedgedNotionalByAsset(gctx)
+			return
+		})
+	}
 	g.Go(func() (err error) {
 		activeAssets, err = assets.ListAssetDocs(gctx, true)
 		return
 	})
-	g.Go(func() error {
-		// Customer money only: DEMO balances are virtual, and the USDT wallets
-		// (another currency, not trading money) are not part of this total.
-		return aggregate(gctx, models.CollWallets, bson.A{
-			bson.M{"$match": bson.M{"accountType": models.NotDemo(), "currency": models.INRCurrency()}},
-			bson.M{"$group": bson.M{"_id": nil, "balance": bson.M{"$sum": "$balance"}, "locked": bson.M{"$sum": "$lockedBalance"}}},
-		}, &walletTotals)
-	})
-	g.Go(func() (err error) {
-		s.PendingDeposits, err = mongox.C(models.CollTransfers).CountDocuments(gctx, bson.M{"kind": "DEPOSIT", "status": "PENDING"})
-		return
-	})
-	g.Go(func() (err error) {
-		s.PendingWithdrawals, err = mongox.C(models.CollTransfers).CountDocuments(gctx, bson.M{"kind": "WITHDRAWAL", "status": "PENDING"})
-		return
-	})
+	if vis.PnL {
+		g.Go(func() error {
+			// Customer money only: DEMO balances are virtual, and the USDT wallets
+			// (another currency, not trading money) are not part of this total.
+			return aggregate(gctx, models.CollWallets, bson.A{
+				bson.M{"$match": bson.M{"accountType": models.NotDemo(), "currency": models.INRCurrency()}},
+				bson.M{"$group": bson.M{"_id": nil, "balance": bson.M{"$sum": "$balance"}, "locked": bson.M{"$sum": "$lockedBalance"}}},
+			}, &walletTotals)
+		})
+	}
+	if vis.Deposits {
+		g.Go(func() (err error) {
+			s.PendingDeposits, err = mongox.C(models.CollTransfers).CountDocuments(gctx, bson.M{"kind": "DEPOSIT", "status": "PENDING"})
+			return
+		})
+	}
+	if vis.Withdrawals {
+		g.Go(func() (err error) {
+			s.PendingWithdrawals, err = mongox.C(models.CollTransfers).CountDocuments(gctx, bson.M{"kind": "WITHDRAWAL", "status": "PENDING"})
+			return
+		})
+	}
 	if err := g.Wait(); err != nil {
 		return DashboardSummary{}, err
 	}
@@ -258,6 +367,61 @@ func GetDailySeries(ctx context.Context, days int64) ([]DailySeriesPoint, error)
 		series = append(series, p)
 	}
 	return series, nil
+}
+
+// DailySeriesView is a series point for one caller: the platform result and
+// the customer payouts are P&L figures (reports:read) and absent otherwise.
+type DailySeriesView struct {
+	Date           string   `json:"date"`
+	Trades         float64  `json:"trades"`
+	Volume         float64  `json:"volume"`
+	PlatformResult *float64 `json:"platformResult,omitempty"`
+	CustomerPayout *float64 `json:"customerPayout,omitempty"`
+	Wins           float64  `json:"wins"`
+	Losses         float64  `json:"losses"`
+	Draws          float64  `json:"draws"`
+}
+
+func GetDailySeriesFor(ctx context.Context, days int64, v Visibility) ([]DailySeriesView, error) {
+	points, err := GetDailySeries(ctx, days)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DailySeriesView, 0, len(points))
+	for _, p := range points {
+		row := DailySeriesView{Date: p.Date, Trades: p.Trades, Volume: p.Volume, Wins: p.Wins, Losses: p.Losses, Draws: p.Draws}
+		if v.PnL {
+			row.PlatformResult, row.CustomerPayout = ptr(p.PlatformResult), ptr(p.CustomerPayout)
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+// AssetVolumeView is an asset-volume row for one caller (platformResult
+// needs reports:read).
+type AssetVolumeView struct {
+	AssetID        string   `json:"assetId"`
+	Symbol         string   `json:"symbol"`
+	Trades         float64  `json:"trades"`
+	Volume         float64  `json:"volume"`
+	PlatformResult *float64 `json:"platformResult,omitempty"`
+}
+
+func GetAssetVolumeFor(ctx context.Context, days int64, v Visibility) ([]AssetVolumeView, error) {
+	rows, err := GetAssetVolume(ctx, days)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AssetVolumeView, 0, len(rows))
+	for _, r := range rows {
+		row := AssetVolumeView{AssetID: r.AssetID, Symbol: r.Symbol, Trades: r.Trades, Volume: r.Volume}
+		if v.PnL {
+			row.PlatformResult = ptr(r.PlatformResult)
+		}
+		out = append(out, row)
+	}
+	return out, nil
 }
 
 type AssetVolumeRow struct {

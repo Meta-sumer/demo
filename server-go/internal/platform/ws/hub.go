@@ -3,7 +3,6 @@ package ws
 import (
 	"context"
 	"encoding/json"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,7 +13,9 @@ import (
 	"github.com/gorilla/websocket"
 
 	"binarytrading/internal/config"
+	"binarytrading/internal/platform/apperr"
 	"binarytrading/internal/platform/authtoken"
+	"binarytrading/internal/platform/httpx"
 	"binarytrading/internal/platform/logx"
 	"binarytrading/internal/service/metrics"
 )
@@ -27,19 +28,41 @@ const (
 	heartbeatEvery = 30 * time.Second
 	writeTimeout   = 10 * time.Second
 	sendBuffer     = 256
+
+	// closeSessionEnded is the close code sent when the user's session was
+	// revoked or the account disabled (4000-4999 are application codes).
+	closeSessionEnded = 4401
 )
+
+// revalidateEvery is how often an open socket re-checks its session even
+// when nothing prompted it. A variable so tests can shorten it.
+var revalidateEvery = time.Minute
 
 type client struct {
 	id          string
 	conn        *websocket.Conn
 	userID      string
-	role        string
-	permissions []string
+	role        string          // guarded by hub.mu; refreshed by revalidate
+	permissions []string        // guarded by hub.mu; refreshed by revalidate
 	channels    map[string]bool // guarded by hub.mu
 	alive       atomic.Bool
 	send        chan []byte
 	closeOnce   sync.Once
 	done        chan struct{}
+
+	// The token the socket was opened with: its role and session version are
+	// what every revalidation checks against the live state.
+	tokenRole      string
+	tokenVer       *int64
+	kill           chan killFrame
+	revalidating   atomic.Bool
+	recheckPending atomic.Bool
+}
+
+// killFrame is the last frame a socket receives before the server closes it.
+type killFrame struct {
+	code    string
+	message string
 }
 
 type hub struct {
@@ -63,11 +86,12 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
 
-// Start subscribes to the broadcast bus.
+// Start subscribes to the broadcast bus and the hub control channel.
 func Start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	h.cancel = cancel
 	consume(ctx, deliver)
+	consumeControl(ctx)
 	logx.Info("websocket server attached at /ws")
 }
 
@@ -127,6 +151,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid access token", http.StatusUnauthorized)
 		return
 	}
+	// A revoked session, or a suspended or closed account, cannot open a
+	// socket even with an unexpired token.
+	state, err := authtoken.CheckSession(r.Context(), claims)
+	if err != nil {
+		status, msg := http.StatusUnauthorized, "Session is no longer valid"
+		if ae, ok := apperr.As(err); ok {
+			status, msg = ae.StatusCode, ae.Message
+		}
+		http.Error(w, msg, status)
+		return
+	}
 
 	h.mu.RLock()
 	existing := len(h.userIndex[claims.Subject])
@@ -141,13 +176,16 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return // the upgrader already wrote the error response
 	}
 	perms := claims.Permissions
+	if state != nil {
+		perms = state.EffectivePermissions()
+	}
 	if perms == nil {
 		perms = []string{}
 	}
-	register(conn, claims.Subject, claims.Role, perms)
+	register(conn, claims.Subject, claims.Role, perms, claims.Ver)
 }
 
-func register(conn *websocket.Conn, userID, role string, permissions []string) {
+func register(conn *websocket.Conn, userID, role string, permissions []string, tokenVer *int64) {
 	c := &client{
 		id:          uuid.NewString(),
 		conn:        conn,
@@ -157,6 +195,9 @@ func register(conn *websocket.Conn, userID, role string, permissions []string) {
 		channels:    map[string]bool{},
 		send:        make(chan []byte, sendBuffer),
 		done:        make(chan struct{}),
+		tokenRole:   role,
+		tokenVer:    tokenVer,
+		kill:        make(chan killFrame, 1),
 	}
 	c.alive.Store(true)
 
@@ -216,11 +257,28 @@ func (c *client) readLoop() {
 func (c *client) writeLoop() {
 	ticker := time.NewTicker(heartbeatEvery)
 	defer ticker.Stop()
+	recheck := time.NewTicker(revalidateEvery)
+	defer recheck.Stop()
 	defer c.close()
 	for {
 		select {
 		case <-c.done:
 			return
+		case k := <-c.kill:
+			// Tell the client why, then close: it must not reconnect with the
+			// same token (the handshake would refuse it anyway).
+			frame, _ := json.Marshal(map[string]any{
+				"event":      config.EvError,
+				"payload":    map[string]any{"code": k.code, "message": k.message},
+				"serverTime": time.Now().UnixMilli(),
+			})
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			_ = c.conn.WriteMessage(websocket.TextMessage, frame)
+			_ = c.conn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(closeSessionEnded, k.message), time.Now().Add(time.Second))
+			return
+		case <-recheck.C:
+			go c.revalidateInBackground()
 		case frame := <-c.send:
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if err := c.conn.WriteMessage(websocket.TextMessage, frame); err != nil {
@@ -274,7 +332,15 @@ func (c *client) handleMessage(raw []byte) {
 		c.sendEvent(config.EvPong, map[string]any{"serverTime": time.Now().UnixMilli()})
 	case "subscribe":
 		requested := toChannelList(msg.Channels)
-		accepted := subscribe(c, requested)
+		// Re-check the session first: a socket outlives its token, so the
+		// permissions it was opened with may no longer hold.
+		accepted := []string{}
+		switch c.revalidate(context.Background()) {
+		case sessionValid:
+			accepted = subscribe(c, requested)
+		case sessionEnded:
+			return
+		}
 		acceptedSet := map[string]bool{}
 		for _, a := range accepted {
 			acceptedSet[a] = true
@@ -338,7 +404,9 @@ func canSubscribe(c *client, ch string) bool {
 	case ch == config.ChAdminSupport:
 		return config.HasPermission(c.role, c.permissions, config.PermSupportRead)
 	case ch == config.ChAdminOps:
-		return config.IsAdminRole(c.role)
+		// Every customer trade as it is placed and settled: the same data as
+		// GET /admin/binary/trades, so the same permission.
+		return config.IsAdminRole(c.role) && config.HasPermission(c.role, c.permissions, config.PermTradesRead)
 	}
 	return false
 }
@@ -419,14 +487,8 @@ func toChannelList(v any) []string {
 	return out
 }
 
-// ClientIP is exported for handlers that need the same derivation.
+// ClientIP is exported for handlers that need the same derivation; it is
+// httpx.ClientIP (forwarding headers only from TRUSTED_PROXIES).
 func ClientIP(r *http.Request) string {
-	if f := r.Header.Get("X-Forwarded-For"); f != "" {
-		return strings.TrimSpace(strings.Split(f, ",")[0])
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return httpx.ClientIP(r)
 }

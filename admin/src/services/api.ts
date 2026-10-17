@@ -4,6 +4,7 @@ import type {
   SupportMessage,
   SupportThread,
   AdminAsset,
+  AdminMfaRow,
   AdminTrade,
   AdminUser,
   AdminWalletRow,
@@ -17,6 +18,9 @@ import type {
   HedgeOrder,
   LatencyReportEntry,
   MarketDataOverview,
+  MfaChallenge,
+  MfaEnrolment,
+  MfaStatus,
   Paginated,
   PaymentMethod,
   PayoutConfig,
@@ -69,9 +73,28 @@ const usdtPath = (...parts: string[]) => '/admin/usdt/' + parts.map(encodeURICom
 /** Every admin endpoint, grouped by the screen that uses it. */
 export const api = {
   auth: {
-    login: (email: string, password: string) => apiPost<AuthResult>('/admin/login', { email, password }),
+    login: (email: string, password: string) =>
+      apiPost<AuthResult | MfaChallenge>('/admin/login', { email, password }),
+    /** Second step: a 6-digit authenticator code or one recovery code. */
+    loginSecondFactor: (mfaToken: string, input: { code?: string; recoveryCode?: string }) =>
+      apiPost<AuthResult & { recoveryCodesRemaining: number }>('/admin/login/2fa', { mfaToken, ...input }),
+    startLoginEnrolment: (mfaToken: string) => apiPost<MfaEnrolment>('/admin/login/2fa/enrol', { mfaToken }),
+    confirmLoginEnrolment: (mfaToken: string, code: string) =>
+      apiPost<AuthResult & { recoveryCodes: string[] }>('/admin/login/2fa/enrol/confirm', { mfaToken, code }),
     me: () => apiGet<{ user: AdminUser }>('/auth/me'),
     logout: (refreshToken?: string) => apiPost('/auth/logout', { refreshToken }),
+  },
+
+  security: {
+    status: () => apiGet<MfaStatus>('/admin/security/2fa'),
+    startEnrolment: () => apiPost<MfaEnrolment>('/admin/security/2fa/enrol'),
+    confirmEnrolment: (code: string) =>
+      apiPost<{ enabled: true; recoveryCodes: string[] }>('/admin/security/2fa/enrol/confirm', { code }),
+    regenerateRecoveryCodes: (code: string) =>
+      apiPost<{ recoveryCodes: string[] }>('/admin/security/2fa/recovery-codes', { code }),
+    admins: () => apiGet<{ required: boolean; admins: AdminMfaRow[] }>('/admin/security/admins'),
+    resetAdmin: (id: string, reason: string) =>
+      apiPost<{ reset: true; wasEnabled: boolean }>('/admin/security/admins/' + id + '/2fa/reset', { reason }),
   },
 
   dashboard: {
@@ -85,8 +108,12 @@ export const api = {
       apiGet<Paginated<AdminUser>>('/admin/users', params),
     detail: (id: string) => apiGet<UserDetail>('/admin/users/' + id),
     update: (id: string, input: Record<string, unknown>) => apiPatch<AdminUser>('/admin/users/' + id, input),
-    adjustWallet: (id: string, input: { amount: number; direction: 'CREDIT' | 'DEBIT'; reason: string }) =>
-      apiPost('/admin/users/' + id + '/wallet/adjust', input),
+    /** The key is per attempt (see utils/idempotency): a resend replays the first result. */
+    adjustWallet: (
+      id: string,
+      input: { amount: number; direction: 'CREDIT' | 'DEBIT'; reason: string },
+      idempotencyKey: string,
+    ) => apiPost('/admin/users/' + id + '/wallet/adjust', input, { 'Idempotency-Key': idempotencyKey }),
     transactions: (id: string, params: { page?: number; limit?: number }) =>
       apiGet<Paginated<Record<string, unknown>>>('/admin/users/' + id + '/transactions', params),
   },

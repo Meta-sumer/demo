@@ -39,6 +39,9 @@ func newLoop() *leader.Loop {
 		Interval: time.Duration(interval) * time.Millisecond,
 		LockTTL:  15 * time.Second,
 		OnTick:   tick,
+		// A tick that outlives its lease stops; its queue writes are fenced
+		// by the leader token as well (see expiry.go).
+		BoundTickToLease: true,
 	})
 }
 

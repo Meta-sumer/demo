@@ -21,6 +21,11 @@ type AccessClaims struct {
 	Permissions []string `json:"permissions"`
 	SID         string   `json:"sid"`
 	Typ         string   `json:"typ"`
+	// Ver is the user's session version when the token was issued. Revoking a
+	// user's sessions moves the stored version past it, so the token stops
+	// working at once rather than at expiry (see CheckSession). Absent on
+	// tokens issued before versions existed, which read as version 0.
+	Ver *int64 `json:"ver,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -57,6 +62,20 @@ func SignAccess(userID, role string, permissions []string, sessionID string) (st
 	}
 	claims := AccessClaims{
 		Role: role, Permissions: permissions, SID: sessionID, Typ: "access",
+		RegisteredClaims: registered(userID, AccessTTLMs()),
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(config.E.JWTSecret))
+}
+
+// SignAccessVersioned signs an access token bound to the user's current
+// session version, so a later revocation invalidates it immediately.
+func SignAccessVersioned(userID, role string, permissions []string, sessionID string, version int64) (string, error) {
+	if permissions == nil {
+		permissions = []string{}
+	}
+	v := version
+	claims := AccessClaims{
+		Role: role, Permissions: permissions, SID: sessionID, Typ: "access", Ver: &v,
 		RegisteredClaims: registered(userID, AccessTTLMs()),
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(config.E.JWTSecret))

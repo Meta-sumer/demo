@@ -2,34 +2,48 @@ package binary
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"strconv"
 	"strings"
-
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"time"
 
 	"binarytrading/internal/config"
 	"binarytrading/internal/models"
 	"binarytrading/internal/platform/apperr"
 	"binarytrading/internal/platform/logx"
-	"binarytrading/internal/platform/mongox"
 	"binarytrading/internal/platform/redisx"
 	"binarytrading/internal/platform/util"
-	"binarytrading/internal/platform/ws"
-	"binarytrading/internal/service/exposure"
 	"binarytrading/internal/service/marketdata"
-	"binarytrading/internal/service/metrics"
 	"binarytrading/internal/service/riskconfig"
-	"binarytrading/internal/service/wallets"
+	"binarytrading/internal/service/settlement"
 )
 
 // Early close ("Sell now").
 //
 // A customer can hand an open position back before expiry for what it is
 // currently worth. The price is computed here, from the server's own tick
-// data - never taken from the request - and the buy-back settles through the
-// same single-settlement guarantees as a normal expiry.
+// data - never taken from the request - and only from a feed that is
+// tradable right now: the last tick must pass the same feed-health gate as a
+// new trade and be fresh (policy.EarlyCloseMaxTickAgeMs). A position cannot
+// be valued without realised volatility, so a zero/unknown volatility refuses
+// the close rather than pricing at the 1%/99% clamps.
+//
+// Quote validity. GET /quote records the quote it showed (Redis, TTL =
+// policy.EarlyCloseQuoteMaxAgeMs). The close re-prices on a fresh tick and
+// requires that the customer was shown a quote within that window, and that
+// the fresh value is not more than policy.EarlyCloseQuoteTolerancePercent
+// below it; otherwise it is refused (PRICE_MOVED) and the customer sees the
+// new price. A better fresh value is paid as is.
+//
+// Lifecycle. The close goes through the settlement state machine:
+// settlement.ClaimEarlyClose moves OPEN -> SETTLING together with the
+// immutable outcome, conditional on expiry being more than the floor away by
+// the database clock (so it can never happen at or after expiry and can never
+// race an expiry settlement into two outcomes), and settlement.Execute books
+// it - one wallet movement, one settlement row, CLOSED_EARLY. A crash after
+// the claim is finished by the settlement worker as CLOSED_EARLY, never as a
+// draw or a second settlement.
 
 // Volatility is measured over this window and converted to a per-second figure.
 const volatilityWindowMs = 60_000
@@ -43,72 +57,163 @@ type EarlyCloseQuoteView struct {
 	UnavailableReason *string `json:"unavailableReason"`
 }
 
+// issuedQuoteKey holds the last quote shown for a trade.
+func issuedQuoteKey(tradeID string) string { return "ec:quote:" + tradeID }
+
+// issuedQuote is what GET /quote showed the customer.
+type issuedQuote struct {
+	UserID        string  `json:"userId"`
+	Value         int64   `json:"value"`
+	Price         float64 `json:"price"`
+	TickTimestamp int64   `json:"tickTimestamp"`
+	IssuedAt      int64   `json:"issuedAt"`
+}
+
+// earlyClosePricing is the shared valuation of QuoteTrade and CloseTradeEarly.
+type earlyClosePricing struct {
+	cfg              *models.RiskConfig
+	policy           models.SettlementPolicy
+	floorMs          int64
+	tick             *models.NormalisedTick
+	feedStatus       models.FeedStatus
+	feedAgeMs        int64
+	vol              float64
+	secondsRemaining float64
+	currentPrice     float64
+	quote            EarlyCloseQuote
+	// First reason the trade cannot be closed now, and the error the close
+	// path returns for it (both nil when it can).
+	reason *string
+	err    error
+}
+
+func (p *earlyClosePricing) refuse(reason string, err error) {
+	if p.reason == nil {
+		p.reason, p.err = &reason, err
+	}
+}
+
+// priceEarlyClose values a trade now and decides whether it may be closed.
+func priceEarlyClose(ctx context.Context, trade *models.BinaryTrade, now int64) (*earlyClosePricing, error) {
+	cfg, err := riskconfig.GetRiskConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	policy, err := settlement.PolicyFor(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	p := &earlyClosePricing{cfg: cfg, policy: policy, floorMs: settlement.EarlyCloseFloorMsFor(cfg, policy)}
+
+	if !cfg.EarlyCloseEnabled {
+		p.refuse("Closing early is currently disabled",
+			apperr.Unavailable(apperr.ServiceUnavailable, "Closing early is currently disabled"))
+	}
+	if trade.Status != models.TradeStatusOpen {
+		// JS String.replace with a string pattern replaces the first match only.
+		p.refuse("This trade is already "+strings.Replace(strings.ToLower(string(trade.Status)), "_", " ", 1),
+			apperr.ConflictErr(apperr.AlreadySettled, "This trade is no longer open"))
+	}
+	if cfg.TradingHalted {
+		p.refuse("Trading is currently halted",
+			apperr.Unavailable(apperr.TradingHalted, "Trading is currently halted. Closing early is paused."))
+	}
+	remainingMs := trade.ExpiryTimestamp - now
+	if remainingMs < p.floorMs {
+		p.refuse("Too close to expiry to close early",
+			apperr.ConflictErr(apperr.Conflict, "Too close to expiry to close early. It will settle on its own shortly."))
+	}
+	p.secondsRemaining = math.Max(0, float64(remainingMs)/1000)
+
+	assetHex := trade.AssetID.Hex()
+	tick, err := marketdata.GetLastTick(ctx, assetHex)
+	if err != nil {
+		return nil, err
+	}
+	p.tick = tick
+	p.currentPrice = trade.EntryPrice
+	if tick == nil {
+		p.feedStatus = models.FeedStatusOffline
+		p.refuse("No live price is available for this asset",
+			apperr.Unavailable(apperr.NoPriceAvailable, "No live price is available for this asset"))
+	} else {
+		p.currentPrice = tick.Price
+		p.feedAgeMs = now - tick.ReceivedAt
+		// Classified from this very tick, so the gate and the price agree.
+		p.feedStatus = marketdata.ClassifyFeed(marketdata.FeedClassificationInput{
+			AgeMs: p.feedAgeMs, LatencyMs: tick.TotalLatencyMs,
+			HealthyMaxMs: cfg.FeedHealthyMaxMs, DegradedMaxMs: cfg.FeedDegradedMaxMs,
+			StaleMaxMs: cfg.FeedStaleMaxMs, TickMaxAgeMs: cfg.FeedTickMaxAgeMs,
+		})
+		blocked := p.feedStatus == models.FeedStatusOffline ||
+			(cfg.HaltTradingOnStaleFeed && p.feedStatus == models.FeedStatusStale) ||
+			(cfg.HaltTradingOnDegradedFeed && p.feedStatus == models.FeedStatusDegraded)
+		if blocked {
+			msg := "Market data for " + trade.Symbol + " is " + string(p.feedStatus) + ". Closing early is paused."
+			p.refuse(msg, apperr.Unavailable(apperr.FeedUnhealthy, msg))
+		}
+		if p.feedAgeMs > policy.EarlyCloseMaxTickAgeMs {
+			msg := "The live price for " + trade.Symbol + " is stale. Closing early is paused."
+			p.refuse(msg, apperr.Unavailable(apperr.FeedUnhealthy, msg))
+		}
+	}
+
+	p.vol, err = volatilityPerSecond(ctx, assetHex)
+	if err != nil {
+		return nil, err
+	}
+	if p.vol <= 0 && p.secondsRemaining > 0 {
+		msg := "Not enough recent market data to value this position. Try again shortly."
+		p.refuse("Not enough recent market data to value this position",
+			apperr.Unavailable(apperr.NoPriceAvailable, msg))
+	}
+
+	p.quote = QuoteEarlyClose(EarlyCloseInput{
+		Stake:               trade.Stake,
+		PayoutPercent:       trade.PayoutPercent,
+		Direction:           trade.Direction,
+		EntryPrice:          trade.EntryPrice,
+		CurrentPrice:        p.currentPrice,
+		SecondsRemaining:    p.secondsRemaining,
+		VolatilityPerSecond: p.vol,
+		FeePercent:          cfg.EarlyCloseFeePercent,
+	})
+	return p, nil
+}
+
 // QuoteTrade prices a position without closing it, so the button can show a
 // live figure. Never fails for an un-closeable trade: the screen needs to
-// explain why the button is disabled.
+// explain why the button is disabled. A closeable quote is recorded as the
+// one the customer was shown (Redis only).
 func QuoteTrade(ctx context.Context, tradeID, userID string) (EarlyCloseQuoteView, error) {
 	trade, err := loadOwnTrade(ctx, tradeID, userID)
 	if err != nil {
 		return EarlyCloseQuoteView{}, err
 	}
-	cfg, err := riskconfig.GetRiskConfig(ctx)
+	now := util.NowMs()
+	p, err := priceEarlyClose(ctx, trade, now)
 	if err != nil {
 		return EarlyCloseQuoteView{}, err
 	}
 
-	secondsRemaining := math.Max(0, float64(trade.ExpiryTimestamp-util.NowMs())/1000)
-	assetHex := trade.AssetID.Hex()
-	tick, err := marketdata.GetLastTick(ctx, assetHex)
-	if err != nil {
-		return EarlyCloseQuoteView{}, err
+	if p.reason == nil {
+		issued, _ := json.Marshal(issuedQuote{
+			UserID: userID, Value: p.quote.Value, Price: p.tick.Price, TickTimestamp: p.tick.Timestamp, IssuedAt: now,
+		})
+		ttl := time.Duration(p.policy.EarlyCloseQuoteMaxAgeMs) * time.Millisecond
+		if err := redisx.R().Set(ctx, issuedQuoteKey(tradeID), issued, ttl).Err(); err != nil {
+			logx.Warn("failed to record the early-close quote", "tradeId", tradeID, "err", err.Error())
+		}
 	}
-
-	unavailable := describeUnavailability(trade, cfg, secondsRemaining, tick != nil)
-	currentPrice := trade.EntryPrice
-	if tick != nil {
-		currentPrice = tick.Price
-	}
-
-	vol, err := volatilityPerSecond(ctx, assetHex)
-	if err != nil {
-		return EarlyCloseQuoteView{}, err
-	}
-	quote := QuoteEarlyClose(EarlyCloseInput{
-		Stake:               trade.Stake,
-		PayoutPercent:       trade.PayoutPercent,
-		Direction:           trade.Direction,
-		EntryPrice:          trade.EntryPrice,
-		CurrentPrice:        currentPrice,
-		SecondsRemaining:    secondsRemaining,
-		VolatilityPerSecond: vol,
-		FeePercent:          cfg.EarlyCloseFeePercent,
-	})
 
 	return EarlyCloseQuoteView{
-		EarlyCloseQuote:   quote,
+		EarlyCloseQuote:   p.quote,
 		TradeID:           tradeID,
-		CurrentPrice:      currentPrice,
-		SecondsRemaining:  int64(util.RoundHalfUp(secondsRemaining)),
-		Available:         unavailable == nil,
-		UnavailableReason: unavailable,
+		CurrentPrice:      p.currentPrice,
+		SecondsRemaining:  int64(util.RoundHalfUp(p.secondsRemaining)),
+		Available:         p.reason == nil,
+		UnavailableReason: p.reason,
 	}, nil
-}
-
-func describeUnavailability(trade *models.BinaryTrade, cfg *models.RiskConfig, secondsRemaining float64, hasPrice bool) *string {
-	if !cfg.EarlyCloseEnabled {
-		return models.Str("Closing early is currently disabled")
-	}
-	if trade.Status != models.TradeStatusOpen {
-		// JS String.replace with a string pattern replaces the first match only.
-		return models.Str("This trade is already " + strings.Replace(strings.ToLower(string(trade.Status)), "_", " ", 1))
-	}
-	if !hasPrice {
-		return models.Str("No live price is available for this asset")
-	}
-	if secondsRemaining < float64(cfg.MinSecondsRemainingForEarlyClose) {
-		return models.Str("Too close to expiry to close early")
-	}
-	return nil
 }
 
 // volatilityPerSecond rescales the per-tick realised volatility by the
@@ -143,17 +248,42 @@ func loadOwnTrade(ctx context.Context, tradeID, userID string) (*models.BinaryTr
 	return trade, nil
 }
 
+func loadIssuedQuote(ctx context.Context, tradeID string) (*issuedQuote, error) {
+	raw, err := redisx.R().Get(ctx, issuedQuoteKey(tradeID)).Result()
+	if err != nil {
+		if redisx.IsNil(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var q issuedQuote
+	if json.Unmarshal([]byte(raw), &q) != nil {
+		return nil, nil
+	}
+	return &q, nil
+}
+
+// checkQuoteValidity enforces quote validity: the customer saw a quote for
+// this trade recently, and the fresh value is within tolerance of it (only a
+// worse price is bounded; a better one is simply paid).
+func checkQuoteValidity(shown *issuedQuote, userID string, fresh int64, now int64, p models.SettlementPolicy) error {
+	if shown == nil || shown.UserID != userID || now-shown.IssuedAt > p.EarlyCloseQuoteMaxAgeMs || now < shown.IssuedAt {
+		return apperr.New(apperr.PriceMoved, "Your sell price has expired. Check the latest price and try again.", 409)
+	}
+	tolerance := int64(util.RoundHalfUp(float64(shown.Value) * p.EarlyCloseQuoteTolerancePercent / 100))
+	if fresh < shown.Value-tolerance {
+		return apperr.New(apperr.PriceMoved, "The sell price has moved. Check the new price and try again.", 409,
+			map[string]any{"quotedValue": shown.Value, "currentValue": fresh})
+	}
+	return nil
+}
+
 type EarlyCloseResult struct {
 	Trade models.BinaryTradeView `json:"trade"`
 	Quote EarlyCloseQuote        `json:"quote"`
 }
 
 // CloseTradeEarly buys the position back.
-//
-// The claim, the wallet movement and the settlement row use exactly the same
-// guards as an expiry settlement, so a trade cannot be both closed early and
-// settled at expiry - whichever happens first wins and the other finds the
-// trade already gone.
 func CloseTradeEarly(ctx context.Context, tradeID, userID string) (EarlyCloseResult, error) {
 	ctx = context.WithoutCancel(ctx)
 	cfg, err := riskconfig.GetRiskConfig(ctx)
@@ -168,159 +298,84 @@ func CloseTradeEarly(ctx context.Context, tradeID, userID string) (EarlyCloseRes
 	if err != nil {
 		return EarlyCloseResult{}, err
 	}
-	if existing.Status != models.TradeStatusOpen {
-		return EarlyCloseResult{}, apperr.ConflictErr(apperr.AlreadySettled, "This trade is no longer open")
-	}
 
-	secondsRemaining := float64(existing.ExpiryTimestamp-util.NowMs()) / 1000
-	if secondsRemaining < float64(cfg.MinSecondsRemainingForEarlyClose) {
-		return EarlyCloseResult{}, apperr.ConflictErr(apperr.Conflict,
-			"Too close to expiry to close early. It will settle on its own shortly.")
+	// Re-price now, on a fresh tick, and refuse if anything about the market
+	// or the trade rules the close out.
+	now := util.NowMs()
+	p, err := priceEarlyClose(ctx, existing, now)
+	if err != nil {
+		return EarlyCloseResult{}, err
+	}
+	if p.err != nil {
+		return EarlyCloseResult{}, p.err
+	}
+	shown, err := loadIssuedQuote(ctx, tradeID)
+	if err != nil {
+		return EarlyCloseResult{}, err
+	}
+	if err := checkQuoteValidity(shown, userID, p.quote.Value, now, p.policy); err != nil {
+		return EarlyCloseResult{}, err
 	}
 
 	assetHex := existing.AssetID.Hex()
-	tick, err := marketdata.GetLastTick(ctx, assetHex)
+	ev := models.SettlementEvidence{
+		Rule:              models.SettlementRuleEarlyCloseAtMarket,
+		Kind:              models.SettlementKindEarlyClose,
+		ExpiryTimestamp:   existing.ExpiryTimestamp,
+		DecidedAt:         now,
+		RiskConfigVersion: p.cfg.Version,
+		Policy:            p.policy,
+		EarlyClose: &models.EarlyCloseEvidence{
+			QuotedValue:         &shown.Value,
+			QuotedAt:            &shown.IssuedAt,
+			QuotedPrice:         &shown.Price,
+			Value:               p.quote.Value,
+			WinProbability:      p.quote.WinProbability,
+			VolatilityPerSecond: p.vol,
+			SecondsRemaining:    p.secondsRemaining,
+			FeePercent:          p.cfg.EarlyCloseFeePercent,
+			PayoutPercent:       existing.PayoutPercent,
+			FeedStatus:          p.feedStatus,
+			FeedAgeMs:           p.feedAgeMs,
+		},
+	}
+	settlement.EvidenceFromTick(&ev, p.tick, now, settlement.FeedProvider(ctx, assetHex), models.SettlementEvidenceSourceTick)
+	price := p.tick.Price
+	intent := settlement.EarlyCloseIntent(existing, p.quote.Value, &price, ev, "customer.early_close")
+
+	claimed, err := settlement.ClaimEarlyClose(ctx, existing.ID, existing.UserID, &intent, p.floorMs)
 	if err != nil {
 		return EarlyCloseResult{}, err
 	}
-	if tick == nil {
-		return EarlyCloseResult{}, apperr.Unavailable(apperr.NoPriceAvailable, "No live price is available for this asset")
-	}
-
-	// Price first, then claim: the quote must come from the same tick the
-	// customer is looking at, and claiming a trade we then refuse to price
-	// would strand it.
-	vol, err := volatilityPerSecond(ctx, assetHex)
-	if err != nil {
-		return EarlyCloseResult{}, err
-	}
-	quote := QuoteEarlyClose(EarlyCloseInput{
-		Stake:               existing.Stake,
-		PayoutPercent:       existing.PayoutPercent,
-		Direction:           existing.Direction,
-		EntryPrice:          existing.EntryPrice,
-		CurrentPrice:        tick.Price,
-		SecondsRemaining:    secondsRemaining,
-		VolatilityPerSecond: vol,
-		FeePercent:          cfg.EarlyCloseFeePercent,
-	})
-
-	trades := mongox.C(models.CollBinaryTrades)
-	var claimed models.BinaryTrade
-	err = trades.FindOneAndUpdate(ctx,
-		bson.M{"_id": existing.ID, "status": string(models.TradeStatusOpen)},
-		bson.M{"$set": bson.M{"status": string(models.TradeStatusSettling), "updatedAt": mongox.Now()}},
-		options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&claimed)
-	if err != nil {
-		if mongox.IsNotFound(err) {
-			return EarlyCloseResult{}, apperr.ConflictErr(apperr.AlreadySettled, "This trade is no longer open")
-		}
-		return EarlyCloseResult{}, err
-	}
-
-	platformResult := claimed.Stake - quote.Value
-
-	// 1. Money, keyed so expiry settlement cannot also pay out.
-	live := models.NormAccountType(claimed.AccountType) == models.AccountLive
-	mutation, err := wallets.SettleTradeEarlyClose(ctx, wallets.TradeFundsInput{
-		UserID: userID, AccountType: claimed.AccountType, Stake: claimed.Stake, TradeID: tradeID,
-	}, quote.Value)
-	if err != nil {
-		return EarlyCloseResult{}, err
-	}
-
-	// 2. Settlement ledger row; the unique index is the final duplicate guard.
-	var walletTxID *bson.ObjectID
-	if mutation.TransactionID != "" {
-		id, err := bson.ObjectIDFromHex(mutation.TransactionID)
+	if claimed == nil {
+		current, err := findTrade(ctx, tradeID)
 		if err != nil {
 			return EarlyCloseResult{}, err
 		}
-		walletTxID = &id
-	}
-	row := models.Settlement{
-		TradeID:             claimed.ID,
-		UserID:              claimed.UserID,
-		AssetID:             claimed.AssetID,
-		Symbol:              claimed.Symbol,
-		Result:              models.TradeResultEarlyClose,
-		AccountType:         models.NormAccountType(claimed.AccountType),
-		EntryPrice:          claimed.EntryPrice,
-		ExpiryPrice:         tick.Price,
-		ExpiryTimestamp:     claimed.ExpiryTimestamp,
-		Stake:               claimed.Stake,
-		PayoutPercent:       claimed.PayoutPercent,
-		PayoutAmount:        quote.Value,
-		PlatformResult:      platformResult,
-		Currency:            settlementCurrency(claimed.Currency),
-		WalletTransactionID: walletTxID,
-		SettledBy:           "customer.early_close",
-		CreatedAt:           mongox.Now(),
-	}
-	if _, err := mongox.C(models.CollSettlements).InsertOne(ctx, row); err != nil {
-		if !mongox.IsDuplicateKey(err) {
-			return EarlyCloseResult{}, err
+		if current == nil || current.Status != models.TradeStatusOpen {
+			return EarlyCloseResult{}, apperr.ConflictErr(apperr.AlreadySettled, "This trade is no longer open")
 		}
-		logx.Warn("settlement row already existed on early close", "tradeId", tradeID)
+		return EarlyCloseResult{}, apperr.ConflictErr(apperr.Conflict,
+			"Too close to expiry to close early. It will settle on its own shortly.")
+	}
+	_ = redisx.R().Del(ctx, issuedQuoteKey(tradeID)).Err()
+
+	if _, err := settlement.Execute(ctx, claimed); err != nil {
+		// The outcome is recorded with the claim; a settlement worker will
+		// finish booking it as CLOSED_EARLY. Hand it one now.
+		logx.Error("early close booked but not finished - handing to settlement", "tradeId", tradeID, "err", err.Error())
+		_ = redisx.R().LPush(ctx, config.RedisKeys.SettlementQueue, tradeID).Err()
+		return EarlyCloseResult{}, err
 	}
 
-	// 3. Final trade state.
-	now := mongox.Now()
-	var updated models.BinaryTrade
-	err = trades.FindOneAndUpdate(ctx,
-		bson.M{"_id": claimed.ID},
-		bson.M{"$set": bson.M{
-			"status":            string(models.TradeStatusClosedEarly),
-			"result":            string(models.TradeResultEarlyClose),
-			"expiryPrice":       tick.Price,
-			"expiryPriceSource": "EARLY_CLOSE_AT_MARKET",
-			"settlementAmount":  quote.CustomerResult,
-			"platformResult":    platformResult,
-			"settledAt":         now,
-			"updatedAt":         now,
-		}},
-		options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&updated)
+	final, err := findTrade(ctx, tradeID)
 	if err != nil {
 		return EarlyCloseResult{}, err
 	}
-
-	// 4. Release the exposure and drop it from the expiry queue.
-	if err := redisx.R().ZRem(ctx, config.RedisKeys.ExpiryQueue, tradeID).Err(); err != nil {
-		return EarlyCloseResult{}, err
+	if final == nil {
+		return EarlyCloseResult{}, tradeNotFound()
 	}
-	if live {
-		if _, err := exposure.ApplyExposureDelta(ctx, exposure.ExposureDelta{
-			AssetID:   assetHex,
-			Symbol:    claimed.Symbol,
-			UserID:    userID,
-			Direction: claimed.Direction,
-			Stake:     claimed.Stake,
-			Profit:    claimed.Profit,
-			Sign:      -1,
-		}); err != nil {
-			return EarlyCloseResult{}, err
-		}
-	}
-
-	view := models.ToTradeView(&updated)
-	ws.Emit([]string{config.ChUser(userID), config.ChAdminOps}, config.EvTradeSettled, view)
-
-	metrics.IncrementCounter("trades.closed_early", 1, 0)
-	if live {
-		metrics.IncrementCounter("platform.gross_result", float64(platformResult), 0)
-	}
-
 	logx.Info("position closed early",
-		"tradeId", tradeID, "symbol", claimed.Symbol, "value", quote.Value, "stake", claimed.Stake,
-		"platformResult", platformResult)
-
-	return EarlyCloseResult{Trade: view, Quote: quote}, nil
-}
-
-// settlementCurrency applies the Mongoose default ('INR') for a missing value.
-func settlementCurrency(c string) string {
-	if c == "" {
-		return models.BinaryTradeDefaultCurrency
-	}
-	return c
+		"tradeId", tradeID, "symbol", final.Symbol, "value", p.quote.Value, "quoted", shown.Value, "stake", final.Stake)
+	return EarlyCloseResult{Trade: models.ToTradeView(final), Quote: p.quote}, nil
 }
