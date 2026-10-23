@@ -1,6 +1,44 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
+import qrcode from 'qrcode-generator';
 import { CopyButton } from './usdt';
 import type { MfaEnrolment } from '../types/api';
+
+/**
+ * The otpauth link as a QR code, drawn here in the browser. The link holds
+ * the secret, so it is never sent to an outside QR service. Dark modules on
+ * white with a quiet zone, whatever the theme, so every scanner reads it.
+ */
+export function OtpQrCode({ uri, size = 184 }: { uri: string; size?: number }) {
+  const qr = useMemo(() => {
+    const code = qrcode(0, 'M');
+    code.addData(uri);
+    code.make();
+    return code;
+  }, [uri]);
+  const count = qr.getModuleCount();
+  const quiet = 4;
+  const cells: string[] = [];
+  for (let row = 0; row < count; row++) {
+    for (let col = 0; col < count; col++) {
+      if (qr.isDark(row, col)) cells.push('M' + (col + quiet) + ' ' + (row + quiet) + 'h1v1h-1z');
+    }
+  }
+  const box = count + quiet * 2;
+  return (
+    <svg
+      role="img"
+      aria-label="QR code to add this account to an authenticator app"
+      width={size}
+      height={size}
+      viewBox={'0 0 ' + box + ' ' + box}
+      shapeRendering="crispEdges"
+      className="rounded-md"
+    >
+      <rect width={box} height={box} fill="#ffffff" />
+      <path d={cells.join('')} fill="#000000" />
+    </svg>
+  );
+}
 
 /** Keeps what an authenticator code can contain: digits, at most six. */
 export function cleanCode(value: string): string {
@@ -35,17 +73,24 @@ export function CodeInput({
 }
 
 /**
- * How to add the account to an authenticator app. There is no QR code: the
- * operator types the key (or pastes the otpauth link) into the app.
+ * How to add the account to an authenticator app: scan the QR code, or type
+ * the key (or paste the otpauth link) when the camera is not an option.
  */
 export function EnrolmentSetup({ enrolment }: { enrolment: MfaEnrolment }) {
   return (
     <div className="space-y-3 text-sm">
       <ol className="list-decimal space-y-1 pl-5 text-content-300">
         <li>Open an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, 1Password).</li>
-        <li>Add an account, choose "Enter a setup key", and type the key below.</li>
+        <li>Add an account and scan the QR code. No camera? Choose "Enter a setup key" and type the key below.</li>
         <li>Enter the 6-digit code the app shows.</li>
       </ol>
+
+      <div className="flex justify-center">
+        <OtpQrCode uri={enrolment.otpauthUri} />
+      </div>
+      <p className="text-center text-[11px] text-content-400">
+        Do not share a screenshot of this code or the key: they let anyone generate your sign-in codes.
+      </p>
 
       <div className="rounded-lg border border-surface-700 bg-surface-900 p-3">
         <div className="text-[11px] text-content-400">Setup key ({enrolment.account})</div>
