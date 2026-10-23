@@ -226,7 +226,12 @@ stake never credited against the other.
 
 The existing bucket limits (per expiry bucket, per asset, platform-wide,
 per user) are kept and checked in the same script. DEMO trades never touch
-the house book (L(D) = 0 for them).
+the house book (L(D) = 0 for them). They do get the same hedge-cost and
+hedge-availability terms as LIVE, so a practice payout is never higher than
+the same trade with real money; when LIVE would be refused because the hedge
+is unavailable (`pricingHedgeUnavailableAction = REFUSE`), DEMO is priced as
+under WIDEN instead of being refused (`service.go` `Evaluate`; test
+`TestHedgeOutageWidensOrRefuses`).
 
 A loaded side's payout falls as its utilisation rises, then blocks at the
 limit, while the opposite side (whose L is lowered by the same stakes) still

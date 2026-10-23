@@ -43,6 +43,28 @@ export function bestPayout(asset: Pick<Asset, 'payouts'>): number {
   return asset.payouts.reduce((best, p) => Math.max(best, p.payoutPercent), 0);
 }
 
+/**
+ * The durations the engine can price right now, shortest first, each with its
+ * indicative payout. A duration it cannot price is not in `payouts` at all;
+ * a row without a positive figure is left out too, rather than shown as 0%.
+ */
+export function offeredPayouts(
+  asset: Pick<Asset, 'payouts'>,
+): Array<{ expirySeconds: number; payoutPercent: number }> {
+  return asset.payouts
+    .filter((p) => Number.isFinite(p.payoutPercent) && p.payoutPercent > 0)
+    .map((p) => ({ expirySeconds: p.expirySeconds, payoutPercent: p.payoutPercent }))
+    .sort((a, b) => a.expirySeconds - b.expirySeconds);
+}
+
+/** Lowest and highest payout on offer, in percent; null when nothing can be priced. */
+export function payoutRange(asset: Pick<Asset, 'payouts'>): { min: number; max: number } | null {
+  const offered = offeredPayouts(asset);
+  if (offered.length === 0) return null;
+  const figures = offered.map((p) => p.payoutPercent);
+  return { min: Math.min(...figures), max: Math.max(...figures) };
+}
+
 /* ------------------------------------------------------------------ filters */
 
 export type AssetFilter = 'all' | 'favourites' | 'recent' | `category:${string}`;

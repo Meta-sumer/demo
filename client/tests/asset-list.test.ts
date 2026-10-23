@@ -8,7 +8,9 @@ import {
   formatNextOpen,
   isAssetSort,
   matchesSearch,
+  offeredPayouts,
   openCount,
+  payoutRange,
   sortAssets,
 } from '../src/components/assetList';
 import type { Asset, FeedStatus } from '../src/types/api';
@@ -82,6 +84,23 @@ describe('availability and payout', () => {
   it('finds the best payout, or zero without one', () => {
     expect(bestPayout(btc)).toBe(87);
     expect(bestPayout(xau)).toBe(0);
+  });
+
+  it('lists the offered durations shortest first, leaving out rows without a figure', () => {
+    const mixed = asset('mix', { payout: [76.5, 0, 81] });
+    mixed.payouts = [mixed.payouts[2]!, mixed.payouts[0]!, mixed.payouts[1]!]; // server order is not promised
+    expect(offeredPayouts(mixed)).toEqual([
+      { expirySeconds: 60, payoutPercent: 76.5 },
+      { expirySeconds: 180, payoutPercent: 81 },
+    ]);
+    expect(offeredPayouts(xau)).toEqual([]);
+  });
+
+  it('gives the payout range on the market cards, or nothing to show', () => {
+    expect(payoutRange(btc)).toEqual({ min: 82, max: 87 });
+    expect(payoutRange(gbp)).toEqual({ min: 87, max: 87 });
+    expect(payoutRange(xau)).toBeNull();
+    expect(payoutRange(asset('zero', { payout: [0] }))).toBeNull();
   });
 });
 

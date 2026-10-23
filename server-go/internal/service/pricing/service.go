@@ -246,19 +246,26 @@ func Evaluate(ctx context.Context, req Request) (*Decision, error) {
 			liability = sl.Up
 		}
 	}
-	hedge := HedgeCostEstimate{Available: true}
-	if !d.Demo {
-		est, herr := CurrentHedgeCostEstimator().EstimateHedgeCost(ctx, HedgeCostRequest{
-			Asset: asset, Direction: req.Direction, Stake: d.Stake, ExpirySeconds: req.ExpirySeconds,
-			Liability: liability, Price: tick.Price, Config: cfg,
-		})
-		if herr != nil {
-			est = HedgeCostEstimate{Required: asset.HedgeEnabled, Available: false, Reason: "ESTIMATOR_ERROR", Basis: herr.Error()}
-		}
-		hedge = est
+	// Hedge cost and availability apply to DEMO too (with no liability, since
+	// DEMO never touches the book): practice payouts must match what the same
+	// trade would pay with real money, never be higher because the hedge
+	// state is ignored.
+	est, herr := CurrentHedgeCostEstimator().EstimateHedgeCost(ctx, HedgeCostRequest{
+		Asset: asset, Direction: req.Direction, Stake: d.Stake, ExpirySeconds: req.ExpirySeconds,
+		Liability: liability, Price: tick.Price, Config: cfg,
+	})
+	if herr != nil {
+		est = HedgeCostEstimate{Required: asset.HedgeEnabled, Available: false, Reason: "ESTIMATOR_ERROR", Basis: herr.Error()}
+	}
+	hedge := est
+	rules := d.Rules
+	if d.Demo && rules.HedgeUnavailableAction == models.PricingActionRefuse {
+		// Practice is never closed by the hedge venue: DEMO gets the widened
+		// payout a LIVE trade would get under WIDEN.
+		rules.HedgeUnavailableAction = models.PricingActionWiden
 	}
 
-	res := ComputeOffer(d.Rules, d.Terms, OfferInput{Direction: req.Direction, ExpirySeconds: req.ExpirySeconds,
+	res := ComputeOffer(rules, d.Terms, OfferInput{Direction: req.Direction, ExpirySeconds: req.ExpirySeconds,
 		Stake: d.Stake, Liability: liability, Sigma: sigma, SpreadBps: spread, Hedge: hedge})
 	d.Components = res.Components
 	d.Components.QuoteTimestamp, d.Components.QuoteReceivedAt = tick.Timestamp, tick.ReceivedAt

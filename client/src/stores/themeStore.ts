@@ -3,14 +3,18 @@ import { create } from 'zustand';
 /**
  * Theme preference.
  *
- * Three states, not two: "system" follows the operating system and keeps
- * following it as it changes, which is what a user who never touches the toggle
- * expects. The resolved value is mirrored onto <html data-theme> because that
- * is what the CSS tokens key off, and onto color-scheme so native controls
- * (scrollbars, date pickers, form fields) match.
+ * Light, twilight and dark, plus "system", which follows the operating system
+ * and keeps following it as it changes. The resolved value is mirrored onto
+ * <html data-theme> because that is what the CSS tokens key off, and onto
+ * color-scheme so native controls (scrollbars, date pickers, form fields)
+ * match.
  *
- * The same key is read by the inline script in index.html, which applies the
- * theme before first paint. Changing it here means changing it there too.
+ * A visitor who has never chosen gets the brand's dark theme (DEFAULT_THEME),
+ * the same black-and-yellow the landing page is drawn in, whatever the OS
+ * says; a stored choice, "system" included, always wins.
+ *
+ * The same key and default are applied before first paint by
+ * public/theme-init.js. Changing either here means changing it there too.
  */
 export type ThemePreference = 'light' | 'twilight' | 'dark' | 'system';
 export type ResolvedTheme = 'light' | 'twilight' | 'dark';
@@ -20,11 +24,14 @@ export const THEMES: ThemePreference[] = ['light', 'twilight', 'dark', 'system']
 
 export const THEME_STORAGE_KEY = 'bt.theme';
 
+/** What a visitor without a stored preference gets: the brand's dark theme. */
+export const DEFAULT_THEME: ThemePreference = 'dark';
+
 interface ThemeState {
   preference: ThemePreference;
   resolved: ResolvedTheme;
   setPreference: (preference: ThemePreference) => void;
-  /** Cycles light -> dark -> system, for the header button. */
+  /** Cycles light -> twilight -> dark -> system, for the header button. */
   cycle: () => void;
 }
 
@@ -33,14 +40,18 @@ function systemTheme(): ResolvedTheme {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
+/** The preference a stored value names; anything else - nothing stored, an old or unknown value - is the default. */
+export function preferenceFrom(stored: string | null | undefined): ThemePreference {
+  return (THEMES as Array<string | null | undefined>).includes(stored) ? (stored as ThemePreference) : DEFAULT_THEME;
+}
+
 function readStored(): ThemePreference {
   try {
-    const stored = localStorage.getItem(THEME_STORAGE_KEY);
-    if ((THEMES as string[]).includes(stored ?? '')) return stored as ThemePreference;
+    return preferenceFrom(localStorage.getItem(THEME_STORAGE_KEY));
   } catch {
-    /* private browsing - fall back to following the system */
+    /* private browsing - the default, as for a first visit */
+    return DEFAULT_THEME;
   }
-  return 'system';
 }
 
 function resolve(preference: ThemePreference): ResolvedTheme {

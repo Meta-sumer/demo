@@ -20,6 +20,8 @@ import { useFavouritesStore } from '../stores/favouritesStore';
 import { formatMoney } from '../utils/format';
 import { AccountMarker, AccountSwitch } from '../components/AccountSwitch';
 import { AssetRow, useOpenMarket } from '../components/AssetRow';
+import { MarketCardGrid, MarketCardSkeletons } from '../components/MarketCard';
+import { catalogueOrder } from '../components/assetList';
 import { Panel, Skeleton, Spinner } from '../components/ui';
 import { openFunds, useResetDemo } from '../features/account/funds';
 import type { Asset } from '../types/api';
@@ -37,6 +39,12 @@ import type { Asset } from '../types/api';
  * and the quick actions on the left and the markets on the right, so the page
  * uses the width instead of leaving a narrow column in the middle; the source
  * order, which is what a screen reader and a phone follow, stays the brief's.
+ *
+ * Favourites and recent markets are lists once the customer has some. Until
+ * then - and for whichever of the two is still empty - the offered markets are
+ * shown as live cards (price, movement, payouts, a Trade button) instead of
+ * boxes saying there is nothing here: with a handful of instruments on offer,
+ * the cards are the quickest way into one.
  */
 export function HomePage() {
   const user = useAuthStore((s) => s.user);
@@ -59,6 +67,15 @@ export function HomePage() {
 
   const favouriteAssets = pick(favourites, 6);
   const recentAssets = pick(recent, 5);
+  const catalogue = useMemo(() => catalogueOrder(assetsQuery.data ?? []), [assetsQuery.data]);
+  const featured = catalogue.slice(0, 4);
+  // While the catalogue loads, the stored lists say which sections to hold a
+  // place for, so a returning customer does not see cards turn into lists.
+  const loading = assetsQuery.isLoading;
+  const hasFavourites = loading ? favourites.length > 0 : favouriteAssets.length > 0;
+  const hasRecent = loading ? recent.length > 0 : recentAssets.length > 0;
+  // The cards take the place of whichever list is still empty.
+  const showCards = !hasFavourites || !hasRecent;
   const name = (user?.fullName?.trim().split(/\s+/)[0] || user?.username) ?? '';
 
   return (
@@ -80,54 +97,66 @@ export function HomePage() {
         </div>
 
         <div className="space-y-4 lg:col-start-2 lg:row-span-2 lg:row-start-1 lg:space-y-6">
-          <section aria-labelledby="home-favourites">
-            <SectionHeading id="home-favourites" title="Favourites" to="/markets" linkLabel="All markets" />
-            <Panel className="overflow-hidden">
-              {assetsQuery.isLoading ? (
-                <RowsSkeleton />
-              ) : favouriteAssets.length > 0 ? (
-                <ul className="divide-y divide-surface-800/70">
-                  {favouriteAssets.map((asset) => (
-                    <li key={asset.id}>
-                      <AssetRow asset={asset} onSelect={openMarket} />
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <div className="flex flex-col items-center gap-2 px-6 py-8 text-center">
-                  <p className="text-sm font-medium text-content-200">No favourites yet</p>
-                  <p className="max-w-xs text-xs text-content-400">
-                    Star the markets you follow in Markets and they will wait for you here.
-                  </p>
-                  <Link to="/markets" className="btn-ghost mt-1">
-                    <LineChart className="h-4 w-4" />
-                    Browse markets
-                  </Link>
-                </div>
-              )}
-            </Panel>
-          </section>
+          {hasFavourites ? (
+            <section aria-labelledby="home-favourites">
+              <SectionHeading id="home-favourites" title="Favourites" to="/markets" linkLabel="All markets" />
+              <Panel className="overflow-hidden">
+                {loading ? (
+                  <RowsSkeleton rows={Math.min(favourites.length, 3)} />
+                ) : (
+                  <ul className="divide-y divide-surface-800/70">
+                    {favouriteAssets.map((asset) => (
+                      <li key={asset.id}>
+                        <AssetRow asset={asset} onSelect={openMarket} />
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </Panel>
+            </section>
+          ) : null}
 
-          <section aria-labelledby="home-recent">
-            <SectionHeading id="home-recent" title="Recent markets" />
-            <Panel className="overflow-hidden">
-              {assetsQuery.isLoading ? (
-                <RowsSkeleton rows={2} />
-              ) : recentAssets.length > 0 ? (
-                <ul className="divide-y divide-surface-800/70">
-                  {recentAssets.map((asset) => (
-                    <li key={asset.id}>
-                      <AssetRow asset={asset} onSelect={openMarket} />
-                    </li>
-                  ))}
-                </ul>
+          {hasRecent ? (
+            <section aria-labelledby="home-recent">
+              <SectionHeading id="home-recent" title="Recent markets" />
+              <Panel className="overflow-hidden">
+                {loading ? (
+                  <RowsSkeleton rows={Math.min(recent.length, 2)} />
+                ) : (
+                  <ul className="divide-y divide-surface-800/70">
+                    {recentAssets.map((asset) => (
+                      <li key={asset.id}>
+                        <AssetRow asset={asset} onSelect={openMarket} />
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </Panel>
+            </section>
+          ) : null}
+
+          {showCards ? (
+            <section aria-labelledby="home-markets">
+              <SectionHeading
+                id="home-markets"
+                title="Live markets"
+                to={hasFavourites ? undefined : '/markets'}
+                linkLabel="All markets"
+                hint={hasFavourites ? undefined : 'Star a market to pin it here.'}
+              />
+              {loading ? (
+                <MarketCardSkeletons className="sm:grid-cols-2 lg:grid-cols-1" />
+              ) : featured.length > 0 ? (
+                <MarketCardGrid assets={featured} onTrade={openMarket} className="sm:grid-cols-2 lg:grid-cols-1" />
               ) : (
-                <p className="px-4 py-5 text-center text-xs text-content-400">
-                  Markets you open to trade will appear here.
-                </p>
+                <Panel className="px-4 py-6 text-center text-xs text-content-400">
+                  {assetsQuery.isError
+                    ? 'Markets could not be loaded. Retrying…'
+                    : 'No markets are available right now. Please check again shortly.'}
+                </Panel>
               )}
-            </Panel>
-          </section>
+            </section>
+          ) : null}
         </div>
 
         <section aria-labelledby="home-quick" className="lg:col-start-1 lg:row-start-2 lg:self-start">
@@ -248,11 +277,24 @@ function BalanceCard() {
   );
 }
 
-function SectionHeading({ id, title, to, linkLabel }: { id: string; title: string; to?: string; linkLabel?: string }) {
+function SectionHeading({
+  id,
+  title,
+  to,
+  linkLabel,
+  hint,
+}: {
+  id: string;
+  title: string;
+  to?: string;
+  linkLabel?: string;
+  hint?: string;
+}) {
   return (
-    <div className="mb-2 flex items-center justify-between">
-      <h2 id={id} className="text-sm font-bold text-content-100">
+    <div className="mb-2 flex items-center justify-between gap-3">
+      <h2 id={id} className="flex min-w-0 items-baseline gap-2 text-sm font-bold text-content-100">
         {title}
+        {hint ? <span className="truncate text-[11px] font-normal text-content-400">{hint}</span> : null}
       </h2>
       {to ? (
         <Link to={to} className="inline-flex items-center gap-0.5 text-xs font-semibold text-accent hover:underline">

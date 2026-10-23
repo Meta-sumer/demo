@@ -1,6 +1,6 @@
 import clsx from 'clsx';
 import type { ReactNode } from 'react';
-import { CheckCircle2, Info, XCircle } from 'lucide-react';
+import { CheckCircle2, Info, XCircle, type LucideIcon } from 'lucide-react';
 import { useToastStore } from '../hooks/useToast';
 
 export function Panel({ className, children }: { className?: string; children: ReactNode }) {
@@ -86,11 +86,32 @@ export function Spinner({ className }: { className?: string }) {
   );
 }
 
-export function EmptyState({ title, description }: { title: string; description?: string }) {
+/**
+ * Nothing to show yet. With an icon and an action it says what would be here
+ * and offers the step that puts it there ("Start trading"), rather than only
+ * that the list is empty.
+ */
+export function EmptyState({
+  title,
+  description,
+  icon: Icon,
+  action,
+}: {
+  title: string;
+  description?: string;
+  icon?: LucideIcon;
+  action?: ReactNode;
+}) {
   return (
     <div className="flex flex-col items-center justify-center gap-1 px-6 py-12 text-center">
+      {Icon ? (
+        <span className="mb-2 grid h-11 w-11 place-items-center rounded-full bg-accent/10 text-accent ring-1 ring-inset ring-accent/25">
+          <Icon className="h-5 w-5" />
+        </span>
+      ) : null}
       <p className="text-sm font-medium text-content-200">{title}</p>
       {description ? <p className="max-w-sm text-xs text-content-400">{description}</p> : null}
+      {action ? <div className="mt-3 flex flex-wrap justify-center gap-2">{action}</div> : null}
     </div>
   );
 }

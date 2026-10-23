@@ -578,14 +578,23 @@ func TestHedgeOutageWidensOrRefuses(t *testing.T) {
 	if detailsOf(t, err)["reason"] != pricing.CodeHedgeUnavailable {
 		t.Fatalf("reason %v", detailsOf(t, err))
 	}
-	// DEMO never hedges, so it is priced as usual.
+	// DEMO is never refused for the hedge venue, but it is priced like LIVE:
+	// the widened payout, never the full one (practice must not pay more
+	// than real money would).
 	in := e.input(models.DirectionUp)
 	in.AccountType = models.AccountDemo
 	res, err := e.create(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tr := e.stored(res.Trade.ID); math.Abs(tr.PayoutPercent-base) > 0.5 {
-		t.Fatalf("demo %v vs %v", tr.PayoutPercent, base)
+	widened := *q.Up.PayoutPercent
+	if tr := e.stored(res.Trade.ID); math.Abs(tr.PayoutPercent-widened) > 0.5 {
+		t.Fatalf("demo %v, want the widened LIVE payout %v (base %v)", tr.PayoutPercent, widened, base)
+	}
+	// With WIDEN, LIVE and DEMO quote the same payout.
+	e.setRiskConfig(bson.M{"pricingHedgeUnavailableAction": models.PricingActionWiden})
+	live, demo := e.quote(models.AccountLive), e.quote(models.AccountDemo)
+	if math.Abs(*live.Up.PayoutPercent-*demo.Up.PayoutPercent) > 0.001 {
+		t.Fatalf("live %v vs demo %v", *live.Up.PayoutPercent, *demo.Up.PayoutPercent)
 	}
 }

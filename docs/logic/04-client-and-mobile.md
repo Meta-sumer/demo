@@ -174,6 +174,7 @@ Two start-up measures for a slow or flaky first request:
 | `['trade', id]`, `['trade', id, 'quote']` | trade detail, Sell now quote |
 | `['trade-window', id]` | trade detail chart data |
 | `['candles', assetId, timeframe]` | main chart history |
+| `['sparkline', assetId]` | web market cards (Home, Markets): the last 60 one-minute candles, refetched every 60 s |
 | `['market', 'health']`, `['notifications']`, `['transfers']`, `['payment-methods']`, `['profile']` | misc |
 | `['usdt', ...]` (`USDT_KEY`, `features/usdt/queries.ts`) | every USDT query under one root |
 
@@ -353,6 +354,11 @@ else wanted it):
 - The key is the sorted, de-duplicated asset id list, so re-renders do not churn subscriptions.
 
 `useMarketSubscription(assetId)` (in `useRealtime.ts`) is the chart's own subscribe/unsubscribe.
+
+On the web, the market cards on Home and Markets (`components/MarketCard.tsx` `MarketCardGrid`) use
+`useLiveFeeds(ids, { keepWorkspace: false })` for the cards on screen, so their prices stream off the
+trade screen too. Those pages are never mounted together with the trade screen or the Trades page,
+and React runs the leaving page's unsubscribe before the arriving page subscribes.
 
 ---
 
@@ -852,7 +858,9 @@ bucket. Times are in ms in the client and divided by 1000 for `lightweight-chart
 On mobile the ticks reach the chart through the 250 ms batch (2.3), so a bar moves at most four
 times a second there.
 
-Other display rules: a DEMO watermark under the series when the active account is DEMO (font size
+Other display rules: while the active account is DEMO the chart says so - on the web as a badge in
+its top-left corner ("Demo account · virtual money", "Demo · virtual money" below `sm`, in the warn
+tone, above the OHLC readout), on mobile as a DEMO watermark under the series (font size
 `clamp(round(width * 0.17), 44, 150)`, per-theme alpha 0.06/0.075/0.055); axis and crosshair labels
 use the chosen time zone (formatting only); grid colour alpha = `gridOpacity / 10`.
 
@@ -1204,9 +1212,16 @@ messages are shown as they come only for known codes (`KNOWN_ERROR_CODES`); anyt
 `brand`, `scrim`, `chart-grid|axis|crosshair|bg|bull|bear|price-line`.
 
 **Three themes + system.** `ThemePreference = 'light' | 'twilight' | 'dark' | 'system'`; `THEMES`
-is that list, and `cycle()` steps through it in that order (`light -> twilight -> dark -> system`;
-the web doc comment still says "light -> dark -> system"). "System" follows the OS live
-(`watchSystemTheme`) and resolves only to `light` or `dark`.
+is that list, and `cycle()` steps through it in that order (`light -> twilight -> dark -> system`).
+"System" follows the OS live (`watchSystemTheme`) and resolves only to `light` or `dark`.
+
+**Default.** Web: a visitor with no stored preference (or an unknown value) gets `dark`
+(`DEFAULT_THEME`, `preferenceFrom()`), the same black-and-yellow as the landing page, whatever the
+OS prefers; a stored choice always wins, and a stored `system` still follows the OS. The store and
+`public/theme-init.js` apply the same rule, so there is no flash of another theme; `index.css` has
+no `prefers-color-scheme` fallback (an attribute-less `:root` is dark), and `index.html` has one
+dark `theme-color`. Test: `client/tests/theme-default.test.ts` (runs `theme-init.js` against the
+store). Mobile still defaults to `system`.
 
 - **Web** (`client/src/stores/themeStore.ts`): tokens are CSS custom properties in
   `client/src/index.css` (`:root` = dark, `:root[data-theme='twilight']`, `:root[data-theme='light']`).

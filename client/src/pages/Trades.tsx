@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import clsx from 'clsx';
-import { ChevronLeft, ChevronRight, Download } from 'lucide-react';
+import { ArrowRight, ChevronLeft, ChevronRight, Download, History, Timer } from 'lucide-react';
 import { api } from '../services/api';
 import { toast } from '../hooks/useToast';
 import { useAccountStore } from '../stores/accountStore';
@@ -394,16 +394,24 @@ export function TradesPage() {
             ))}
           </div>
         ) : items.length === 0 ? (
-          <EmptyState
-            title={tab === 'active' ? 'No active trades' : 'No trades match'}
-            description={
-              tab === 'active'
-                ? 'Trades you place appear here until they expire.'
-                : filtered
-                  ? 'Widen the date range, or clear the filters to see everything.'
-                  : 'Settled trades on this account appear here.'
-            }
-          />
+          tab === 'history' && filtered ? (
+            <EmptyState
+              icon={History}
+              title="No trades match"
+              description="Widen the date range, or clear the filters to see everything."
+            />
+          ) : (
+            <EmptyState
+              icon={tab === 'active' ? Timer : History}
+              title={tab === 'active' ? 'No active trades' : 'No settled trades yet'}
+              description={
+                tab === 'active'
+                  ? 'Trades you place appear here with a live result and a countdown until they expire.'
+                  : 'Every finished trade on this account is listed here with its entry, expiry and result.'
+              }
+              action={<StartTrading />}
+            />
+          )
         ) : (
           <>
             {/* Phone: one card per trade - no sideways scrolling at 390px -
@@ -737,5 +745,15 @@ function Labelled({ label, children, className }: { label: string; children: Rea
       <span className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-content-400">{label}</span>
       {children}
     </div>
+  );
+}
+
+/** The step that fills an empty list: the trade screen. */
+function StartTrading() {
+  return (
+    <Link to="/trade" className="btn-primary">
+      Start trading
+      <ArrowRight className="h-4 w-4" />
+    </Link>
   );
 }

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import clsx from 'clsx';
 import { Link } from 'react-router-dom';
-import { ArrowDownToLine, ArrowLeft, ArrowUpFromLine } from 'lucide-react';
+import { ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUpFromLine, ReceiptText } from 'lucide-react';
 import { api } from '../services/api';
 import { useAccountStore } from '../stores/accountStore';
 import { openFunds } from '../features/account/funds';
@@ -115,7 +115,21 @@ export function WalletPage() {
               ))}
             </div>
           ) : (ledgerQuery.data?.items.length ?? 0) === 0 ? (
-            <EmptyState title="No transactions yet" />
+            <EmptyState
+              icon={ReceiptText}
+              title="No transactions yet"
+              description={
+                account === 'DEMO'
+                  ? 'Every trade you place with virtual money, and its result, is recorded here.'
+                  : 'Every deposit, withdrawal, trade and result on your Live account is recorded here.'
+              }
+              action={
+                <Link to="/trade" className="btn-primary">
+                  Start trading
+                  <ArrowRight className="h-4 w-4" />
+                </Link>
+              }
+            />
           ) : (
             <ul className="divide-y divide-surface-800/70">
               {ledgerQuery.data!.items.map((row) => {
@@ -171,7 +185,10 @@ export function WalletPage() {
             <span className="flex items-center gap-2">Deposits and withdrawals <AccountMarker account="LIVE" /></span>
           </div>
           {(transfersQuery.data?.items.length ?? 0) === 0 ? (
-            <EmptyState title="No requests yet" />
+            <EmptyState
+              title="No requests yet"
+              description="Deposits and withdrawals you request appear here while our team reviews them."
+            />
           ) : (
             <ul className="divide-y divide-surface-800/70">
               {transfersQuery.data!.items.map((transfer) => (

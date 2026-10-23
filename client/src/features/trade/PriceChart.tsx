@@ -42,7 +42,7 @@ import { IndicatorPicker } from './chart/IndicatorPicker';
 import { INDICATOR_CATALOG, INDICATOR_ORDER, isOscillator, type Oscillator } from './chart/indicatorCatalog';
 import { OscillatorPane, type PaneHandle } from './chart/OscillatorPane';
 import { lastAtOrBefore } from './chart/timeProjection';
-import { clamp, isFollowingRealTime } from './chart/useFrameLoop';
+import { isFollowingRealTime } from './chart/useFrameLoop';
 import type { Asset, Candle, Trade } from '../../types/api';
 
 /**
@@ -81,16 +81,6 @@ interface Ohlc {
   low: number;
   close: number;
 }
-
-/**
- * How strongly "DEMO" shows behind the candles, per theme.
- *
- * Tuned by eye against each theme's background: enough to be read at a
- * glance on every screen, faint enough that no candle, level or label is ever
- * harder to read because of it.
- */
-const WATERMARK_ALPHA: Record<ChartPalette['theme'], number> = { dark: 0.06, twilight: 0.075, light: 0.055 };
-const WATERMARK_FONT = '"Inter var", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 
 export function PriceChart({ asset, openTrades, mode }: Props) {
   const advanced = mode === 'advanced';
@@ -313,37 +303,6 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
       },
     });
   }, [zone]);
-
-  /*
-   * "DEMO" behind the candles (record 20).
-   *
-   * The header's demo marker scrolls away on a phone; the chart does not, so
-   * the one thing a practising trader always has in view says it is practice.
-   * It is the library's own watermark, drawn under the series, sized to the
-   * plot so it reads the same on a phone as on a desktop.
-   */
-  useEffect(() => {
-    const chart = chartApi;
-    if (!chart) return;
-    const scale = chart.timeScale();
-    const apply = () => {
-      chart.applyOptions({
-        watermark: {
-          visible: demo,
-          text: 'DEMO',
-          color: withAlpha(palette.strongText, WATERMARK_ALPHA[palette.theme]),
-          fontSize: clamp(Math.round(scale.width() * 0.17), 44, 150),
-          fontStyle: '800',
-          fontFamily: WATERMARK_FONT,
-          horzAlign: 'center',
-          vertAlign: 'center',
-        },
-      });
-    };
-    apply();
-    scale.subscribeSizeChange(apply);
-    return () => scale.unsubscribeSizeChange(apply);
-  }, [chartApi, demo, palette]);
 
   // Show exactly one price series.
   useEffect(() => {
@@ -760,6 +719,22 @@ export function PriceChart({ asset, openTrades, mode }: Props) {
 
         {/* Live figures the chart library cannot draw itself. */}
         <div className="pointer-events-none absolute left-3 top-3 z-20 flex flex-col gap-1.5">
+          {/* Practice money, said on the chart itself (record 20). The header's
+              demo marker scrolls away on a phone; the chart does not, so the
+              one thing a practising trader always has in view says it is
+              practice - as a badge in the corner, in the demo tone and in
+              words, rather than a word across the candles. */}
+          {demo ? (
+            <span
+              role="status"
+              className="inline-flex w-fit items-center gap-1.5 rounded-md bg-surface-900/90 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-warn ring-1 ring-inset ring-warn/45 backdrop-blur"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-warn" />
+              <span className="sm:hidden">Demo · virtual money</span>
+              <span className="hidden sm:inline">Demo account · virtual money</span>
+            </span>
+          ) : null}
+
           {readout ? (
             <span className="inline-flex w-fit flex-wrap items-center gap-x-2.5 gap-y-1 rounded-md bg-surface-900/85 px-2 py-1 text-[11px] font-medium backdrop-blur">
               <Ohlc label="O" value={readout.open} digits={digits} />

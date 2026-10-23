@@ -1,8 +1,9 @@
-import { useMemo, useState, type RefObject } from 'react';
+import { useMemo, useState, type ReactNode, type RefObject } from 'react';
 import clsx from 'clsx';
 import { Search, X } from 'lucide-react';
 import { useFavouritesStore } from '../stores/favouritesStore';
 import { AssetRow, AssetTableHeader } from './AssetRow';
+import { MarketCardGrid, MarketCardSkeletons } from './MarketCard';
 import { EmptyState, Skeleton } from './ui';
 import {
   ASSET_SORTS,
@@ -60,6 +61,14 @@ interface Props {
    * one line and the rows become a table with column titles.
    */
   wide?: boolean;
+  /**
+   * Show the instruments as cards - price line, payout by duration, a Trade
+   * button - instead of rows. For a page with only a few of them, where a
+   * table would be two rows on an empty page. The search, chips and sort work
+   * the same; the header and each card are then panels of their own, so the
+   * host does not wrap the browser in one.
+   */
+  cards?: boolean;
 }
 
 export function AssetBrowser({
@@ -72,6 +81,7 @@ export function AssetBrowser({
   headerClassName,
   className,
   wide = false,
+  cards = false,
 }: Props) {
   const favourites = useFavouritesStore((s) => s.favourites);
   const recent = useFavouritesStore((s) => s.recent);
@@ -121,6 +131,9 @@ export function AssetBrowser({
   // offer that instead of a dead end.
   const elsewhere = term && visible.length === 0 && filter !== 'all' ? chips[0]!.count : 0;
   const openNow = openCount(visible);
+  // Cards sit on the page, so a message in their place needs a panel of its own.
+  const framed = (node: ReactNode) => (cards ? <div className="panel">{node}</div> : node);
+  const cardColumns = catalogue.length > 2 ? 'sm:grid-cols-2 xl:grid-cols-3' : 'sm:grid-cols-2';
 
   return (
     <div className={clsx('flex min-h-0 flex-col', className)}>
@@ -210,12 +223,16 @@ export function AssetBrowser({
       </div>
 
       <div className={clsx('min-h-0', listClassName)}>
-        {loading ? (
+        {loading && cards ? (
+          <MarketCardSkeletons className={cardColumns} />
+        ) : loading ? (
           <div className="space-y-2 p-3">
             {Array.from({ length: 6 }).map((_, index) => (
               <Skeleton key={index} className="h-12 w-full" />
             ))}
           </div>
+        ) : visible.length > 0 && cards ? (
+          <MarketCardGrid assets={visible} onTrade={onPick} detailed className={cardColumns} />
         ) : visible.length > 0 ? (
           <>
             {wide ? <AssetTableHeader className="border-b border-surface-800" /> : null}
@@ -228,26 +245,32 @@ export function AssetBrowser({
             </ul>
           </>
         ) : elsewhere > 0 ? (
-          <div className="px-6 py-10 text-center">
-            <p className="text-sm text-content-200">Nothing here matches “{search.trim()}”.</p>
-            <button type="button" className="btn-ghost mt-3" onClick={() => setFilter('all')}>
-              Show {elsewhere} {elsewhere === 1 ? 'match' : 'matches'} in all markets
-            </button>
-          </div>
+          framed(
+            <div className="px-6 py-10 text-center">
+              <p className="text-sm text-content-200">Nothing here matches “{search.trim()}”.</p>
+              <button type="button" className="btn-ghost mt-3" onClick={() => setFilter('all')}>
+                Show {elsewhere} {elsewhere === 1 ? 'match' : 'matches'} in all markets
+              </button>
+            </div>,
+          )
         ) : term ? (
-          <EmptyState
-            title="No market matches that search"
-            description="Try the symbol, e.g. BTC, or part of the name."
-          />
+          framed(
+            <EmptyState
+              title="No market matches that search"
+              description="Try the symbol, e.g. BTC, or part of the name."
+            />,
+          )
         ) : filter === 'favourites' ? (
-          <EmptyState
-            title="No favourites yet"
-            description="Tap the star on any market to keep it here, on Home and in the trade screen."
-          />
+          framed(
+            <EmptyState
+              title="No favourites yet"
+              description="Tap the star on any market to keep it here, on Home and in the trade screen."
+            />,
+          )
         ) : filter === 'recent' ? (
-          <EmptyState title="Nothing recent" description="Markets you open to trade appear here." />
+          framed(<EmptyState title="Nothing recent" description="Markets you open to trade appear here." />)
         ) : (
-          <EmptyState title="No markets available" description="Please check again shortly." />
+          framed(<EmptyState title="No markets available" description="Please check again shortly." />)
         )}
       </div>
     </div>

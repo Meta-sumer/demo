@@ -22,6 +22,7 @@ import (
 	"binarytrading/internal/platform/redisx"
 	"binarytrading/internal/platform/util"
 	"binarytrading/internal/platform/ws"
+	"binarytrading/internal/service/assets"
 	"binarytrading/internal/service/exposure"
 	"binarytrading/internal/service/marketdata"
 	"binarytrading/internal/workers"
@@ -52,6 +53,21 @@ func ready(w http.ResponseWriter, r *http.Request) error {
 	feeds, err := marketdata.GetAllFeedHealth(r.Context())
 	if err != nil {
 		return err
+	}
+	// Only assets that are offered count: a switched-off asset has no feed by
+	// design and would read as OFFLINE here.
+	if active, err := assets.ListAssetDocs(r.Context(), true); err == nil {
+		offered := make(map[string]bool, len(active))
+		for _, a := range active {
+			offered[a.Symbol] = true
+		}
+		kept := feeds[:0]
+		for _, f := range feeds {
+			if offered[f.Symbol] {
+				kept = append(kept, f)
+			}
+		}
+		feeds = kept
 	}
 	mongoOK := mongox.Healthy(r.Context())
 	provider := marketdata.GetProviderStatus()
