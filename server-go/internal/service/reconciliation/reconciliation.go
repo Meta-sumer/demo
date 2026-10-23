@@ -66,6 +66,8 @@ func RunReconciliation(ctx context.Context, windowMs int64) (*ReconciliationResu
 		checkLockedFundsAgainstOpenPositions,
 		checkSettledTradesHaveSettlements,
 		checkSettlementsHaveWalletTransactions,
+		checkCancelledTradesReleased,
+		checkStakeLocksHaveOpenTrades,
 		func(ctx context.Context) (models.ReconciliationCheck, error) {
 			return checkPlatformResultConsistency(ctx, windowFrom)
 		},
@@ -77,6 +79,8 @@ func RunReconciliation(ctx context.Context, windowMs int64) (*ReconciliationResu
 		checkUsdtPaidDepositsCredited,
 		checkUsdtCreditedDepositsLedger,
 		checkUsdtCompletedWithdrawalsSettled,
+		checkUsdtProviderAlerts,
+		checkStuckSettlements,
 	}
 
 	status := models.ReconciliationOK

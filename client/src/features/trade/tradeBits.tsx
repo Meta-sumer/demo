@@ -3,7 +3,7 @@ import { ArrowDown, ArrowUp } from 'lucide-react';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { formatClock, resolveZone } from '../../utils/time';
 import { formatSignedMoney } from '../../utils/format';
-import { statusLabel, statusTone } from '../../utils/tradeStatus';
+import { statusTone, tradeLabel } from '../../utils/tradeStatus';
 import { accountOf } from './ticketModel';
 import { STANDING_WORDS, amountTone, type LiveResult } from './liveResult';
 import type { AccountType, Direction, Trade } from '../../types/api';
@@ -56,7 +56,13 @@ const TONE_CLASS = {
 } as const;
 
 /** The trade's status in words, coloured by what it means for the trader. */
-export function StatusPill({ trade, className }: { trade: Pick<Trade, 'status' | 'settlementAmount'>; className?: string }) {
+export function StatusPill({
+  trade,
+  className,
+}: {
+  trade: Pick<Trade, 'status' | 'settlementAmount' | 'voided' | 'expiryPriceSource'>;
+  className?: string;
+}) {
   return (
     <span
       className={clsx(
@@ -65,7 +71,7 @@ export function StatusPill({ trade, className }: { trade: Pick<Trade, 'status' |
         className,
       )}
     >
-      {statusLabel(trade.status)}
+      {tradeLabel(trade)}
     </span>
   );
 }

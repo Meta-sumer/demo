@@ -2,6 +2,7 @@ package admin
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -11,6 +12,8 @@ import (
 	assetsvc "binarytrading/internal/service/assets"
 	"binarytrading/internal/service/audit"
 	"binarytrading/internal/service/payouts"
+	"binarytrading/internal/service/pricing"
+	"binarytrading/internal/service/riskconfig"
 )
 
 var assetCategories = []string{"CRYPTO", "FOREX", "STOCK", "COMMODITY", "INDEX"}
@@ -38,12 +41,28 @@ func mountAssets(r chi.Router) {
 type assetWithPayouts struct {
 	models.AssetView
 	Payouts []models.PayoutView `json:"payouts"`
+	// Whether the pricing engine can price the instrument at all (launch
+	// scope: BTC/USD and ETH/USD); additive.
+	Priced          bool   `json:"priced"`
+	NotPricedReason string `json:"notPricedReason,omitempty"`
 }
 
 type assetDetail struct {
 	models.AssetView
-	Payouts       []models.PayoutView `json:"payouts"`
-	PayoutHistory []models.PayoutView `json:"payoutHistory"`
+	Payouts         []models.PayoutView `json:"payouts"`
+	PayoutHistory   []models.PayoutView `json:"payoutHistory"`
+	Priced          bool                `json:"priced"`
+	NotPricedReason string              `json:"notPricedReason,omitempty"`
+}
+
+// pricedFn reports whether a symbol can be priced under the active risk
+// configuration.
+func pricedFn(r *http.Request) (func(symbol string) (bool, string), error) {
+	cfg, err := riskconfig.GetRiskConfig(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	return func(symbol string) (bool, string) { return pricing.SymbolPriced(cfg, symbol) }, nil
 }
 
 func nonNil[T any](s []T) []T {
@@ -58,13 +77,19 @@ func listAssets(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	priced, err := pricedFn(r)
+	if err != nil {
+		return err
+	}
 	out := make([]assetWithPayouts, 0, len(list))
 	for _, a := range list {
 		p, err := payouts.ListActivePayouts(r.Context(), a.ID)
 		if err != nil {
 			return err
 		}
-		out = append(out, assetWithPayouts{AssetView: a, Payouts: nonNil(p)})
+		row := assetWithPayouts{AssetView: a, Payouts: nonNil(p)}
+		row.Priced, row.NotPricedReason = priced(a.Symbol)
+		out = append(out, row)
 	}
 	return httpx.OK(w, out)
 }
@@ -86,7 +111,13 @@ func getAsset(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	return httpx.OK(w, assetDetail{AssetView: asset, Payouts: nonNil(active), PayoutHistory: nonNil(history)})
+	priced, err := pricedFn(r)
+	if err != nil {
+		return err
+	}
+	d := assetDetail{AssetView: asset, Payouts: nonNil(active), PayoutHistory: nonNil(history)}
+	d.Priced, d.NotPricedReason = priced(asset.Symbol)
+	return httpx.OK(w, d)
 }
 
 // parseTradingWindows is z.array(tradingWindowSchema).
@@ -298,13 +329,29 @@ func upsertPayout(w http.ResponseWriter, r *http.Request) error {
 	percent, _ := b.reqNum("payoutPercent", numRule{Min: f(0), Max: f(500)})
 	_, minStake := b.nullableInt("minStake", numRule{Positive: true})
 	_, maxStake := b.nullableInt("maxStake", numRule{Positive: true})
+	// Pricing-engine bounds (optional; null = default).
+	_, minPayout := b.nullableNum("minPayoutPercent", numRule{Min: f(0), Max: f(500)})
+	_, maxPayout := b.nullableNum("maxPayoutPercent", numRule{Min: f(0), Max: f(500)})
+	_, margin := b.nullableNum("marginPercent", numRule{Min: f(0), Max: f(50)})
 	note := b.optStr("note", 0, 300)
+	// Optional ISO time: a future instant schedules the change.
+	var effectiveFrom *time.Time
+	if raw := b.optStr("effectiveFrom", 1, 40); raw != nil {
+		at, perr := time.Parse(time.RFC3339Nano, *raw)
+		if perr != nil {
+			b.v.Add("effectiveFrom", "Invalid datetime")
+		} else {
+			effectiveFrom = &at
+		}
+	}
 	if err := b.err(); err != nil {
 		return err
 	}
 	before, after, err := payouts.UpsertPayout(r.Context(), payouts.UpsertPayoutInput{
 		AssetID: id.Hex(), ExpirySeconds: int64(expiry), PayoutPercent: percent,
 		MinStake: minStake, MaxStake: maxStake, Note: note,
+		MinPayoutPercent: minPayout, MaxPayoutPercent: maxPayout, MarginPercent: margin,
+		EffectiveFrom: effectiveFrom,
 	}, actor.UserID)
 	if err != nil {
 		return err

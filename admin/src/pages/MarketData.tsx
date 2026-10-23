@@ -1,7 +1,8 @@
 import { useQuery } from '@tanstack/react-query';
 import clsx from 'clsx';
 import { api } from '../services/api';
-import { FeedBadge, Panel, PanelHeader, Skeleton, Stat, TableSkeleton } from '../components/ui';
+import { Badge, FeedBadge, Panel, PanelHeader, Skeleton, Stat, TableSkeleton } from '../components/ui';
+import type { FeedQualityReport } from '../types/api';
 
 /**
  * Market data console (spec sections 23 and 28).
@@ -120,6 +121,8 @@ export function MarketDataPage() {
         )}
       </Panel>
 
+      {data?.quality ? <FeedQualityPanel quality={data.quality} /> : null}
+
       <Panel className="overflow-hidden">
         <PanelHeader title="Latency percentiles" description="Rolling window of the most recent samples" />
         {query.isLoading ? (
@@ -156,5 +159,110 @@ export function MarketDataPage() {
         )}
       </Panel>
     </div>
+  );
+}
+
+const STATE_TONE: Record<string, 'up' | 'down' | 'warn' | 'neutral'> = {
+  LIVE: 'up',
+  QUIET: 'neutral',
+  GAP: 'down',
+  DISCONNECTED: 'down',
+  NO_DATA: 'warn',
+  NOT_EVALUATED: 'warn',
+};
+
+const time = (ms: number) => (ms > 0 ? new Date(ms).toISOString().slice(11, 23) : '--');
+
+/**
+ * Feed data rules (docs/audit/operations/feed-rules.md): a gap (nothing at all
+ * from the provider) is told apart from a quiet market (heartbeats, no price
+ * change); dropped and rejected ticks are counted; the clock is checked
+ * against the provider's.
+ */
+function FeedQualityPanel({ quality }: { quality: FeedQualityReport }) {
+  const clock = quality.clock;
+  return (
+    <Panel className="overflow-hidden">
+      <PanelHeader
+        title="Data quality"
+        description={
+          'Clock check: ' +
+          (clock ? clock.state + ' (offset ' + clock.offsetMs + ' ms, drift ' + clock.driftMs + ' ms, ' + clock.source + ')' : 'not run') +
+          ' · ingestion buffer high-water ' +
+          quality.queueHighWater +
+          ' / ' +
+          quality.queueCap +
+          ' · dropped ' +
+          quality.droppedTotal
+        }
+      />
+      <div className="overflow-x-auto">
+        <table className="table min-w-[860px]">
+          <thead>
+            <tr>
+              <th>Asset</th>
+              <th>State</th>
+              <th className="text-right">Expected interval</th>
+              <th className="text-right">Gap after</th>
+              <th className="text-right">Updates / heartbeats</th>
+              <th className="text-right">Dropped</th>
+              <th className="text-right">Rejected</th>
+              <th>Blocked</th>
+            </tr>
+          </thead>
+          <tbody>
+            {quality.assets.map((row) => (
+              <tr key={row.assetId}>
+                <td className="font-medium text-content-100">{row.symbol}</td>
+                <td>
+                  <Badge tone={STATE_TONE[row.state] ?? 'neutral'}>{row.state}</Badge>
+                  {row.gapOpen ? <span className="ml-1 text-[11px] text-down">since {time(row.gapStartedAt)}</span> : null}
+                </td>
+                <td className="text-right tnum text-content-300">{Math.round(row.expectedIntervalMs)} ms</td>
+                <td className="text-right tnum text-content-300">{row.gapThresholdMs} ms</td>
+                <td className="text-right tnum text-content-300">
+                  {row.updates} / {row.heartbeats}
+                </td>
+                <td className={clsx('text-right tnum', row.droppedQueueFull + row.droppedInvalid > 0 ? 'text-warn' : 'text-content-400')}>
+                  {row.droppedQueueFull + row.droppedInvalid}
+                </td>
+                <td className="text-right tnum text-content-400">{row.rejected.total ?? 0}</td>
+                <td className="text-[11px] text-content-400">{row.block ? row.block.code + ': ' + row.block.detail : '--'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {quality.gaps.length > 0 ? (
+        <div className="overflow-x-auto border-t border-surface-800">
+          <table className="table min-w-[760px]">
+            <thead>
+              <tr>
+                <th>Gap</th>
+                <th>Reason</th>
+                <th>Last data before (UTC)</th>
+                <th>First data after (UTC)</th>
+                <th className="text-right">Duration</th>
+              </tr>
+            </thead>
+            <tbody>
+              {quality.gaps.slice(0, 20).map((gap) => (
+                <tr key={gap.id}>
+                  <td className="font-medium text-content-100">
+                    {gap.symbol} {gap.open ? <Badge tone="down">open</Badge> : null}
+                  </td>
+                  <td className="text-content-300">{gap.reason}</td>
+                  <td className="font-mono text-[11px] text-content-400">{new Date(gap.startedAt).toISOString().slice(0, 23)}</td>
+                  <td className="font-mono text-[11px] text-content-400">
+                    {gap.endedAt ? new Date(gap.endedAt).toISOString().slice(0, 23) : '--'}
+                  </td>
+                  <td className="text-right tnum text-content-300">{gap.durationMs !== null ? gap.durationMs + ' ms' : '--'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </Panel>
   );
 }

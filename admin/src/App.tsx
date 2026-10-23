@@ -24,6 +24,7 @@ import { PaymentMethodsPage } from './pages/PaymentMethods';
 import { ReportsPage } from './pages/Reports';
 import { AuditLogsPage } from './pages/AuditLogs';
 import { ReconciliationPage } from './pages/Reconciliation';
+import { AlertsPage } from './pages/Alerts';
 import { SettingsPage } from './pages/Settings';
 import { SecurityPage } from './pages/Security';
 import { SupportPage } from './pages/Support';
@@ -58,6 +59,7 @@ const GUARDED_ROUTES: Array<{ path: string; permission: string; element: React.R
   { path: '/admin/usdt/networks', permission: 'deposits:read', element: <UsdtNetworksPage /> },
   { path: '/admin/reports', permission: 'reports:read', element: <ReportsPage /> },
   { path: '/admin/reconciliation', permission: 'reconciliation:read', element: <ReconciliationPage /> },
+  { path: '/admin/alerts', permission: 'reconciliation:read', element: <AlertsPage /> },
   { path: '/admin/audit-logs', permission: 'audit:read', element: <AuditLogsPage /> },
   { path: '/admin/settings', permission: 'risk:read', element: <SettingsPage /> },
 ];

@@ -30,11 +30,14 @@ func mountTrading(r chi.Router) {
 	perm(config.PermTradesRead).Get("/binary/trades", httpx.H(listTrades))
 	perm(config.PermTradesRead).Get("/binary/trades/{id}", httpx.H(getTrade))
 	write(config.PermTradesCancel).Post("/binary/trades/{id}/cancel", httpx.H(cancelTrade))
+	// Finishes cancels whose stake or exposure release did not complete.
+	write(config.PermTradesCancel).Post("/binary/trades/cancellations/repair", httpx.H(repairCancellations))
 	perm(config.PermExposureRead).Get("/exposure", httpx.H(getExposure))
 	perm(config.PermRiskRead).Get("/risk", httpx.H(getRisk))
 	perm(config.PermHedgeRead).Get("/hedging", httpx.H(getHedging))
 	perm(config.PermHedgeRead).Get("/hedging/orders", httpx.H(listHedgeOrders))
 	write(config.PermHedgeWrite).Post("/hedging/orders/{id}/cancel", httpx.H(cancelHedgeOrder))
+	mountHedging(perm, write)
 	perm(config.PermMarketDataRead).Get("/market-data", httpx.H(getMarketData))
 }
 
@@ -55,7 +58,8 @@ func getTrade(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	trade, err := binary.GetTrade(r.Context(), id.Hex(), "")
+	// The trade plus its pricing record (additive "pricing" key).
+	trade, err := binary.GetTradeWithPricing(r.Context(), id.Hex())
 	if err != nil {
 		return err
 	}
@@ -80,13 +84,37 @@ func cancelTrade(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	after, err := binary.CancelTrade(r.Context(), id.Hex(), reason)
+	if err != nil && after.ID == "" {
+		return err
+	}
+	// The trade is cancelled even when a release step failed (the repair
+	// finishes it): the cancel is audited either way.
+	e := entry(r, actor, audit.TradeCancelled, "BinaryTrade", chi.URLParam(r, "id"))
+	e.Before, e.After, e.Reason = auditDoc(before), auditDoc(after), reason
+	if err != nil {
+		e.Failed = true
+		e.Reason = reason + " (stake release pending: " + err.Error() + ")"
+	}
+	audit.Write(r.Context(), e)
 	if err != nil {
 		return err
 	}
-	e := entry(r, actor, audit.TradeCancelled, "BinaryTrade", chi.URLParam(r, "id"))
-	e.Before, e.After, e.Reason = auditDoc(before), auditDoc(after), reason
-	audit.Write(r.Context(), e)
 	return httpx.OK(w, after)
+}
+
+func repairCancellations(w http.ResponseWriter, r *http.Request) error {
+	actor, err := httpx.RequireActor(r)
+	if err != nil {
+		return err
+	}
+	res, err := binary.RepairCancelledTrades(r.Context())
+	if err != nil {
+		return err
+	}
+	e := entry(r, actor, "trade.cancellations_repaired", "BinaryTrade", "")
+	e.After = map[string]any{"scanned": res.Scanned, "repaired": res.Repaired, "failed": res.Failed, "tradeIds": res.TradeIDs}
+	audit.Write(r.Context(), e)
+	return httpx.OK(w, res)
 }
 
 type exposureRow struct {
@@ -189,9 +217,15 @@ func getMarketData(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	// Feed data rules (gaps, dropped ticks, clock check; additive).
+	quality, err := marketdata.GetFeedQuality(r.Context())
+	if err != nil {
+		return err
+	}
 	return httpx.OK(w, struct {
 		Provider *mdproviders.Status          `json:"provider"`
 		Feeds    []models.FeedHealthSnapshot  `json:"feeds"`
 		Latency  []metrics.LatencyReportEntry `json:"latency"`
-	}{marketdata.GetProviderStatus(), nonNil(feeds), metrics.GetLatencyReport(r.Context())})
+		Quality  marketdata.FeedQualityReport `json:"quality"`
+	}{marketdata.GetProviderStatus(), nonNil(feeds), metrics.GetLatencyReport(r.Context()), quality})
 }

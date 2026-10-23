@@ -191,36 +191,3 @@ func TestToFixed(t *testing.T) {
 		}
 	}
 }
-
-func TestAssessRiskHedgeSizing(t *testing.T) {
-	cfg := models.DefaultRiskConfig()
-	in := RiskInputs{
-		AssetID: "a1", Symbol: "BTC/USD",
-		Exposure:              book(exposure.RawCounters{UpStake: util.ToMinor(700_000), OpenTrades: 5}),
-		AssetExposureLimit:    util.ToMinor(1_000_000),
-		AssetNetExposureLimit: util.ToMinor(1_000_000),
-		HedgeEnabled:          true,
-		AssetTargetHedgeRatio: 0.5,
-		MinHedgeNotional:      util.ToMinor(1_000),
-		MaxHedgeNotional:      util.ToMinor(1_000_000),
-		Config:                &cfg,
-		GlobalGrossExposure:   util.ToMinor(700_000),
-		FeedStatus:            models.FeedStatusHealthy,
-	}
-	a := AssessRisk(in)
-	// 70% gross utilisation -> HIGH band (0.7 ratio x 0.5 x 2).
-	if a.Level != models.RiskLevelHigh || a.HedgeDecision != models.HedgeDecisionHighHedge {
-		t.Fatalf("level %s decision %s", a.Level, a.HedgeDecision)
-	}
-	if a.TargetHedgeRatio != 0.7 || a.TargetHedgeNotional != util.ToMinor(490_000) {
-		t.Fatalf("ratio %v notional %d", a.TargetHedgeRatio, a.TargetHedgeNotional)
-	}
-	if len(a.Reasons) != 1 || a.Reasons[0] != "gross exposure at 70.0% of the asset limit" {
-		t.Fatalf("reasons %v", a.Reasons)
-	}
-
-	in.HedgeEnabled = false
-	if b := AssessRisk(in); b.HedgeDecision != models.HedgeDecisionNoHedge || b.TargetHedgeNotional != 0 {
-		t.Fatalf("disabled hedge: %+v", b)
-	}
-}

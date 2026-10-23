@@ -1,0 +1,170 @@
+# Continuous integration (audit F-20): every push and pull request runs the
+# Go backend's build, vet, format check and full test suite against a real
+# MongoDB replica set and Redis, with a coverage report; the web client's and
+# the admin console's type check and tests; and the Android app's type check
+# and tests. The load and failover tests are opt-in (build tag / env switch)
+# and do not run here; see docs/audit/operations/load-and-failover.md.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go (build, vet, gofmt, tests, coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: server-go
+    env:
+      # Tests create a throwaway database per test on this replica set and
+      # namespace their Redis keys (internal/testsupport).
+      MONGO_URI: mongodb://127.0.0.1:27017/binary_trading_ci?replicaSet=rs0
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server-go/go.mod
+          cache-dependency-path: server-go/go.sum
+
+      # Service containers cannot take a command, and transactions need a
+      # replica set, so MongoDB is started by hand and initiated here.
+      - name: Start MongoDB (single-node replica set) and Redis
+        run: |
+          docker run -d --name ci-mongo -p 27017:27017 mongo:7 mongod --replSet rs0 --bind_ip_all
+          docker run -d --name ci-redis -p 6379:6379 redis:7-alpine
+          for i in $(seq 1 60); do
+            docker exec ci-mongo mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker exec ci-mongo mongosh --quiet --eval "rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'localhost:27017' }] })"
+          for i in $(seq 1 60); do
+            [ "$(docker exec ci-mongo mongosh --quiet --eval 'db.hello().isWritablePrimary')" = "true" ] && break
+            sleep 2
+          done
+          docker exec ci-mongo mongosh --quiet --eval 'printjson({ primary: db.hello().isWritablePrimary, setName: db.hello().setName })'
+          docker exec ci-redis redis-cli ping
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Test with coverage
+        run: |
+          go test -count=1 -p 1 -timeout 30m -covermode=atomic -coverprofile=coverage.out ./... 2>&1 | tee test-output.txt
+
+      - name: Coverage report
+        if: always()
+        run: |
+          if [ ! -f coverage.out ]; then echo "no coverage profile"; exit 0; fi
+          go tool cover -func=coverage.out > coverage-func.txt
+          total=$(tail -n 1 coverage-func.txt | awk '{print $NF}')
+          {
+            echo "## Go tests and coverage"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\` (${GITHUB_REF_NAME})"
+            echo
+            echo "Total statement coverage: **${total}**"
+            echo
+            echo "| Package | Result | Coverage |"
+            echo "|---|---|---|"
+            grep -E '^(ok|FAIL|---|\?)[[:space:]]' test-output.txt | grep -E '^(ok|FAIL)[[:space:]]' |
+              awk '{ cov = "-"; for (i = 1; i <= NF; i++) if ($i == "coverage:") { cov = $(i + 1); if (cov ~ /^\[/) cov = "no statements" } print "| " $2 " | " $1 " | " cov " |" }'
+            echo
+            echo "Per-function figures (\`go tool cover -func\`) are in the coverage artifact."
+          } > coverage-summary.md
+          cat coverage-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage-${{ github.sha }}
+          path: |
+            server-go/coverage.out
+            server-go/coverage-func.txt
+            server-go/coverage-summary.md
+            server-go/test-output.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+  web:
+    name: Web client and admin console (typecheck, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install (root workspace with client and admin)
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck client
+        run: npm run typecheck --workspace client
+
+      - name: Typecheck admin
+        run: npm run typecheck --workspace admin
+
+      - name: Test client
+        run: npm run test --workspace client
+
+      - name: Test admin
+        run: npm run test --workspace admin
+
+  mobile:
+    name: Android app (typecheck, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      # mobile/ is not part of the root npm workspace (mobile/README.md).
+      - name: Install
+        run: npm ci --workspaces=false --no-audit --no-fund
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npx vitest run

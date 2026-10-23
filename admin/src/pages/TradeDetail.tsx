@@ -7,7 +7,9 @@ import { ApiRequestError } from '../services/http';
 import { useAuthStore } from '../stores/authStore';
 import { toast } from '../hooks/useToast';
 import { formatDateTime, formatMoney, formatPrice, formatSignedMoney } from '../utils/format';
+import { isVoided, VOID_LABEL } from '../utils/tradeStatus';
 import { Badge, Panel, PanelHeader, Skeleton, StatusBadge } from '../components/ui';
+import type { PricingComponents } from '../types/api';
 
 /** Full trade record, including the terms it was accepted under. */
 export function TradeDetailPage() {
@@ -51,7 +53,7 @@ export function TradeDetailPage() {
             <p className="font-mono text-[11px] text-content-400">{trade.reference}</p>
           </div>
           <div className="ml-auto flex items-center gap-3">
-            <StatusBadge status={trade.status} />
+            {isVoided(trade) ? <Badge tone="warn">{VOID_LABEL}</Badge> : <StatusBadge status={trade.status} />}
             <span
               className={
                 'text-lg font-bold tnum ' +
@@ -77,7 +79,10 @@ export function TradeDetailPage() {
           <Field label="Entry time" value={formatDateTime(trade.entryTimestamp)} />
           <Field label="Expiry time" value={formatDateTime(trade.expiryTimestamp)} />
           <Field label="Settled at" value={trade.settledAt ? formatDateTime(trade.settledAt) : '--'} />
-          <Field label="Result" value={trade.result ?? '--'} />
+          <Field label="Result" value={isVoided(trade) ? 'Void · stake refunded' : (trade.result ?? '--')} />
+          {isVoided(trade) ? <Field label="Why voided" value={trade.voidReason ?? 'No valid market price at expiry'} /> : null}
+          <Field label="Settlement rule" value={trade.expiryPriceSource ?? '--'} mono />
+          <Field label="Tie rule (frozen)" value={trade.drawPolicy ?? 'policy at settlement'} />
           <Field
             label="Customer settlement"
             value={trade.settlementAmount !== null ? formatSignedMoney(trade.settlementAmount) : '--'}
@@ -85,6 +90,57 @@ export function TradeDetailPage() {
           <Field label="Placed" value={formatDateTime(trade.createdAt)} />
         </dl>
       </Panel>
+
+      {trade.pricing ? (
+        <Panel className="overflow-hidden">
+          <PanelHeader
+            title="Pricing"
+            description={
+              trade.pricing.inline
+                ? 'Priced at acceptance (the app sent no offer)'
+                : 'Accepted on offer ' + trade.pricing.offerId
+            }
+          />
+          <dl className="grid grid-cols-2 gap-px bg-surface-800/60 sm:grid-cols-4">
+            <Field label="Rule version" value={trade.pricing.ruleVersion} mono />
+            <Field label="Mode" value={trade.pricing.mode} />
+            <Field label="Locked payout" value={trade.pricing.payoutPercent + '%'} />
+            <Field
+              label="Displayed payout"
+              value={trade.pricing.displayedPayoutPercent !== null ? trade.pricing.displayedPayoutPercent + '%' : '--'}
+            />
+            <Field label="Offer reference" value={formatPrice(trade.pricing.referencePrice, 5)} mono />
+            <Field label="Mid at acceptance" value={formatPrice(trade.pricing.acceptMid, 5)} mono />
+            <Field label="Slippage" value={trade.pricing.slippageBps.toFixed(3) + ' bps'} />
+            <Field label="Feed" value={trade.pricing.feedProvider || '--'} />
+            <Field label="Base / min / max" value={terms(trade.pricing.components)} />
+            <Field label="Vol ratio" value={trade.pricing.components.volRatio.toFixed(2)} />
+            <Field label="Spread" value={trade.pricing.components.spreadBps.toFixed(3) + ' bps'} />
+            <Field label="Expiry factor" value={String(trade.pricing.components.expiryFactor)} />
+            <Field label="Vol adj" value={points(trade.pricing.components.volAdj)} />
+            <Field label="Spread adj" value={points(trade.pricing.components.spreadAdj)} />
+            <Field
+              label="Hedge adj"
+              value={
+                points(trade.pricing.components.hedgeAdj + trade.pricing.components.hedgeUnavailableAdj) +
+                (trade.pricing.components.hedgeAvailable ? '' : ' (hedge unavailable)')
+              }
+            />
+            <Field label="Exposure adj" value={points(trade.pricing.components.exposureAdj)} />
+            <Field label="Margin adj" value={points(trade.pricing.components.marginAdj)} />
+            <Field label="Utilisation" value={(trade.pricing.components.utilFinal * 100).toFixed(1) + '%'} />
+            <Field
+              label="Guard"
+              value={
+                trade.pricing.guard.enabled
+                  ? 'model v' + trade.pricing.guard.modelVersion + ', edge ' + (trade.pricing.guard.pointEdge * 100).toFixed(1) + '%'
+                  : 'off'
+              }
+            />
+            <Field label="Guard regime" value={trade.pricing.guard.regime || '--'} />
+          </dl>
+        </Panel>
+      ) : null}
 
       {open && can('trades:cancel') ? (
         <Panel>
@@ -117,6 +173,15 @@ export function TradeDetailPage() {
       ) : null}
     </div>
   );
+}
+
+/** Payout points of a fraction: 0.035 -> "3.50 pts". */
+function points(fraction: number): string {
+  return (fraction * 100).toFixed(2) + ' pts';
+}
+
+function terms(c: PricingComponents): string {
+  return [c.base, c.min, c.max].map((v) => Math.round(v * 1000) / 10 + '%').join(' / ');
 }
 
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {

@@ -18,6 +18,7 @@ import (
 	"binarytrading/internal/platform/redisx"
 	"binarytrading/internal/platform/util"
 	"binarytrading/internal/service/exposure"
+	"binarytrading/internal/service/pricing"
 	"binarytrading/internal/service/riskconfig"
 	"binarytrading/internal/service/settlement"
 	"binarytrading/internal/service/wallets"
@@ -372,6 +373,60 @@ func TestCloseEarlyRefusedWhileTradingHalted(t *testing.T) {
 	_, err := CloseTradeEarly(e.ctx, tr.ID.Hex(), e.userID.Hex())
 	wantCode(t, err, apperr.TradingHalted, 503)
 	e.assertUntouched(tr)
+}
+
+// TestCloseEarlyRefusedWhileSymbolHalted (pricing specification 7.4): a
+// halt on the trade's symbol stops Sell now - it is a new acceptance of a
+// price - while another symbol's halt does not, and an open trade on the
+// halted symbol still settles at expiry.
+func TestCloseEarlyRefusedWhileSymbolHalted(t *testing.T) {
+	e := newECEnv(t)
+	tr := e.trade(util.NowMs() + 120_000)
+	e.market(tr, 100.2, 10, false)
+	if _, _, err := pricing.Halt(e.ctx, tr.Symbol, "exchange outage", e.userID.Hex()); err != nil {
+		t.Fatal(err)
+	}
+	q := e.quote(tr)
+	if q.Available || q.UnavailableReason == nil || *q.UnavailableReason != "Trading on "+tr.Symbol+" is halted" {
+		t.Fatalf("quote during the symbol halt %+v", q)
+	}
+	raw, _ := json.Marshal(issuedQuote{UserID: e.userID.Hex(), Value: q.Value, Price: 100.2, IssuedAt: util.NowMs()})
+	_ = redisx.R().Set(e.ctx, issuedQuoteKey(tr.ID.Hex()), raw, time.Minute).Err()
+	_, err := CloseTradeEarly(e.ctx, tr.ID.Hex(), e.userID.Hex())
+	wantCode(t, err, apperr.TradingHalted, 503)
+	if ae, _ := apperr.As(err); ae == nil || ae.Details.(map[string]any)["reason"] != pricing.CodeSymbolHalted {
+		t.Fatalf("details %v", err)
+	}
+	e.assertUntouched(tr)
+
+	// Another symbol's halt does not stop it.
+	if _, _, err := pricing.Resume(e.ctx, tr.Symbol, e.userID.Hex()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := pricing.Halt(e.ctx, "OTHER/USD", "unrelated", e.userID.Hex()); err != nil {
+		t.Fatal(err)
+	}
+	e.market(tr, 100.2, 10, false)
+	if q := e.quote(tr); !q.Available {
+		t.Fatalf("quote with another symbol halted %+v", q)
+	}
+
+	// Open trades on the halted symbol still settle on their terms.
+	if _, _, err := pricing.Halt(e.ctx, tr.Symbol, "exchange outage", e.userID.Hex()); err != nil {
+		t.Fatal(err)
+	}
+	due := e.trade(util.NowMs() - 3000)
+	a := due.AssetID.Hex()
+	e.writeTick(a, due.Symbol, 101, due.ExpiryTimestamp-10, false)
+	e.writeTick(a, due.Symbol, 101, due.ExpiryTimestamp+10, true)
+	out, err := settlement.SettleTrade(e.ctx, due.ID.Hex(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := findTrade(e.ctx, due.ID.Hex())
+	if out.Status != settlement.StatusSettled || got.Status != models.TradeStatusWon {
+		t.Fatalf("settlement during the halt %+v, trade %s", out, got.Status)
+	}
 }
 
 func TestConcurrentDuplicateClosesMoveMoneyOnce(t *testing.T) {

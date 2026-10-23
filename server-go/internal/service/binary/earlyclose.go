@@ -7,6 +7,7 @@ import (
 
 	"binarytrading/internal/models"
 	"binarytrading/internal/platform/util"
+	"binarytrading/internal/service/pricing"
 )
 
 // Early close valuation (the "Sell now" price).
@@ -37,6 +38,16 @@ type EarlyCloseInput struct {
 	VolatilityPerSecond float64
 	// Platform spread on an early close, percent of the computed value.
 	FeePercent float64
+	// Calibrated correction (audit F-12; models.EarlyCloseCalibrationRow):
+	// the volatility is multiplied by SigmaScale (0 = 1) and raised to at
+	// least MinVolatilityPerSecond, and Stickiness is the probability that a
+	// price which has moved off the entry stays on its side until expiry
+	// (0 = none). MinProbabilityPercent is the lower clamp of P(win)
+	// (0 = 1%). Zero values are the uncorrected formula.
+	SigmaScale             float64
+	MinVolatilityPerSecond float64
+	Stickiness             float64
+	MinProbabilityPercent  float64
 }
 
 type EarlyCloseQuote struct {
@@ -64,10 +75,30 @@ func QuoteEarlyClose(in EarlyCloseInput) EarlyCloseQuote {
 	}
 	inTheMoney := signedMove > 0
 
-	winProbability := clamp(
-		estimateWinProbability(signedMove, in.CurrentPrice, in.SecondsRemaining, in.VolatilityPerSecond),
-		minProbability, maxProbability,
-	)
+	vol := in.VolatilityPerSecond
+	if in.SigmaScale > 0 {
+		vol *= in.SigmaScale
+	}
+	if vol > 0 && in.MinVolatilityPerSecond > vol {
+		vol = in.MinVolatilityPerSecond
+	}
+	winProbability := estimateWinProbability(signedMove, in.CurrentPrice, in.SecondsRemaining, vol)
+	// Stickiness: a price that has moved off the entry mostly stays on that
+	// side over short horizons (the back-test in early-close.md), which a
+	// random walk understates. At the entry, and once expiry is reached,
+	// the probability is left as it is.
+	if s := clamp(in.Stickiness, 0, 1); s > 0 && signedMove != 0 && in.SecondsRemaining > 0 {
+		itm := 0.0
+		if signedMove > 0 {
+			itm = 1
+		}
+		winProbability = s*itm + (1-s)*winProbability
+	}
+	floor := minProbability
+	if in.MinProbabilityPercent > 0 {
+		floor = math.Min(in.MinProbabilityPercent/100, maxProbability)
+	}
+	winProbability = clamp(winProbability, floor, maxProbability)
 
 	fullPayout := float64(in.Stake) * (1 + in.PayoutPercent/100)
 	fee := clamp(in.FeePercent, 0, 100) / 100
@@ -105,6 +136,34 @@ func estimateWinProbability(signedMove, price, secondsRemaining, volatilityPerSe
 	}
 
 	return StandardNormalCdf(signedMove / expectedMove)
+}
+
+// EarlyCloseCorrection returns the calibrated row for a position on symbol
+// with secondsRemaining left and volRatio = sigma / the instrument's
+// baseline volatility (volRatio <= 0 when the baseline is unknown: only rows
+// without a ratio bound apply). Rows for the symbol and rows for any symbol
+// ("") are matched in the order of pricing.SortedEarlyCloseRows; no match
+// gives the identity (scale 1, no floor, stickiness 0). The service turns
+// MinVolRatio into MinVolatilityPerSecond = MinVolRatio x baseline.
+func EarlyCloseCorrection(rows []models.EarlyCloseCalibrationRow, symbol string, secondsRemaining, volRatio float64) models.EarlyCloseCalibrationRow {
+	for _, r := range pricing.SortedEarlyCloseRows(rows) {
+		if r.Symbol != "" && r.Symbol != symbol {
+			continue
+		}
+		if r.MaxSecondsRemaining > 0 && secondsRemaining > float64(r.MaxSecondsRemaining) {
+			continue
+		}
+		if r.MaxVolRatio > 0 && (volRatio <= 0 || volRatio > r.MaxVolRatio) {
+			continue
+		}
+		if r.SigmaScale <= 0 {
+			r.SigmaScale = 1
+		}
+		r.MinVolRatio = math.Max(0, r.MinVolRatio)
+		r.Stickiness = clamp(r.Stickiness, 0, 1)
+		return r
+	}
+	return models.EarlyCloseCalibrationRow{SigmaScale: 1}
 }
 
 // StandardNormalCdf is Phi(z), via the Abramowitz and Stegun 7.1.26

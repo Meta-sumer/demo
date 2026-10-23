@@ -19,7 +19,9 @@ import {
 import { api } from '../services/api';
 import { useAuthStore } from '../stores/authStore';
 import { formatMoney, formatSignedMoney, fromMinor } from '../utils/format';
-import { Panel, PanelHeader, Skeleton, Stat } from '../components/ui';
+import { Badge, Panel, PanelHeader, Skeleton, Stat } from '../components/ui';
+import { StaleBadge, Unavailable } from '../components/freshness';
+import { queryMaxAge } from '../utils/freshness';
 import { useChartPalette } from '../utils/theme-colors';
 
 /**
@@ -37,11 +39,16 @@ import { useChartPalette } from '../utils/theme-colors';
  */
 const CHART_COLORS = ['#6366f1', '#0ea5e9', '#f59e0b', '#ec4899', '#14b8a6', '#a855f7'];
 
+const SUMMARY_REFRESH_MS = 5000;
+// Hedge positions are marked every full hedge pass (15 s); a minute without a
+// mark means the hedge worker or the venue is not keeping up.
+const HEDGE_MARK_MAX_AGE_MS = 60_000;
+
 export function DashboardPage() {
   const summaryQuery = useQuery({
     queryKey: ['dashboard', 'summary'],
     queryFn: api.dashboard.summary,
-    refetchInterval: 5000,
+    refetchInterval: SUMMARY_REFRESH_MS,
   });
   const seriesQuery = useQuery({
     queryKey: ['dashboard', 'series'],
@@ -97,32 +104,37 @@ export function DashboardPage() {
     { name: 'Draws', value: winLoss.draws },
   ].filter((entry) => entry.value > 0);
 
-  const hedgeRatio =
-    summary && Math.abs(summary.currentNetExposure) > 0
-      ? Math.min(100, Math.round((summary.hedgedExposure / Math.abs(summary.currentNetExposure)) * 100))
-      : 0;
+  // Held protection as a share of the policy target (both delta-equivalent).
+  const hedgeTarget = summary?.hedgeTargetNotional ?? 0;
+  const hedgeRatio = summary && hedgeTarget > 0 ? Math.min(100, Math.round((summary.hedgedExposure / hedgeTarget) * 100)) : 0;
+  // A figure that could not be loaded reads "unavailable", never 0.
+  const placeholder = (width: string) =>
+    summaryQuery.isError && !summary ? <Unavailable /> : <Skeleton className={'h-6 ' + width} />;
+  const summaryStale = (
+    <StaleBadge asOf={summaryQuery.dataUpdatedAt || null} maxAgeMs={queryMaxAge(SUMMARY_REFRESH_MS)} />
+  );
 
   return (
     <div className="space-y-4">
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Stat
           label="Total users"
-          value={summary ? summary.totalUsers.toLocaleString('en-IN') : <Skeleton className="h-6 w-16" />}
-          hint={summary ? summary.activeUsers + ' active today' : undefined}
+          value={summary ? summary.totalUsers.toLocaleString('en-IN') : placeholder('w-16')}
+          hint={summary ? <>{summary.activeUsers + ' active today'}{summaryStale}</> : undefined}
         />
         <Stat
           label="Open trades"
-          value={summary ? summary.openTrades.toLocaleString('en-IN') : <Skeleton className="h-6 w-16" />}
+          value={summary ? summary.openTrades.toLocaleString('en-IN') : placeholder('w-16')}
           hint={summary ? summary.todayTrades + ' placed today' : undefined}
         />
         <Stat
           label="Today's volume"
-          value={summary ? formatMoney(summary.todayVolume) : <Skeleton className="h-6 w-24" />}
+          value={summary ? formatMoney(summary.todayVolume) : placeholder('w-24')}
         />
         {seePnl ? (
           <Stat
             label="Today's P&L"
-            value={summary ? formatSignedMoney(summary.todayPlatformResult) : <Skeleton className="h-6 w-24" />}
+            value={summary ? formatSignedMoney(summary.todayPlatformResult) : placeholder('w-24')}
             tone={summary ? (summary.todayPlatformResult >= 0 ? 'up' : 'down') : 'neutral'}
             hint="Platform gross result"
           />
@@ -132,26 +144,40 @@ export function DashboardPage() {
           <>
             <Stat
               label="Current exposure"
-              value={summary ? formatMoney(summary.currentExposure) : <Skeleton className="h-6 w-24" />}
+              value={summary ? formatMoney(summary.currentExposure) : placeholder('w-24')}
               hint={summary ? 'Net ' + formatSignedMoney(summary.currentNetExposure) : undefined}
             />
             <Stat
               label="Hedged exposure"
-              value={summary ? formatMoney(summary.hedgedExposure) : <Skeleton className="h-6 w-24" />}
+              value={summary ? formatMoney(summary.hedgedExposure) : placeholder('w-24')}
               tone="accent"
-              hint={hedgeRatio + '% of net exposure'}
+              hint={
+                summary ? (
+                  <>
+                    {hedgeTarget > 0 ? hedgeRatio + '% of target ' + formatMoney(hedgeTarget) : 'No hedge target'}
+                    {summary.hedgeReconcileStatus && summary.hedgeReconcileStatus !== 'OK' ? (
+                      <Badge tone={summary.hedgeReconcileStatus === 'DRIFT' ? 'down' : 'warn'} className="ml-1">
+                        {summary.hedgeReconcileStatus}
+                      </Badge>
+                    ) : null}
+                    {summary.hedgedExposure !== 0 ? (
+                      <StaleBadge asOf={summary.hedgeMarkedAt} maxAgeMs={HEDGE_MARK_MAX_AGE_MS} label="mark" />
+                    ) : null}
+                  </>
+                ) : undefined
+              }
             />
             <Stat
               label="Unhedged exposure"
-              value={summary ? formatMoney(summary.unhedgedExposure) : <Skeleton className="h-6 w-24" />}
+              value={summary ? formatMoney(summary.unhedgedExposure) : placeholder('w-24')}
               tone={summary && summary.unhedgedExposure > 0 ? 'warn' : 'neutral'}
-              hint={summary ? 'Liability ' + formatMoney(summary.potentialLiability) : undefined}
+              hint={summary ? 'Target minus held; liability ' + formatMoney(summary.potentialLiability) : undefined}
             />
           </>
         ) : null}
         <Stat
           label="Feed latency"
-          value={summary ? summary.feedLatencyP50 + ' ms' : <Skeleton className="h-6 w-16" />}
+          value={summary ? summary.feedLatencyP50 + ' ms' : placeholder('w-16')}
           tone={summary && summary.feedLatencyP95 > 300 ? 'warn' : 'up'}
           hint={summary ? 'p95 ' + summary.feedLatencyP95 + 'ms / p99 ' + summary.feedLatencyP99 + 'ms' : undefined}
         />
@@ -280,27 +306,27 @@ export function DashboardPage() {
         {seePnl ? (
           <Stat
             label="Customer balances"
-            value={summary ? formatMoney(summary.totalCustomerBalance) : <Skeleton className="h-6 w-24" />}
+            value={summary ? formatMoney(summary.totalCustomerBalance) : placeholder('w-24')}
             hint={summary ? formatMoney(summary.totalLockedBalance) + ' locked' : undefined}
           />
         ) : null}
         {seeDeposits ? (
           <Stat
             label="Pending deposits"
-            value={summary ? summary.pendingDeposits : <Skeleton className="h-6 w-10" />}
+            value={summary ? summary.pendingDeposits : placeholder('w-10')}
             tone={summary && summary.pendingDeposits > 0 ? 'warn' : 'neutral'}
           />
         ) : null}
         {seeWithdrawals ? (
           <Stat
             label="Pending withdrawals"
-            value={summary ? summary.pendingWithdrawals : <Skeleton className="h-6 w-10" />}
+            value={summary ? summary.pendingWithdrawals : placeholder('w-10')}
             tone={summary && summary.pendingWithdrawals > 0 ? 'warn' : 'neutral'}
           />
         ) : null}
         <Stat
           label="Trade acceptance p95"
-          value={summary ? summary.tradeAcceptanceP95 + ' ms' : <Skeleton className="h-6 w-16" />}
+          value={summary ? summary.tradeAcceptanceP95 + ' ms' : placeholder('w-16')}
           hint={summary ? summary.activeAssets + ' active assets' : undefined}
         />
       </div>

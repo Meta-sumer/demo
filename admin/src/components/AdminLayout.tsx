@@ -6,6 +6,7 @@ import {
   ArrowDownToLine,
   ArrowUpFromLine,
   BarChart3,
+  BellRing,
   CandlestickChart,
   CircleDollarSign,
   Coins,
@@ -101,6 +102,7 @@ const NAV_GROUPS: Array<{ title: string; items: NavItem[] }> = [
     title: 'Governance',
     items: [
       { to: '/admin/reconciliation', label: 'Reconciliation', icon: FileClock, permission: 'reconciliation:read' },
+      { to: '/admin/alerts', label: 'Alerts', icon: BellRing, permission: 'reconciliation:read' },
       { to: '/admin/audit-logs', label: 'Audit log', icon: ScrollText, permission: 'audit:read' },
       { to: '/admin/settings', label: 'Settings', icon: Settings, permission: 'risk:read' },
       { to: '/admin/security', label: 'Security', icon: KeyRound },

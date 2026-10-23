@@ -106,6 +106,8 @@ const (
 	RuleExpiryLiability   = "EXPIRY_LIABILITY"
 	RuleAssetLiability    = "ASSET_LIABILITY"
 	RulePlatformLiability = "PLATFORM_LIABILITY"
+	// Pricing specification 7.2: L(side) <= max_exposure for the symbol.
+	RuleSideLiability = "SIDE_LIABILITY"
 )
 
 // ReserveLimits are the ceilings in force for one trade. Liability limits of
@@ -119,6 +121,9 @@ type ReserveLimits struct {
 	ExpiryLiability      int64
 	AssetLiability       int64
 	PlatformLiability    int64
+	// The pricing rule's max_exposure for the asset (0 = off): the trade's
+	// side may not lose more than this if it wins.
+	SideLiability int64
 }
 
 type ReserveInput struct {
@@ -173,7 +178,7 @@ func Reserve(ctx context.Context, in ReserveInput) (*Reservation, ReserveOutcome
 		BookNamespace(), in.TradeID, in.AssetID, in.UserID, dirArg(in.Direction), in.Stake, in.Profit,
 		bucket, in.Symbol, deadline, nowArg(),
 		l.UserExposure, l.AssetGross, l.AssetNet, l.PlatformGross, l.ConcentrationPercent,
-		l.ExpiryLiability, l.AssetLiability, l.PlatformLiability,
+		l.ExpiryLiability, l.AssetLiability, l.PlatformLiability, l.SideLiability,
 	).Slice()
 	if err != nil {
 		return nil, ReserveOutcome{}, err
@@ -302,6 +307,42 @@ const (
 // commit is ignored.
 func CloseTrade(ctx context.Context, tradeID, userID string) (string, error) {
 	return closeScript.Run(ctx, redisx.R(), nil, BookNamespace(), tradeID, userID, nowArg()).Text()
+}
+
+// Release results beyond CloseClosed and CloseMissing.
+const (
+	// A legacy record (counted before records were keyed by trade id) was
+	// released in the trade's place.
+	ReleaseLegacy = "legacy"
+	// The trade id had already been released: nothing changed.
+	ReleaseDone = "done"
+)
+
+// ReleaseTrade releases a finished trade's exposure (settlement, early
+// close, cancellation) by its trade id - the key its reservation and commit
+// used - so the release is exactly once even if two open trades share every
+// field. A release that arrives before the commit leaves a tombstone (the
+// late commit is ignored). A trade the book still counts under an anonymous
+// legacy record is released through that record (see closeIDScript).
+func ReleaseTrade(ctx context.Context, t OpenTrade) (string, error) {
+	res, err := closeIDScript.Run(ctx, redisx.R(), nil,
+		BookNamespace(), t.TradeID, t.UserID, t.AssetID, dirArg(t.Direction), t.Stake, t.Profit,
+		BucketOf(t.ExpiryTimestamp), nowArg()).Slice()
+	if err != nil {
+		return "", err
+	}
+	parts := strs(res)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("exposure: empty release reply")
+	}
+	switch parts[0] {
+	case ReleaseLegacy:
+		metrics.IncrementCounter("exposure.release_legacy", 1, 0)
+		logx.Info("exposure released through a legacy record", "tradeId", t.TradeID, "record", strings.Join(parts[1:], ""))
+	case CloseMissing:
+		logx.Debug("exposure release found no record; tombstoned", "tradeId", t.TradeID)
+	}
+	return parts[0], nil
 }
 
 // closeByMatch serves callers that release without a trade id.

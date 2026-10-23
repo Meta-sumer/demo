@@ -214,12 +214,22 @@ type Summary struct {
 	ByNetwork    []NetworkSummary  `json:"byNetwork"`
 	WalletTotals WalletTotals      `json:"walletTotals"`
 	Provider     ProviderSummary   `json:"provider"`
+	// Additions: no real money can move (mock or test key).
+	Sandbox bool `json:"sandbox"`
+	// Withdrawals above this wait for an operator; 0 = every one does.
+	ReviewAbove              int64        `json:"reviewAbove"`
+	TransferToTradingEnabled bool         `json:"transferToTradingEnabled"`
+	Alerts                   AlertSummary `json:"alerts"`
 }
 
 func GetSummary(ctx context.Context) (Summary, error) {
-	s := Summary{Enabled: Enabled(), ByNetwork: []NetworkSummary{}}
+	s := Summary{Enabled: Enabled(), ByNetwork: []NetworkSummary{}, Sandbox: Sandbox(), ReviewAbove: reviewAbove(),
+		TransferToTradingEnabled: Enabled() && TransferToTradingEnabled()}
 	dc := depositsColl()
 	var err error
+	if s.Alerts, err = alertSummary(ctx); err != nil {
+		return s, err
+	}
 	if s.Deposits.Count, err = dc.CountDocuments(ctx, bson.M{}); err != nil {
 		return s, err
 	}

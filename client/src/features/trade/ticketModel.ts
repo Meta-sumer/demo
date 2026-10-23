@@ -1,5 +1,6 @@
 import { formatExpiry, formatMoney, toMinor } from '../../utils/format';
 import type { AccountType, Asset, PayoutConfig, Trade } from '../../types/api';
+import { unpricedReason } from './livePayout';
 
 /**
  * The trade ticket's rules, without React.
@@ -42,7 +43,9 @@ export function durationLabel(seconds: number): string {
  * hiding it would make the set of durations change from asset to asset for
  * no reason the trader can see.
  */
-export function durationChips(asset: Pick<Asset, 'supportedExpiries' | 'payouts'> | null): DurationChip[] {
+export function durationChips(
+  asset: (Pick<Asset, 'supportedExpiries' | 'payouts'> & Partial<Pick<Asset, 'pricing'>>) | null,
+): DurationChip[] {
   if (!asset) return [];
   return [...asset.supportedExpiries]
     .sort((a, b) => a - b)
@@ -52,7 +55,8 @@ export function durationChips(asset: Pick<Asset, 'supportedExpiries' | 'payouts'
         seconds,
         label: durationLabel(seconds),
         payoutPercent: payout ? payout.payoutPercent : null,
-        unavailableReason: payout ? null : 'No payout for ' + durationLabel(seconds),
+        // The pricing engine says why, when it cannot price the duration.
+        unavailableReason: payout ? null : (unpricedReason(asset, seconds) ?? 'No payout for ' + durationLabel(seconds)),
       };
     });
 }

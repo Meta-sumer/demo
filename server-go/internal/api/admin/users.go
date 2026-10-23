@@ -162,9 +162,10 @@ func adjustWallet(w http.ResponseWriter, r *http.Request) error {
 	amountF, _ := b.reqNum("amount", numRule{Int: true, Positive: true, Max: f(1_000_000_000_000)})
 	direction, _ := b.reqEnum("direction", "CREDIT", "DEBIT")
 	reason, _ := b.reqStr("reason", 3, 500)
-	// LIVE unless the admin names the DEMO account.
+	// LIVE unless the admin names the DEMO account or the FUNDING (USDT)
+	// wallet; a FUNDING amount is micro-USDT.
 	account := models.AccountLive
-	if s := b.optEnum("accountType", models.AccountTypeValues...); s != nil {
+	if s := b.optEnum("accountType", models.AccountLive, models.AccountDemo, models.AccountFunding); s != nil {
 		account = *s
 	}
 	if err := b.err(); err != nil {
@@ -177,8 +178,14 @@ func adjustWallet(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	amount := int64(amountF)
-	if account == models.AccountDemo {
+	switch account {
+	case models.AccountDemo:
 		if _, err := wallets.EnsureDemoWallet(r.Context(), id.Hex()); err != nil {
+			return err
+		}
+	case models.AccountFunding:
+		// A customer who never used USDT has no FUNDING wallet yet.
+		if _, err := wallets.GetOrCreateWallet(r.Context(), id.Hex(), models.AccountFunding, models.CurrencyUSDT); err != nil {
 			return err
 		}
 	}
@@ -207,6 +214,7 @@ func adjustWallet(w http.ResponseWriter, r *http.Request) error {
 		{Key: "reference", Value: res.Reference},
 		{Key: "direction", Value: direction},
 		{Key: "accountType", Value: account},
+		{Key: "currency", Value: res.Wallet.Currency},
 		{Key: "amount", Value: amount},
 		{Key: "reason", Value: reason},
 		{Key: "balanceAfter", Value: res.Wallet.Balance},

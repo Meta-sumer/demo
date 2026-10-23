@@ -1,17 +1,21 @@
-// Package hedging is the dynamic hedging engine (spec sections 14, 15).
+// Package hedging is the hedging engine: Binance USDⓈ-M perpetual futures
+// against the platform's short binary book (docs/audit/hedging/).
 //
-// The engine works on ONE input: the platform's aggregate net exposure per
-// asset. It has no access to individual trades, and nothing it does can change
-// a customer's result - settlement never reads a hedge order (rule 8).
+// Inputs are aggregate only - the open book of an asset, its price and
+// volatility - and nothing here can change a customer's result: settlement
+// never reads a hedge order (rule 8). Every order stores every input of the
+// decision that produced it, so it can be replayed (ReplayDecision, rule 9).
 //
-// Every order records the decision inputs that produced it, so any hedge can be
-// replayed against the risk configuration that was live at the time (rule 9).
+//	risk.ComputeHedgeTarget   book delta -> capped INR target   (risk/hedgetarget.go)
+//	PlanExecution             target -> venue quantity          (execution.go)
+//	send / RefreshOrder       order state machine               (lifecycle.go)
+//	recordFills / RefoldPosition  fills ledger -> position, P&L (ledger.go)
+//	ReconcilePositions        ledger vs venue positions         (reconcile.go)
+//	CostEstimate              cost and availability for pricing (cost.go)
 package hedging
 
 import (
 	"context"
-	"strconv"
-	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -19,367 +23,286 @@ import (
 	"binarytrading/internal/config"
 	"binarytrading/internal/models"
 	"binarytrading/internal/platform/apperr"
+	"binarytrading/internal/platform/iso"
 	"binarytrading/internal/platform/logx"
 	"binarytrading/internal/platform/mongox"
 	"binarytrading/internal/platform/util"
-	"binarytrading/internal/platform/ws"
 	"binarytrading/internal/service/assets"
 	"binarytrading/internal/service/hedging/providers"
-	"binarytrading/internal/service/marketdata"
-	"binarytrading/internal/service/metrics"
 	"binarytrading/internal/service/risk"
 	"binarytrading/internal/service/riskconfig"
 )
 
-type HedgeAdjustment struct {
-	Side                  providers.HedgeSide `json:"side"`
-	Notional              int64               `json:"notional"`
-	TargetSignedNotional  int64               `json:"targetSignedNotional"`
-	CurrentSignedNotional int64               `json:"currentSignedNotional"`
-}
-
-// ComputeHedgeAdjustment is the pure sizing step.
-//
-// The platform is short the market when the book leans UP (it pays out if the
-// price rises), so it hedges by going long, and vice versa. The order is only
-// the difference between where the hedge should be and where it already is.
-func ComputeHedgeAdjustment(netExposure, targetHedgeNotional, currentSignedNotional, minHedgeNotional int64) *HedgeAdjustment {
-	var direction int64
-	switch {
-	case netExposure > 0:
-		direction = 1
-	case netExposure < 0:
-		direction = -1
-	}
-	targetSigned := direction * targetHedgeNotional
-	delta := targetSigned - currentSignedNotional
-	abs := delta
-	if abs < 0 {
-		abs = -abs
-	}
-	if abs < minHedgeNotional {
-		return nil
-	}
-	side := providers.SideSell
-	if delta > 0 {
-		side = providers.SideBuy
-	}
-	return &HedgeAdjustment{
-		Side:                  side,
-		Notional:              abs,
-		TargetSignedNotional:  targetSigned,
-		CurrentSignedNotional: currentSignedNotional,
+func init() {
+	// The risk assessment names an unavailable hedge among its reasons.
+	risk.HedgeAvailability = func(ctx context.Context, assetID string) (bool, string) {
+		c, err := CostEstimate(ctx, assetID, 0)
+		if err != nil {
+			return false, ReasonVenueUnavail
+		}
+		return c.Available, c.Reason
 	}
 }
 
+func maxOrderUSDT() float64 {
+	if config.E != nil {
+		return config.E.HedgeMaxOrderUSDT
+	}
+	return 50_000
+}
+
+// HedgeEvaluation is the outcome of one evaluation.
 type HedgeEvaluation struct {
-	AssetID               string                `json:"assetId"`
-	Symbol                string                `json:"symbol"`
-	Assessment            models.RiskAssessment `json:"assessment"`
-	CurrentSignedNotional int64                 `json:"currentSignedNotional"`
-	Adjustment            *HedgeAdjustment      `json:"adjustment"`
-	Order                 *models.HedgeOrder    `json:"order"`
-	SkippedReason         string                `json:"skippedReason,omitempty"`
+	AssetID       string                `json:"assetId"`
+	Symbol        string                `json:"symbol"`
+	VenueSymbol   string                `json:"venueSymbol"`
+	Assessment    models.RiskAssessment `json:"assessment"`
+	Plan          *Plan                 `json:"plan"`
+	Order         *models.HedgeOrder    `json:"order"`
+	SkippedReason string                `json:"skippedReason,omitempty"`
 }
 
+// EvaluateAndHedge decides and, when the plan has an executable quantity,
+// places one order.
 func EvaluateAndHedge(ctx context.Context, assetID string) (*HedgeEvaluation, error) {
 	asset, err := assets.RequireAssetDoc(ctx, assetID)
 	if err != nil {
 		return nil, err
 	}
-	assessment, err := risk.AssessAsset(ctx, assetID)
+	ev := &HedgeEvaluation{AssetID: assetID, Symbol: asset.Symbol}
+	venueSymbol := config.E.HedgeVenueSymbol(asset.Symbol)
+	ev.VenueSymbol = venueSymbol
+	if venueSymbol == "" {
+		ev.SkippedReason = "not a hedgeable asset (HEDGE_SYMBOLS)"
+		return ev, nil
+	}
+	rememberVenueSymbol(venueSymbol, assetID)
+	v := venue()
+
+	// One working order per asset: settle it before deciding again.
+	if w, err := findWorkingOrderFor(ctx, asset.ID); err != nil {
+		return nil, err
+	} else if w != nil {
+		if w, err = RefreshOrder(ctx, v, w); err != nil {
+			logx.Warn("could not refresh working hedge order", "reference", w.Reference, "err", err.Error())
+		}
+		if w != nil && w.Working() {
+			ev.Order, ev.SkippedReason = w, "an order is still working"
+			return ev, nil
+		}
+	}
+
+	assessment, inputs, err := risk.AssessAssetDetailed(ctx, assetID)
 	if err != nil {
 		return nil, err
 	}
-	currentSigned, err := GetSignedHedgeNotional(ctx, assetID)
+	ev.Assessment = assessment
+	switch {
+	case !asset.HedgeEnabled:
+		ev.SkippedReason = "hedging disabled for this asset"
+		return ev, nil
+	case inputs.FeedStatus == models.FeedStatusStale || inputs.FeedStatus == models.FeedStatusOffline:
+		ev.SkippedReason = "market data feed is " + string(inputs.FeedStatus)
+		return ev, nil
+	}
+	if err := v.CanTrade(); err != nil {
+		ev.SkippedReason = "venue cannot trade: " + errMessage(err)
+		return ev, nil
+	}
+	fx, err := CurrentFX(ctx)
 	if err != nil {
 		return nil, err
 	}
+	target := int64(0)
+	if assessment.HedgeTarget != nil {
+		target = assessment.HedgeTarget.TargetSigned
+	}
+	if !fx.Usable() {
+		if target != 0 {
+			raiseAlert(ctx, hedgeAlert{Code: models.HedgeAlertFxStale, Subject: "rate", Severity: models.AlertCritical,
+				Message: "Hedging stopped: the INR per USDT rate is " + fx.Reason() + "; set a fresh rate on the Hedging page",
+				Details: map[string]any{"rate": fx.Rate, "asOf": fx.AsOf, "ageMs": fx.AgeMs, "maxAgeMs": fx.MaxAgeMs}})
+		}
+		ev.SkippedReason = "INR rate unusable: " + fx.Reason()
+		return ev, nil
+	}
+	clearAlert(ctx, models.HedgeAlertFxStale, "rate")
+
+	snap, err := GetVenueSnapshot(ctx, venueSymbol)
+	if err != nil {
+		return nil, err
+	}
+	if snap == nil || !snap.OK || util.NowMs()-snap.UpdatedAt > venueMaxAge() {
+		fresh := RefreshVenueSnapshot(ctx, v, venueSymbol)
+		snap = &fresh
+	}
+	if !snap.OK {
+		ev.SkippedReason = "venue unavailable: " + snap.Error
+		return ev, nil
+	}
+
+	pos, err := GetPosition(ctx, asset.ID)
+	if err != nil {
+		return nil, err
+	}
+	var posQty int64
+	if pos != nil {
+		posQty = pos.QtyE8
+	}
+	plan := PlanExecution(target, posQty, snap.Mid(), fx.Rate, snap.Rules, maxOrderUSDT(), asset.MinHedgeNotional)
+	ev.Plan = &plan
+	if plan.ExecutableQtyE8 == 0 {
+		ev.SkippedReason = plan.Reason
+		return ev, nil
+	}
+
 	cfg, err := riskconfig.GetRiskConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
+	cost, _, _ := ComputeCostBps(*snap, DefaultHoldSeconds,
+		envFloat(func(e *config.Env) float64 { return e.HedgeTakerFeeBps }, 5),
+		envFloat(func(e *config.Env) float64 { return e.HedgeSlippageBps }, 2),
+		envFloat(func(e *config.Env) float64 { return e.HedgeFallbackSpreadBps }, 1))
+	decision := buildDecision(assessment, inputs, cfg.Version, *snap, fx, plan, asset.MinHedgeNotional, cost, pos)
 
-	ev := &HedgeEvaluation{
-		AssetID:               assetID,
-		Symbol:                asset.Symbol,
-		Assessment:            assessment,
-		CurrentSignedNotional: currentSigned,
+	side := models.DirectionUp
+	if plan.Side == providers.SideSell {
+		side = models.DirectionDown
 	}
-
-	if !asset.HedgeEnabled {
-		ev.SkippedReason = "hedging disabled for this asset"
-		return ev, nil
+	id := bson.NewObjectID()
+	clientID := newClientOrderID(id)
+	mid := snap.Mid()
+	slot := asset.ID.Hex()
+	intent := &models.HedgeOrder{
+		ID: id, Reference: util.Reference("HDG"), AssetID: asset.ID, Symbol: asset.Symbol,
+		Provider: v.Name(), Venue: v.ID(), VenueSymbol: venueSymbol, ClientOrderID: clientID,
+		Side: side, ReduceOnly: plan.ReduceOnly, TargetQtyE8: plan.ExecutableQtyE8,
+		RequestedNotional: NotionalForQty(plan.ExecutableQtyE8, mid, fx.Rate), RequestPrice: &mid,
+		Status: models.HedgeOrderStatusPending, Decision: decision, WorkingSlot: &slot, IdempotencyKey: clientID,
 	}
-
-	adj := ComputeHedgeAdjustment(assessment.NetExposure, assessment.TargetHedgeNotional, currentSigned, asset.MinHedgeNotional)
-	if adj == nil {
-		ev.SkippedReason = "hedge already within tolerance"
-		return ev, nil
-	}
-	ev.Adjustment = adj
-
-	tick, err := marketdata.GetLastTick(ctx, assetID)
+	order, err := CreateHedgeOrder(ctx, intent)
 	if err != nil {
+		if mongox.IsDuplicateKey(err) {
+			ev.SkippedReason = "an order is still working"
+			return ev, nil
+		}
 		return nil, err
 	}
-	if tick == nil {
-		ev.SkippedReason = "no reference price available"
-		return ev, nil
-	}
-
-	// One order per (asset, target, current) state: re-running the evaluation
-	// on unchanged state returns the same order rather than stacking duplicates.
-	idempotencyKey := util.SHA256(strings.Join([]string{
-		assetID, string(adj.Side), strconv.FormatInt(adj.Notional, 10),
-		strconv.FormatInt(adj.TargetSignedNotional, 10), strconv.FormatInt(currentSigned, 10),
-	}, ":"))
-
-	existing, err := FindByIdempotencyKey(ctx, idempotencyKey)
-	if err != nil {
-		return nil, err
-	}
-	if existing != nil {
-		ev.Order = existing
-		ev.SkippedReason = "identical hedge already placed"
-		return ev, nil
-	}
-
-	order, err := placeHedgeOrder(ctx, placeHedgeInput{
-		asset:                 asset,
-		adjustment:            adj,
-		assessment:            assessment,
-		referencePrice:        tick.Price,
-		idempotencyKey:        idempotencyKey,
-		existingHedgeNotional: absInt(currentSigned),
-		riskConfigVersion:     cfg.Version,
-	})
-	if err != nil {
+	emitHedge(config.EvHedgeCreated, order)
+	if order, err = send(ctx, v, order); err != nil {
 		return nil, err
 	}
 	ev.Order = order
+	logx.Info("hedge order processed", "reference", order.Reference, "symbol", venueSymbol, "side", string(plan.Side),
+		"qty", providers.FormatE8(plan.ExecutableQtyE8), "filled", providers.FormatE8(order.FilledQtyE8),
+		"status", string(order.Status), "venue", v.ID())
 	return ev, nil
 }
 
-type placeHedgeInput struct {
-	asset                 *models.Asset
-	adjustment            *HedgeAdjustment
-	assessment            models.RiskAssessment
-	referencePrice        float64
-	idempotencyKey        string
-	existingHedgeNotional int64
-	riskConfigVersion     int64
+func buildDecision(a models.RiskAssessment, in risk.RiskInputs, cfgVersion int64, snap VenueSnapshot, fx FxRate, plan Plan,
+	minHedge int64, cost models.HedgeCostBps, pos *models.HedgePosition) models.HedgeDecisionSnapshot {
+	d := models.HedgeDecisionSnapshot{
+		NetExposureAtDecision:   a.NetExposure,
+		GrossExposureAtDecision: a.GrossExposure,
+		UtilisationPercent:      a.UtilisationPercent,
+		RiskLevel:               a.Level,
+		HedgeLevel:              string(a.HedgeDecision),
+		TargetHedgeRatio:        a.TargetHedgeRatio,
+		TargetHedgeNotional:     a.TargetHedgeNotional,
+		RiskConfigVersion:       cfgVersion,
+		Volatility:              in.Volatility,
+		VenuePrice:              snap.Mid(),
+		InrPerUsdt:              fx.Rate,
+		FxAsOf:                  fx.AsOf,
+		TargetQtyE8:             plan.TargetQtyE8,
+		PositionQtyE8:           plan.PositionQtyE8,
+		OrderQtyE8:              plan.OrderQtyE8,
+		ExecutableQtyE8:         plan.ExecutableQtyE8,
+		ResidualQtyE8:           plan.ResidualQtyE8,
+		Rules:                   snap.Rules,
+		MinHedgeNotional:        minHedge,
+		MaxOrderUSDT:            maxOrderUSDT(),
+		EstimatedCost:           cost,
+		Legs:                    []models.HedgeLeg{},
+	}
+	if in.SecondsToNearestExpiry != nil {
+		s := float64(*in.SecondsToNearestExpiry)
+		d.SecondsToNearestExpiry = &s
+	}
+	if a.HedgeTarget != nil {
+		d.Target = *a.HedgeTarget
+	}
+	if pos != nil {
+		d.ExistingHedgeNotional = NotionalForQty(absI(pos.QtyE8), snap.Mid(), fx.Rate)
+	}
+	if in.HedgeBook != nil {
+		legs := in.HedgeBook.Legs
+		d.LegsCount = int64(len(legs))
+		if len(legs) > models.MaxDecisionLegs {
+			legs, d.LegsTruncated = legs[:models.MaxDecisionLegs], true
+		}
+		d.Legs = append(d.Legs, legs...)
+	}
+	return d
 }
 
-func emitHedge(event string, o *models.HedgeOrder) {
-	ws.Emit([]string{config.ChAdminRisk}, event, models.ToHedgeView(o))
+// Replay is a decision recomputed from its stored inputs.
+type Replay struct {
+	BookDelta    int64 `json:"bookDelta"`
+	TargetSigned int64 `json:"targetSigned"`
+	Plan         Plan  `json:"plan"`
+	// Exact is false when the stored legs were truncated.
+	Exact bool `json:"exact"`
 }
 
-func placeHedgeOrder(ctx context.Context, in placeHedgeInput) (*models.HedgeOrder, error) {
-	provider := providers.GetHedgeProvider()
-	orderReference := util.Reference("HDG")
-	side := models.DirectionDown
-	if in.adjustment.Side == providers.SideBuy {
-		side = models.DirectionUp
+// ReplayDecision recomputes the target and the order from a stored decision
+// alone (no live data): the audit check that a hedge is reproducible.
+func ReplayDecision(d models.HedgeDecisionSnapshot) Replay {
+	t := d.Target
+	delta, _, _ := risk.BookDelta(d.Legs, t.ReferencePrice, t.Sigma, t.DecidedAt, t.GammaWindowSeconds)
+	bookDelta := int64(util.RoundHalfUp(delta))
+	h := risk.HedgeRatioFor(&models.HedgeLevel{HedgeRatio: t.BandRatio}, t.VolatilityBoost, t.AssetCeiling)
+	target, _, _ := risk.CapTarget(h*float64(bookDelta), t.MaxHedgeNotional, t.LiabilityMultiple, t.ExpiryLiability)
+	if t.Reason != "" {
+		target = 0
 	}
-	requestPrice := in.referencePrice
-
-	// Persist the intent before the network call, so an order that is sent but
-	// whose response is lost is still visible and reconcilable.
-	order, err := CreateHedgeOrder(ctx, &models.HedgeOrder{
-		Reference:         orderReference,
-		AssetID:           in.asset.ID,
-		Symbol:            in.asset.Symbol,
-		Provider:          provider.Name(),
-		Side:              side,
-		RequestedNotional: in.adjustment.Notional,
-		FilledNotional:    0,
-		RequestPrice:      &requestPrice,
-		Status:            models.HedgeOrderStatusPending,
-		Decision: models.HedgeDecisionSnapshot{
-			NetExposureAtDecision:   in.assessment.NetExposure,
-			GrossExposureAtDecision: in.assessment.GrossExposure,
-			UtilisationPercent:      in.assessment.UtilisationPercent,
-			RiskLevel:               in.assessment.Level,
-			HedgeLevel:              string(in.assessment.HedgeDecision),
-			TargetHedgeRatio:        in.assessment.TargetHedgeRatio,
-			TargetHedgeNotional:     in.assessment.TargetHedgeNotional,
-			ExistingHedgeNotional:   in.existingHedgeNotional,
-			RiskConfigVersion:       in.riskConfigVersion,
-			Volatility:              0,
-			SecondsToNearestExpiry:  nil,
-		},
-		RealisedPnl:    0,
-		UnrealisedPnl:  0,
-		IdempotencyKey: in.idempotencyKey,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	emitHedge(config.EvHedgeCreated, order)
-
-	startedAt := time.Now()
-	elapsedMs := func() int64 {
-		return int64(util.RoundHalfUp(float64(time.Since(startedAt).Microseconds()) / 1000))
-	}
-	result, err := provider.PlaceOrder(ctx, providers.OrderRequest{
-		Reference:      orderReference,
-		Symbol:         in.asset.Symbol,
-		Side:           in.adjustment.Side,
-		Notional:       in.adjustment.Notional,
-		ReferencePrice: in.referencePrice,
-		IdempotencyKey: in.idempotencyKey,
-	})
-	if err != nil {
-		message := errMessage(err)
-		logx.Error("hedge order failed", "err", err.Error(), "symbol", in.asset.Symbol, "reference", orderReference)
-		updated, uerr := UpdateHedgeOrder(ctx, order.ID, bson.M{
-			"status":           models.HedgeOrderStatusFailed,
-			"error":            message,
-			"requestLatencyMs": elapsedMs(),
-		})
-		if uerr != nil {
-			return nil, uerr
-		}
-		if updated != nil {
-			order = updated
-		}
-		emitHedge(config.EvHedgeUpdated, order)
-		return order, nil
-	}
-
-	requestLatencyMs := elapsedMs()
-	metrics.RecordLatency(config.LatHedgeRequest, float64(requestLatencyMs))
-	if result.Status == providers.StateFilled || result.Status == providers.StatePartiallyFilled {
-		metrics.RecordLatency(config.LatHedgeFill, float64(requestLatencyMs))
-	}
-
-	filled := int64(util.RoundHalfUp(result.FilledNotional))
-	patch := resultPatch(result, filled)
-	patch["requestLatencyMs"] = requestLatencyMs
-	if result.FilledNotional > 0 {
-		patch["fillLatencyMs"] = requestLatencyMs
-	} else {
-		patch["fillLatencyMs"] = nil
-	}
-	updated, err := UpdateHedgeOrder(ctx, order.ID, patch)
-	if err != nil {
-		return nil, err
-	}
-	if updated != nil {
-		order = updated
-	}
-
-	emitHedge(config.EvHedgeUpdated, order)
-
-	logx.Info("hedge order processed",
-		"reference", orderReference, "symbol", in.asset.Symbol, "side", string(in.adjustment.Side),
-		"requested", in.adjustment.Notional, "filled", result.FilledNotional, "status", string(result.Status),
-		"provider", provider.Name())
-
-	return order, nil
+	plan := PlanExecution(target, d.PositionQtyE8, d.VenuePrice, d.InrPerUsdt, d.Rules, d.MaxOrderUSDT, d.MinHedgeNotional)
+	return Replay{BookDelta: bookDelta, TargetSigned: target, Plan: plan, Exact: !d.LegsTruncated}
 }
 
-// resultPatch maps a venue result onto stored fields. Undefined TS keys are
-// dropped by Mongoose, so an empty providerOrderId is not written.
-func resultPatch(r providers.OrderResult, filled int64) bson.M {
-	patch := bson.M{
-		"status":           models.HedgeOrderStatus(r.Status),
-		"filledNotional":   filled,
-		"averageFillPrice": r.AverageFillPrice,
-		"error":            nil,
-	}
-	if r.ProviderOrderID != "" {
-		patch["providerOrderId"] = r.ProviderOrderID
-	}
-	if r.Error != "" {
-		patch["error"] = r.Error
-	}
-	return patch
-}
-
-func errMessage(err error) string {
-	if ae, ok := apperr.As(err); ok {
-		return ae.Message
-	}
-	return err.Error()
-}
-
-// ReconcilePendingHedgeOrders polls the venue for orders that were not
-// immediately final.
-func ReconcilePendingHedgeOrders(ctx context.Context) (int, error) {
-	provider := providers.GetHedgeProvider()
-	pending, err := FindPendingOrders(ctx, 200)
-	if err != nil {
-		return 0, err
-	}
-	updated := 0
-	for i := range pending {
-		order := &pending[i]
-		if order.ProviderOrderID == nil || *order.ProviderOrderID == "" {
-			continue
-		}
-		result, err := provider.GetOrder(ctx, *order.ProviderOrderID)
-		if err != nil {
-			logx.Warn("could not refresh hedge order state", "err", err.Error(), "reference", order.Reference)
-			continue
-		}
-		filled := int64(util.RoundHalfUp(result.FilledNotional))
-		if models.HedgeOrderStatus(result.Status) == order.Status && filled == order.FilledNotional {
-			continue
-		}
-		patch := bson.M{
-			"status":           models.HedgeOrderStatus(result.Status),
-			"filledNotional":   filled,
-			"averageFillPrice": result.AverageFillPrice,
-			"error":            nil,
-		}
-		if result.Error != "" {
-			patch["error"] = result.Error
-		}
-		next, err := UpdateHedgeOrder(ctx, order.ID, patch)
-		if err != nil {
-			logx.Warn("could not refresh hedge order state", "err", err.Error(), "reference", order.Reference)
-			continue
-		}
-		if next != nil {
-			emitHedge(config.EvHedgeUpdated, next)
-			updated++
-		}
-	}
-	return updated, nil
-}
-
-// MarkHedgePositions marks every open hedge leg to market against the latest tick.
+// MarkHedgePositions values every position at the venue mark (paper: the
+// platform price) and the current INR rate.
 func MarkHedgePositions(ctx context.Context) error {
-	items, _, err := ListHedgeOrders(ctx, HedgeOrderQuery{Page: 1, Limit: 500, Status: string(models.HedgeOrderStatusFilled)})
+	cur, err := positions().Find(ctx, bson.M{})
 	if err != nil {
 		return err
 	}
-	for i := range items {
-		o := &items[i]
-		if o.ClosedAt != nil || o.AverageFillPrice == nil || *o.AverageFillPrice == 0 || o.FilledNotional <= 0 {
-			continue
-		}
-		tick, err := marketdata.GetLastTick(ctx, o.AssetID.Hex())
+	var ps []models.HedgePosition
+	if err := cur.All(ctx, &ps); err != nil {
+		return err
+	}
+	fx, err := CurrentFX(ctx)
+	if err != nil {
+		return err
+	}
+	if fx.Missing || !(fx.Rate > 0) {
+		return nil
+	}
+	for i := range ps {
+		snap, err := GetVenueSnapshot(ctx, ps[i].VenueSymbol)
 		if err != nil {
 			return err
 		}
-		if tick == nil {
+		if snap == nil || !snap.OK {
 			continue
 		}
-		avg := *o.AverageFillPrice
-		priceMove := (tick.Price - avg) / avg
-		direction := -1.0
-		if o.Side == models.DirectionUp {
-			direction = 1
+		mark := snap.Mark
+		if !(mark > 0) {
+			mark = snap.Mid()
 		}
-		pnl := int64(util.RoundHalfUp(float64(o.FilledNotional) * priceMove * direction))
-		if pnl != o.UnrealisedPnl {
-			if _, err := UpdateHedgeOrder(ctx, o.ID, bson.M{"unrealisedPnl": pnl}); err != nil {
-				return err
-			}
+		if _, err := markPosition(ctx, &ps[i], mark, fx.Rate); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -388,7 +311,9 @@ func MarkHedgePositions(ctx context.Context) error {
 // ToHedgeView is models.ToHedgeView, re-exported for route handlers.
 func ToHedgeView(o *models.HedgeOrder) models.HedgeOrderView { return models.ToHedgeView(o) }
 
-// HedgeMonitorRow is one line of the live hedging screen (spec section 22).
+// HedgeMonitorRow is one line of the live hedging screen. Money is minor
+// units (INR); signed figures are + long / - short. The first block keeps
+// its earlier meaning where it still has one (see the metric dictionary).
 type HedgeMonitorRow struct {
 	AssetID           string                  `json:"assetId"`
 	Symbol            string                  `json:"symbol"`
@@ -403,10 +328,48 @@ type HedgeMonitorRow struct {
 	FillPrice         *float64                `json:"fillPrice"`
 	HedgePnl          int64                   `json:"hedgePnl"`
 	HedgeEnabled      bool                    `json:"hedgeEnabled"`
+
+	Hedgeable    bool    `json:"hedgeable"`
+	Venue        string  `json:"venue"`
+	VenueSymbol  string  `json:"venueSymbol"`
+	BookDelta    int64   `json:"bookDelta"`
+	TargetSigned int64   `json:"targetSigned"`
+	HedgeRatio   float64 `json:"hedgeRatio"`
+	CappedBy     string  `json:"cappedBy"`
+	TargetReason string  `json:"targetReason"`
+	Sigma        float64 `json:"sigma"`
+	SigmaSource  string  `json:"sigmaSource"`
+	// Filled position (protection held).
+	PositionQty      float64   `json:"positionQty"`
+	PositionNotional int64     `json:"positionNotional"`
+	MarkPrice        float64   `json:"markPrice"`
+	MarkedAt         *iso.Time `json:"markedAt"`
+	// Working orders: contingent, not protection.
+	WorkingQty      float64 `json:"workingQty"`
+	WorkingNotional int64   `json:"workingNotional"`
+	// target - filled position, signed.
+	ResidualNotional int64 `json:"residualNotional"`
+	// Execution-based P&L (INR minor units at stored rates).
+	RealisedPnl   int64 `json:"realisedPnl"`
+	Fees          int64 `json:"fees"`
+	Funding       int64 `json:"funding"`
+	UnrealisedPnl int64 `json:"unrealisedPnl"`
+	// Venue reconciliation.
+	ReconcileStatus string    `json:"reconcileStatus"`
+	ReconciledAt    *iso.Time `json:"reconciledAt"`
+	VenueQty        *float64  `json:"venueQty"`
+	DriftQty        float64   `json:"driftQty"`
+	// Cost estimate for the target (round trip) and availability.
+	Available         bool    `json:"available"`
+	UnavailableReason string  `json:"unavailableReason"`
+	Expensive         bool    `json:"expensive"`
+	RoundTripBps      float64 `json:"roundTripBps"`
+	EvaluatedAt       int64   `json:"evaluatedAt"`
 }
 
+// GetHedgeMonitor builds the per-asset monitor.
 func GetHedgeMonitor(ctx context.Context) ([]HedgeMonitorRow, error) {
-	provider := providers.GetHedgeProvider()
+	v := venue()
 	docs, err := assets.ListAssetDocs(ctx, false)
 	if err != nil {
 		return nil, err
@@ -418,80 +381,209 @@ func GetHedgeMonitor(ctx context.Context) ([]HedgeMonitorRow, error) {
 		if err != nil {
 			return nil, err
 		}
-		signed, err := GetSignedHedgeNotional(ctx, assetID)
+		row := HedgeMonitorRow{
+			AssetID: assetID, Symbol: asset.Symbol, NetExposure: assessment.NetExposure,
+			TargetHedge: assessment.TargetHedgeNotional, RiskLevel: assessment.Level, HedgeDecision: assessment.HedgeDecision,
+			Provider: v.Name(), Venue: v.ID(), OrderStatus: models.HedgeOrderStatusNotRequired, HedgeEnabled: asset.HedgeEnabled,
+			VenueSymbol: config.E.HedgeVenueSymbol(asset.Symbol), ReconcileStatus: models.HedgeReconNever,
+			EvaluatedAt: assessment.EvaluatedAt,
+		}
+		row.Hedgeable = row.VenueSymbol != ""
+		if h := assessment.HedgeTarget; h != nil {
+			row.BookDelta, row.TargetSigned, row.HedgeRatio = h.BookDelta, h.TargetSigned, h.HedgeRatio
+			row.CappedBy, row.TargetReason, row.Sigma, row.SigmaSource = h.CappedBy, h.Reason, h.Sigma, h.SigmaSource
+		}
+		pos, err := GetPosition(ctx, asset.ID)
 		if err != nil {
 			return nil, err
 		}
+		var signedPos int64
+		if pos != nil {
+			signedPos = sgn(pos.QtyE8) * pos.NotionalInr
+			row.PositionQty, row.PositionNotional, row.CurrentHedge = models.QtyFloat(pos.QtyE8), signedPos, pos.NotionalInr
+			row.MarkPrice, row.MarkedAt = pos.MarkPrice, iso.Ptr(pos.MarkedAt)
+			row.RealisedPnl, row.Fees, row.Funding, row.UnrealisedPnl = pos.RealisedInr, pos.FeesInr, pos.FundingInr, pos.UnrealisedInr
+			row.ReconcileStatus, row.ReconciledAt = pos.ReconcileStatus, iso.Ptr(pos.ReconciledAt)
+			row.DriftQty = models.QtyFloat(pos.DriftE8)
+			if pos.VenueQtyE8 != nil {
+				q := models.QtyFloat(*pos.VenueQtyE8)
+				row.VenueQty = &q
+			}
+			if pos.QtyE8 != 0 {
+				avg := pos.AvgPrice
+				row.FillPrice = &avg
+			}
+			row.HedgePnl = pos.RealisedInr - pos.FeesInr + pos.FundingInr + pos.UnrealisedInr
+		}
+		row.ResidualNotional = row.TargetSigned - signedPos
+		row.RemainingExposure = absI(row.ResidualNotional)
 		latest, _, err := ListHedgeOrders(ctx, HedgeOrderQuery{AssetID: assetID, Page: 1, Limit: 1})
 		if err != nil {
 			return nil, err
 		}
-		row := HedgeMonitorRow{
-			AssetID:           assetID,
-			Symbol:            asset.Symbol,
-			NetExposure:       assessment.NetExposure,
-			TargetHedge:       assessment.TargetHedgeNotional,
-			CurrentHedge:      absInt(signed),
-			RemainingExposure: max(0, absInt(assessment.NetExposure)-absInt(signed)),
-			RiskLevel:         assessment.Level,
-			HedgeDecision:     assessment.HedgeDecision,
-			Provider:          provider.Name(),
-			OrderStatus:       models.HedgeOrderStatusNotRequired,
-			HedgeEnabled:      asset.HedgeEnabled,
-		}
 		if len(latest) > 0 {
-			last := latest[0]
+			last := &latest[0]
 			row.OrderStatus = last.Status
-			row.FillPrice = last.AverageFillPrice
-			row.HedgePnl = last.RealisedPnl + last.UnrealisedPnl
+			if last.Working() {
+				rem := max(0, last.TargetQtyE8-last.FilledQtyE8)
+				if last.Side == models.DirectionDown {
+					rem = -rem
+				}
+				row.WorkingQty = models.QtyFloat(rem)
+				row.WorkingNotional = NotionalForQty(rem, last.Decision.VenuePrice, last.Decision.InrPerUsdt)
+			}
+		}
+		if row.Hedgeable {
+			c, err := CostEstimate(ctx, assetID, row.TargetHedge)
+			if err != nil {
+				return nil, err
+			}
+			row.Available, row.UnavailableReason, row.Expensive, row.RoundTripBps = c.Available, c.Reason, c.Expensive, c.RoundTripBps
+		} else {
+			row.UnavailableReason = ReasonNotHedgeable
 		}
 		rows = append(rows, row)
 	}
 	return rows, nil
 }
 
-func CancelHedgeOrder(ctx context.Context, orderID string) (models.HedgeOrderView, error) {
-	provider := providers.GetHedgeProvider()
-	target, err := FindHedgeOrderByID(ctx, orderID)
-	if err != nil {
-		return models.HedgeOrderView{}, err
-	}
-	if target == nil {
-		return models.HedgeOrderView{}, apperr.NotFoundErr(apperr.NotFound, "Hedge order not found")
-	}
-	if target.Status == models.HedgeOrderStatusFilled || target.Status == models.HedgeOrderStatusCancelled {
-		return models.HedgeOrderView{}, apperr.ConflictErr(apperr.Conflict, "Order is already "+string(target.Status))
-	}
+// VenueStatusView is one symbol's venue snapshot for the admin screen.
+type VenueStatusView struct {
+	Symbol      string  `json:"symbol"`
+	OK          bool    `json:"ok"`
+	Error       string  `json:"error,omitempty"`
+	Mid         float64 `json:"mid"`
+	Mark        float64 `json:"mark"`
+	FundingRate float64 `json:"fundingRate"`
+	TakerFeeBps float64 `json:"takerFeeBps"`
+	UpdatedAt   int64   `json:"updatedAt"`
+	AgeMs       int64   `json:"ageMs"`
+	Stale       bool    `json:"stale"`
+}
 
-	if target.ProviderOrderID != nil && *target.ProviderOrderID != "" {
-		if err := provider.CancelOrder(ctx, *target.ProviderOrderID); err != nil {
-			return models.HedgeOrderView{}, err
+// HedgeStatus is the venue, rate and reconciliation state of hedging.
+type HedgeStatus struct {
+	Provider             string            `json:"provider"`
+	Venue                string            `json:"venue"`
+	Live                 bool              `json:"live"`
+	LiveExecutionEnabled bool              `json:"liveExecutionEnabled"`
+	CanTrade             bool              `json:"canTrade"`
+	CanTradeReason       string            `json:"canTradeReason,omitempty"`
+	Fx                   FxRate            `json:"fx"`
+	Venues               []VenueStatusView `json:"venues"`
+	ReconcileStatus      string            `json:"reconcileStatus"`
+	LastReconciledAt     *iso.Time         `json:"lastReconciledAt"`
+	LastCheckedAt        *iso.Time         `json:"lastCheckedAt"`
+	OpenAlerts           int64             `json:"openAlerts"`
+	// Average realised minus estimated per-side cost over recent filled
+	// orders (model error), bps; nil without fills.
+	CostModelErrorBps *float64 `json:"costModelErrorBps"`
+	CostModelSamples  int64    `json:"costModelSamples"`
+	// Refresh intervals the screen compares ages against, ms.
+	HedgeIntervalMs     int64    `json:"hedgeIntervalMs"`
+	ReconcileIntervalMs int64    `json:"reconcileIntervalMs"`
+	VenueMaxAgeMs       int64    `json:"venueMaxAgeMs"`
+	GeneratedAt         iso.Time `json:"generatedAt"`
+}
+
+// GetHedgeStatus builds the status panel.
+func GetHedgeStatus(ctx context.Context) (HedgeStatus, error) {
+	v := venue()
+	s := HedgeStatus{Provider: v.Name(), Venue: v.ID(), Live: v.Live(), Venues: []VenueStatusView{},
+		HedgeIntervalMs: hedgeIntervalMs(), ReconcileIntervalMs: reconcileIntervalMs(), VenueMaxAgeMs: venueMaxAge(),
+		GeneratedAt: iso.From(mongox.Now())}
+	s.LiveExecutionEnabled = config.E != nil && config.E.HedgeLiveExecutionEnabled
+	if err := v.CanTrade(); err != nil {
+		s.CanTradeReason = errMessage(err)
+		if ae, ok := apperr.As(err); ok {
+			s.CanTradeReason = ae.Code + ": " + ae.Message
+		}
+	} else {
+		s.CanTrade = true
+	}
+	fx, err := CurrentFX(ctx)
+	if err != nil {
+		return s, err
+	}
+	s.Fx = fx
+	if config.E != nil {
+		seen := map[string]bool{}
+		for _, sym := range config.E.HedgeSymbols {
+			if seen[sym] {
+				continue
+			}
+			seen[sym] = true
+			snap, err := GetVenueSnapshot(ctx, sym)
+			if err != nil {
+				return s, err
+			}
+			view := VenueStatusView{Symbol: sym, Error: "no snapshot yet"}
+			if snap != nil {
+				view = VenueStatusView{Symbol: sym, OK: snap.OK, Error: snap.Error, Mid: snap.Mid(), Mark: snap.Mark,
+					FundingRate: snap.FundingRate, TakerFeeBps: snap.TakerRate * 10_000, UpdatedAt: snap.UpdatedAt}
+				view.AgeMs = util.NowMs() - snap.UpdatedAt
+				view.Stale = view.AgeMs > venueMaxAge()
+			}
+			s.Venues = append(s.Venues, view)
 		}
 	}
-	updated, err := UpdateHedgeOrder(ctx, target.ID, bson.M{
-		"status":   models.HedgeOrderStatusCancelled,
-		"closedAt": mongox.Now(),
-	})
+	pnl, err := GetHedgePnlSummary(ctx, nil)
 	if err != nil {
-		return models.HedgeOrderView{}, err
+		return s, err
 	}
-	if updated == nil {
-		updated = target
+	s.ReconcileStatus, s.LastReconciledAt = pnl.ReconcileStatus, iso.Ptr(pnl.ReconciledAt)
+	var checked *time.Time
+	cur, err := positions().Find(ctx, bson.M{})
+	if err != nil {
+		return s, err
 	}
-	emitHedge(config.EvHedgeUpdated, updated)
-	return models.ToHedgeView(updated), nil
+	var ps []models.HedgePosition
+	if err := cur.All(ctx, &ps); err != nil {
+		return s, err
+	}
+	if len(ps) == 0 {
+		s.ReconcileStatus = models.HedgeReconNever
+	}
+	for i := range ps {
+		if c := ps[i].ReconcileCheckedAt; c != nil && (checked == nil || c.Before(*checked)) {
+			checked = c
+		}
+	}
+	s.LastCheckedAt = iso.Ptr(checked)
+	if s.OpenAlerts, err = CountOpenAlerts(ctx); err != nil {
+		return s, err
+	}
+	s.CostModelErrorBps, s.CostModelSamples, err = costModelError(ctx, 50)
+	return s, err
 }
 
-// ProviderInfo reports the active provider for the health endpoint:
-// name and whether orders really reach a venue.
+// costModelError compares realised per-side cost with the estimate over
+// the last n orders with fills.
+func costModelError(ctx context.Context, n int64) (*float64, int64, error) {
+	cur, err := orders().Find(ctx, bson.M{"realisedCostBps": bson.M{"$ne": nil}},
+		optionsFindRecent(n))
+	if err != nil {
+		return nil, 0, err
+	}
+	var rows []models.HedgeOrder
+	if err := cur.All(ctx, &rows); err != nil {
+		return nil, 0, err
+	}
+	if len(rows) == 0 {
+		return nil, 0, nil
+	}
+	var sum float64
+	for _, o := range rows {
+		sum += *o.RealisedCostBps - o.Decision.EstimatedCost.PerSideBps
+	}
+	avg := sum / float64(len(rows))
+	avg = float64(int64(avg*100)) / 100
+	return &avg, int64(len(rows)), nil
+}
+
+// ProviderInfo reports the active venue for the health endpoint: its id
+// and whether orders move real money.
 func ProviderInfo() (name string, liveHedging bool) {
-	p := providers.GetHedgeProvider()
-	return p.Name(), p.Live() && config.E != nil && config.E.HedgeLiveExecutionEnabled
-}
-
-func absInt(v int64) int64 {
-	if v < 0 {
-		return -v
-	}
-	return v
+	v := providers.GetVenue()
+	return v.ID(), v.Live() && v.CanTrade() == nil
 }

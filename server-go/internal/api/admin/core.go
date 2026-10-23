@@ -189,6 +189,11 @@ func parseRiskPatch(r *http.Request) (riskconfig.RiskConfigPatch, *string, error
 	p.MinTradeAmount = b.optInt("minTradeAmount", nonneg)
 	p.MaxTradeAmount = b.optInt("maxTradeAmount", nonneg)
 	p.MaxOpenTradesPerUser = b.optInt("maxOpenTradesPerUser", numRule{Min: f(1)})
+	// Liability ceilings, minor units; 0 = no limit (riskconfig validates
+	// that they are not negative).
+	p.MaxExpiryLiability = b.optInt("maxExpiryLiability", nonneg)
+	p.MaxAssetLiability = b.optInt("maxAssetLiability", nonneg)
+	p.MaxPlatformLiability = b.optInt("maxPlatformLiability", nonneg)
 	p.MaxUserAssetConcentrationPercent = b.optNum("maxUserAssetConcentrationPercent", numRule{Min: f(1), Max: f(100)})
 	p.HedgeThresholdPercent = b.optNum("hedgeThresholdPercent", numRule{Min: f(0), Max: f(100)})
 	p.CriticalExposurePercent = b.optNum("criticalExposurePercent", numRule{Min: f(1), Max: f(100)})
@@ -224,11 +229,137 @@ func parseRiskPatch(r *http.Request) (riskconfig.RiskConfigPatch, *string, error
 	}
 	p.FeedHealthyMaxMs = b.optInt("feedHealthyMaxMs", numRule{Min: f(1)})
 	p.FeedDegradedMaxMs = b.optInt("feedDegradedMaxMs", numRule{Min: f(1)})
-	p.FeedStaleMaxMs = b.optInt("feedStaleMaxMs", numRule{Min: f(1)})
+	// feedStaleMaxMs is retired (never read): an old admin build may still
+	// send it, and it is ignored.
 	p.FeedTickMaxAgeMs = b.optInt("feedTickMaxAgeMs", numRule{Min: f(1)})
 	p.HaltTradingOnStaleFeed = b.optBool("haltTradingOnStaleFeed")
 	p.HaltTradingOnDegradedFeed = b.optBool("haltTradingOnDegradedFeed")
 	p.TradingHalted = b.optBool("tradingHalted")
+	// Feed data rules and the settlement policy; the cross-field and hard
+	// limits are in riskconfig (policy_validate.go).
+	p.FeedTickHistoryRetentionMs = b.optInt("feedTickHistoryRetentionMs", numRule{Min: f(60_000), Max: f(86_400_000)})
+	p.FeedGapMinMs = b.optInt("feedGapMinMs", numRule{Min: f(500), Max: f(600_000)})
+	p.FeedGapIntervalMultiple = b.optNum("feedGapIntervalMultiple", numRule{Min: f(2), Max: f(1000)})
+	p.FeedSaturationHoldMs = b.optInt("feedSaturationHoldMs", numRule{Min: f(0), Max: f(600_000)})
+	p.FeedMaxClockDriftMs = b.optInt("feedMaxClockDriftMs", numRule{Min: f(50), Max: f(60_000)})
+	p.FeedClockCheckIntervalMs = b.optInt("feedClockCheckIntervalMs", numRule{Min: f(0), Max: f(86_400_000)})
+	p.SettlementMaxTickAgeMs = b.optInt("settlementMaxTickAgeMs", numRule{Min: f(100), Max: f(60_000)})
+	p.SettlementConfirmationWindowMs = b.optInt("settlementConfirmationWindowMs", numRule{Min: f(0), Max: f(60_000)})
+	p.SettlementDeferWindowMs = b.optInt("settlementDeferWindowMs", numRule{Min: f(1000), Max: f(3_600_000)})
+	p.SettlementRetryDelayMs = b.optInt("settlementRetryDelayMs", numRule{Min: f(100), Max: f(60_000)})
+	p.SettlementMaxClockSkewMs = b.optInt("settlementMaxClockSkewMs", numRule{Min: f(1), Max: f(60_000)})
+	p.SettlementNoPriceRule = b.optEnum("settlementNoPriceRule", models.NoPriceRuleValues...)
+	p.EarlyCloseFloorMs = b.optInt("earlyCloseFloorMs", numRule{Min: f(models.EarlyCloseHardFloorMs), Max: f(3_600_000)})
+	p.EarlyCloseMaxTickAgeMs = b.optInt("earlyCloseMaxTickAgeMs", numRule{Min: f(100), Max: f(10_000)})
+	p.EarlyCloseQuoteMaxAgeMs = b.optInt("earlyCloseQuoteMaxAgeMs", numRule{Min: f(1000), Max: f(60_000)})
+	p.EarlyCloseQuoteTolerancePercent = b.optNum("earlyCloseQuoteTolerancePercent", numRule{Min: f(0), Max: f(50)})
+	// Pricing engine (docs/audit/pricing/pricing-spec.md; the owner's
+	// specification section 11). Halts are set with POST /admin/pricing/halt.
+	p.TradingHaltReason = b.optStr("tradingHaltReason", 0, 300)
+	p.PricingMode = b.optEnum("pricingMode", models.PricingModeValues...)
+	p.PricingRuleLabel = b.optStr("pricingRuleLabel", 3, 60)
+	p.PricingStaleAfterMs = b.optInt("pricingStaleAfterMs", numRule{Min: f(100), Max: f(60_000)})
+	p.PricingMaxSpreadBps = b.optNum("pricingMaxSpreadBps", numRule{Min: f(0), Max: f(1000)})
+	p.PricingMaxJumpBps = b.optNum("pricingMaxJumpBps", numRule{Min: f(1), Max: f(10_000)})
+	p.PricingJumpConfirmations = b.optInt("pricingJumpConfirmations", numRule{Min: f(1), Max: f(50)})
+	p.PricingPendingOutlierMaxAgeMs = b.optInt("pricingPendingOutlierMaxAgeMs", numRule{Min: f(0), Max: f(600_000)})
+	p.PricingEwmaLambda = b.optNum("pricingEwmaLambda", numRule{Min: f(0.5), Max: f(0.9999)})
+	p.PricingVolSampleIntervalMs = b.optInt("pricingVolSampleIntervalMs", numRule{Min: f(0), Max: f(60_000)})
+	p.PricingKVol = b.optNum("pricingKVol", numRule{Min: f(0), Max: f(1)})
+	p.PricingMaxVolAdj = b.optNum("pricingMaxVolAdj", numRule{Min: f(0), Max: f(1)})
+	p.PricingVolBlockRatio = b.optNum("pricingVolBlockRatio", numRule{Min: f(1), Max: f(100)})
+	p.PricingKSpread = b.optNum("pricingKSpread", numRule{Min: f(0), Max: f(1)})
+	p.PricingMaxSpreadAdj = b.optNum("pricingMaxSpreadAdj", numRule{Min: f(0), Max: f(1)})
+	p.PricingKExposure = b.optNum("pricingKExposure", numRule{Min: f(0), Max: f(1)})
+	p.PricingMaxExposureAdj = b.optNum("pricingMaxExposureAdj", numRule{Min: f(0), Max: f(1)})
+	if raw, ok := b.get("pricingExpiryFactors"); ok {
+		if items, ok := checkArray(b.v, "pricingExpiryFactors", raw, 0); ok {
+			factors := make([]models.PricingExpiryFactor, 0, len(items))
+			for i, item := range items {
+				path := sub("pricingExpiryFactors", i)
+				obj, ok := checkObject(b.v, path, item)
+				if !ok {
+					continue
+				}
+				fb := &body{f: obj, v: b.v}
+				exp, _ := fb.nestedNum(path, "expirySeconds", numRule{Int: true, Positive: true})
+				fac, _ := fb.nestedNum(path, "factor", numRule{Min: f(0.01), Max: f(10)})
+				factors = append(factors, models.PricingExpiryFactor{ExpirySeconds: int64(exp), Factor: fac})
+			}
+			p.PricingExpiryFactors = factors
+		}
+	}
+	p.PricingPayoutStep = b.optNum("pricingPayoutStep", numRule{Min: f(0.0001), Max: f(0.1)})
+	p.PricingOfferTTLMs = b.optInt("pricingOfferTtlMs", numRule{Min: f(500), Max: f(60_000)})
+	p.PricingMaxSlippageBps = b.optNum("pricingMaxSlippageBps", numRule{Min: f(0), Max: f(1000)})
+	p.PricingDisplayTolerancePercent = b.optNum("pricingDisplayTolerancePercent", numRule{Min: f(0), Max: f(5)})
+	p.PricingGuardEnabled = b.optBool("pricingGuardEnabled")
+	p.PricingGuardMinEdgePercent = b.optNum("pricingGuardMinEdgePercent", numRule{Min: f(-10), Max: f(50)})
+	p.PricingGuardConservative = b.optBool("pricingGuardConservative")
+	p.PricingHedgeUnavailableAction = b.optEnum("pricingHedgeUnavailableAction", models.PricingActionValues...)
+	p.PricingHedgeUnavailableAdj = b.optNum("pricingHedgeUnavailableAdj", numRule{Min: f(0), Max: f(1)})
+	p.PricingHedgeTakerFeeBps = b.optNum("pricingHedgeTakerFeeBps", numRule{Min: f(0), Max: f(1000)})
+	p.PricingHedgeSpreadBps = b.optNum("pricingHedgeSpreadBps", numRule{Min: f(0), Max: f(1000)})
+	p.PricingHedgeSlippageBps = b.optNum("pricingHedgeSlippageBps", numRule{Min: f(0), Max: f(1000)})
+	if raw, ok := b.get("pricingSymbolRules"); ok {
+		if items, ok := checkArray(b.v, "pricingSymbolRules", raw, 0); ok {
+			rules := make([]models.PricingSymbolRule, 0, len(items))
+			for i, item := range items {
+				path := sub("pricingSymbolRules", i)
+				obj, ok := checkObject(b.v, path, item)
+				if !ok {
+					continue
+				}
+				rb := &body{f: obj, v: b.v}
+				var sr models.PricingSymbolRule
+				sr.Symbol, _ = rb.nested(path, "symbol", func(p string, raw []byte) (string, bool) { return checkStr(b.v, p, raw, 3, 20) })
+				if raw, ok := rb.get("enabled"); ok {
+					sr.Enabled, _ = checkBool(b.v, sub(path, "enabled"), raw)
+				}
+				if raw, ok := rb.get("disabledReason"); ok {
+					sr.DisabledReason, _ = checkStr(b.v, sub(path, "disabledReason"), raw, 0, 200)
+				}
+				sr.BasePayout, _ = rb.nestedNum(path, "basePayout", numRule{Min: f(0.01), Max: f(5)})
+				sr.MinPayout, _ = rb.nestedNum(path, "minPayout", numRule{Min: f(0.005), Max: f(5)})
+				sr.MaxPayout, _ = rb.nestedNum(path, "maxPayout", numRule{Min: f(0.005), Max: f(5)})
+				sr.BaselineVol, _ = rb.nestedNum(path, "baselineVol", numRule{Min: f(1e-9), Max: f(0.1)})
+				sr.HedgeCost, _ = rb.nestedNum(path, "hedgeCost", numRule{Min: f(0), Max: f(1)})
+				sr.Margin, _ = rb.nestedNum(path, "margin", numRule{Min: f(0), Max: f(1)})
+				mx, _ := rb.nestedNum(path, "maxExposure", numRule{Int: true, Positive: true})
+				sr.MaxExposure = int64(mx)
+				rules = append(rules, sr)
+			}
+			p.PricingSymbolRules = rules
+		}
+	}
+	// Calibrated Sell-now correction (audit F-12); ranges are checked again
+	// by riskconfig.ValidateConfig.
+	p.EarlyCloseMinProbabilityPercent = b.optNum("earlyCloseMinProbabilityPercent", numRule{Min: f(0.01), Max: f(10)})
+	if raw, ok := b.get("earlyCloseCalibration"); ok {
+		if items, ok := checkArray(b.v, "earlyCloseCalibration", raw, 0); ok {
+			rows := make([]models.EarlyCloseCalibrationRow, 0, len(items))
+			for i, item := range items {
+				path := sub("earlyCloseCalibration", i)
+				obj, ok := checkObject(b.v, path, item)
+				if !ok {
+					continue
+				}
+				rb := &body{f: obj, v: b.v}
+				var row models.EarlyCloseCalibrationRow
+				if raw, ok := rb.get("symbol"); ok {
+					row.Symbol, _ = checkStr(b.v, sub(path, "symbol"), raw, 0, 20)
+				}
+				sec, _ := rb.nestedNum(path, "maxSecondsRemaining", numRule{Int: true, Min: f(0)})
+				row.MaxSecondsRemaining = int64(sec)
+				row.MaxVolRatio, _ = rb.nestedNum(path, "maxVolRatio", numRule{Min: f(0), Max: f(1000)})
+				row.SigmaScale, _ = rb.nestedNum(path, "sigmaScale", numRule{Min: f(0.01), Max: f(20)})
+				row.MinVolRatio, _ = rb.nestedNum(path, "minVolRatio", numRule{Min: f(0), Max: f(10)})
+				row.Stickiness, _ = rb.nestedNum(path, "stickiness", numRule{Min: f(0), Max: f(0.95)})
+				rows = append(rows, row)
+			}
+			p.EarlyCloseCalibration = rows
+		}
+	}
 	note := b.optStr("note", 0, 500)
 	if err := b.err(); err != nil {
 		return riskconfig.RiskConfigPatch{}, nil, err

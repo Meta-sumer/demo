@@ -1,4 +1,5 @@
 import { apiGet, apiPatch, apiPost, apiPut, postForm } from './http';
+import { offerableAssets } from '../components/assetList';
 
 /** A picked image, as React Native's FormData takes it. */
 export interface UploadFile {
@@ -12,6 +13,7 @@ import type {
   AuthResult,
   Candle,
   EarlyCloseQuote,
+  EntryQuote,
   FeedHealth,
   Notification,
   SupportConversation,
@@ -70,7 +72,8 @@ export const api = {
   },
 
   assets: {
-    list: () => apiGet<Asset[]>('/assets'),
+    // Unpriced instruments are never offered (components/assetList).
+    list: () => apiGet<Asset[]>('/assets').then(offerableAssets),
     get: (id: string) => apiGet<Asset>('/assets/' + id),
   },
 
@@ -103,9 +106,19 @@ export const api = {
         quotedPrice?: number;
         /** Defaults to LIVE on the server. */
         accountType?: AccountType;
+        /**
+         * The offer on screen (its payout is locked) and the payout shown.
+         * An order without an offer is priced on arrival and refused
+         * (PAYOUT_CHANGED) only if that is below the payout shown.
+         */
+        offerId?: string;
+        displayedPayoutPercent?: number;
       },
       idempotencyKey: string,
     ) => apiPost<Trade>('/binary/trades', input, { 'idempotency-key': idempotencyKey }),
+    /** Offers for both directions (refresh while the ticket is open; each lasts a few seconds). */
+    entryQuote: (params: { assetId: string; expirySeconds: number; amount?: number; accountType?: AccountType }) =>
+      apiGet<EntryQuote>('/binary/quotes', params),
     list: (params: {
       status?: string;
       /** 'OPEN' for anything still running, 'SETTLED' for anything finished. */

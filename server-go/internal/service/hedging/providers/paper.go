@@ -8,215 +8,205 @@ import (
 	"sync"
 	"time"
 
+	"binarytrading/internal/models"
 	"binarytrading/internal/platform/util"
 )
 
-// Paper / sandbox execution (spec section 16, rule 14).
-//
-// Orders are booked into an in-process ledger. Nothing leaves the server, so
-// the whole hedging pipeline - decision, order, fill, position, P&L - can be
-// exercised end to end before any venue is connected.
-//
-// SlippageBps, PartialFillRatio and FailureRate exist so failure modes can be
-// reproduced in tests rather than only discovered in production.
+// Paper venue (spec rule 14): orders fill in process against the platform's
+// own price, so the whole pipeline - target, order, fill, position, P&L - runs
+// end to end without a venue. It speaks the same quantities and statuses as
+// Binance. Nothing leaves the server; state lives in memory, so after a
+// restart it knows no orders (recovery then marks a working order FAILED) and
+// it reports no venue position (reconciliation: NOT_APPLICABLE).
+
+// PriceFunc returns the bid and ask of a venue symbol.
+type PriceFunc func(ctx context.Context, symbol string) (bid, ask float64, ok bool)
 
 type PaperOptions struct {
 	// Default 2 when nil.
 	SlippageBps *float64
-	// 1 = always fill fully; 0.5 = fill half of each order. Default 1 when nil.
+	// Taker fee, default 5 bps when nil.
+	FeeBps *float64
+	// 1 = always fill fully; 0.5 = fill half of each order then expire.
 	PartialFillRatio *float64
 	// Probability [0..1] that an order is rejected outright.
 	FailureRate float64
-	LatencyMs   int64
+	Price       PriceFunc
 }
 
 type paperOrder struct {
-	OrderResult
-	symbol            string
-	side              HedgeSide
-	requestedNotional int64
-	createdAt         int64
+	state OrderState
+	fills []Fill
 }
 
-type paperPosition struct {
-	netNotional  float64
-	averagePrice *float64
+type PaperVenue struct {
+	opts PaperOptions
+
+	mu        sync.Mutex
+	orders    map[string]*paperOrder
+	nextOrder int64
+	nextTrade int64
+	positions map[string]int64
 }
 
-type PaperProvider struct {
-	options PaperOptions
-
-	mu               sync.Mutex
-	orders           map[string]*paperOrder
-	byIdempotencyKey map[string]string
-	positions        map[string]paperPosition
+func NewPaper(opts PaperOptions) *PaperVenue {
+	return &PaperVenue{opts: opts, orders: map[string]*paperOrder{}, positions: map[string]int64{}, nextOrder: 1, nextTrade: 1}
 }
 
-func NewPaperProvider(opts PaperOptions) *PaperProvider {
-	p := &PaperProvider{options: opts}
-	p.Reset()
-	return p
-}
-
-func (p *PaperProvider) Name() string { return "paper" }
-func (p *PaperProvider) Live() bool   { return false }
-
-func (p *PaperProvider) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult, error) {
+// SetPrice installs the price source (the hedging package wires the
+// platform's last tick).
+func (p *PaperVenue) SetPrice(f PriceFunc) {
 	p.mu.Lock()
-	if existingID, ok := p.byIdempotencyKey[req.IdempotencyKey]; ok {
-		res := toResult(p.orders[existingID])
+	p.opts.Price = f
+	p.mu.Unlock()
+}
+
+func (p *PaperVenue) Name() string    { return "paper" }
+func (p *PaperVenue) ID() string      { return "paper" }
+func (p *PaperVenue) Live() bool      { return false }
+func (p *PaperVenue) CanTrade() error { return nil }
+
+func (p *PaperVenue) Ping(context.Context) error { return nil }
+
+// paperRules mirror the Binance USDⓈ-M filters of the launch symbols.
+func (p *PaperVenue) Rules(_ context.Context, symbol string) (models.HedgeRules, error) {
+	switch symbol {
+	case "BTCUSDT":
+		return models.HedgeRules{StepE8: 100_000, MinQtyE8: 100_000, MaxQtyE8: 120 * models.QtyScale, MinNotional: 100, TickSize: 0.1}, nil
+	case "ETHUSDT":
+		return models.HedgeRules{StepE8: 100_000, MinQtyE8: 100_000, MaxQtyE8: 2000 * models.QtyScale, MinNotional: 20, TickSize: 0.01}, nil
+	}
+	return models.HedgeRules{StepE8: 100_000, MinQtyE8: 100_000, MaxQtyE8: 1000 * models.QtyScale, MinNotional: 5, TickSize: 0.01}, nil
+}
+
+func (p *PaperVenue) Quote(ctx context.Context, symbol string) (Quote, error) {
+	p.mu.Lock()
+	price := p.opts.Price
+	p.mu.Unlock()
+	if price == nil {
+		return Quote{}, &VenueError{Msg: "paper venue has no price source"}
+	}
+	bid, ask, ok := price(ctx, symbol)
+	if !ok || bid <= 0 || ask <= 0 {
+		return Quote{}, &VenueError{Msg: "no price for " + symbol}
+	}
+	return Quote{Bid: bid, Ask: ask, Time: util.NowMs()}, nil
+}
+
+func (p *PaperVenue) Mark(ctx context.Context, symbol string) (Mark, error) {
+	q, err := p.Quote(ctx, symbol)
+	if err != nil {
+		return Mark{}, err
+	}
+	return Mark{MarkPrice: q.Mid(), IndexPrice: q.Mid(), Time: q.Time}, nil
+}
+
+func (p *PaperVenue) Commission(context.Context, string) (Commission, error) {
+	return Commission{MakerRate: p.feeBps() / 10_000, TakerRate: p.feeBps() / 10_000}, nil
+}
+
+func (p *PaperVenue) feeBps() float64 {
+	if p.opts.FeeBps != nil {
+		return *p.opts.FeeBps
+	}
+	return 5
+}
+
+func (p *PaperVenue) PlaceOrder(ctx context.Context, req OrderRequest) (OrderState, error) {
+	p.mu.Lock()
+	if o, ok := p.orders[req.ClientOrderID]; ok && !o.state.Final() {
 		p.mu.Unlock()
-		return res, nil
+		return OrderState{}, &VenueError{HTTPStatus: 400, Code: -4116, Msg: "ClientOrderId is duplicated."}
 	}
 	p.mu.Unlock()
-
-	if p.options.LatencyMs > 0 {
-		select {
-		case <-time.After(time.Duration(p.options.LatencyMs) * time.Millisecond):
-		case <-ctx.Done():
-			return OrderResult{}, ctx.Err()
-		}
+	q, err := p.Quote(ctx, req.Symbol)
+	if err != nil {
+		return OrderState{}, err
 	}
 
-	providerOrderID := "paper_" + util.UUID()
-
-	if p.options.FailureRate > 0 && rand.Float64() < p.options.FailureRate {
-		failed := &paperOrder{
-			OrderResult: OrderResult{
-				ProviderOrderID: providerOrderID,
-				Status:          StateFailed,
-				Error:           "Simulated venue rejection",
-			},
-			symbol: req.Symbol, side: req.Side, requestedNotional: req.Notional, createdAt: util.NowMs(),
-		}
-		p.mu.Lock()
-		p.orders[providerOrderID] = failed
-		p.byIdempotencyKey[req.IdempotencyKey] = providerOrderID
-		p.mu.Unlock()
-		return toResult(failed), nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	id := p.nextOrder
+	p.nextOrder++
+	st := OrderState{Symbol: req.Symbol, ClientOrderID: req.ClientOrderID, VenueOrderID: "paper-" + strconv.FormatInt(id, 10),
+		Side: req.Side, OrigQtyE8: req.QtyE8, UpdateTime: util.NowMs()}
+	if p.opts.FailureRate > 0 && rand.Float64() < p.opts.FailureRate {
+		st.Status = VenueRejected
+		p.orders[req.ClientOrderID] = &paperOrder{state: st}
+		return OrderState{}, &VenueError{HTTPStatus: 400, Code: -2010, Msg: "Simulated venue rejection"}
 	}
-
-	fillRatio := 1.0
-	if p.options.PartialFillRatio != nil {
-		fillRatio = math.Min(1, math.Max(0, *p.options.PartialFillRatio))
+	ratio := 1.0
+	if p.opts.PartialFillRatio != nil {
+		ratio = math.Min(1, math.Max(0, *p.opts.PartialFillRatio))
 	}
-	filled := util.RoundHalfUp(float64(req.Notional) * fillRatio)
-	slippageBps := 2.0
-	if p.options.SlippageBps != nil {
-		slippageBps = *p.options.SlippageBps
+	slip := 2.0
+	if p.opts.SlippageBps != nil {
+		slip = *p.opts.SlippageBps
 	}
-	slippage := slippageBps / 10_000
-	fillPrice := req.ReferencePrice * (1 - slippage)
+	price := q.Bid * (1 - slip/10_000)
 	if req.Side == SideBuy {
-		fillPrice = req.ReferencePrice * (1 + slippage)
+		price = q.Ask * (1 + slip/10_000)
 	}
-
-	status := StateFailed
-	if filled >= float64(req.Notional) {
-		status = StateFilled
-	} else if filled > 0 {
-		status = StatePartiallyFilled
+	filled := int64(math.Floor(float64(req.QtyE8) * ratio))
+	st.Status = VenueFilled
+	if filled < req.QtyE8 {
+		st.Status = VenueExpired
 	}
-	var avg *float64
+	o := &paperOrder{state: st}
 	if filled > 0 {
-		// Number(fillPrice.toFixed(8))
-		v, _ := strconv.ParseFloat(strconv.FormatFloat(fillPrice, 'f', 8, 64), 64)
-		avg = &v
+		quote := FloatToE8(price * E8ToFloat(filled))
+		fee := FloatToE8(E8ToFloat(quote) * p.feeBps() / 10_000)
+		tid := p.nextTrade
+		p.nextTrade++
+		o.fills = append(o.fills, Fill{TradeID: tid, VenueOrderID: st.VenueOrderID, Symbol: req.Symbol, Side: req.Side,
+			Price: price, QtyE8: filled, QuoteE8: quote, CommissionE8: fee, CommissionAsset: "USDT", Time: time.Now().UnixMilli()})
+		o.state.ExecutedQtyE8, o.state.CumQuoteE8, o.state.AvgPrice = filled, quote, price
+		signed := filled
+		if req.Side == SideSell {
+			signed = -filled
+		}
+		p.positions[req.Symbol] += signed
 	}
-	order := &paperOrder{
-		OrderResult: OrderResult{
-			ProviderOrderID:  providerOrderID,
-			Status:           status,
-			FilledNotional:   filled,
-			AverageFillPrice: avg,
-		},
-		symbol: req.Symbol, side: req.Side, requestedNotional: req.Notional, createdAt: util.NowMs(),
-	}
-
-	p.mu.Lock()
-	p.orders[providerOrderID] = order
-	p.byIdempotencyKey[req.IdempotencyKey] = providerOrderID
-	p.applyToPosition(order)
-	p.mu.Unlock()
-	return toResult(order), nil
+	p.orders[req.ClientOrderID] = o
+	return o.state, nil
 }
 
-func (p *PaperProvider) CancelOrder(_ context.Context, providerOrderID string) error {
+func (p *PaperVenue) QueryOrder(_ context.Context, _ string, clientOrderID string) (OrderState, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	order, ok := p.orders[providerOrderID]
-	if !ok || order.Status == StateFilled {
-		return nil
-	}
-	order.Status = StateCancelled
-	return nil
-}
-
-func (p *PaperProvider) GetOrder(_ context.Context, providerOrderID string) (OrderResult, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	order, ok := p.orders[providerOrderID]
+	o, ok := p.orders[clientOrderID]
 	if !ok {
-		return OrderResult{ProviderOrderID: providerOrderID, Status: StateFailed, Error: "Unknown order"}, nil
+		return OrderState{}, ErrOrderNotFound
 	}
-	return toResult(order), nil
+	return o.state, nil
 }
 
-func (p *PaperProvider) GetPosition(_ context.Context, symbol string) (Position, error) {
+func (p *PaperVenue) CancelOrder(_ context.Context, _ string, clientOrderID string) (OrderState, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	pos := p.positions[symbol]
-	return Position{Symbol: symbol, NetNotional: pos.netNotional, AveragePrice: pos.averagePrice}, nil
+	o, ok := p.orders[clientOrderID]
+	if !ok || o.state.Final() {
+		return OrderState{}, ErrOrderNotFound
+	}
+	o.state.Status = VenueCanceled
+	return o.state, nil
 }
 
-func (p *PaperProvider) Healthy(context.Context) bool { return true }
-
-// applyToPosition must be called with p.mu held.
-func (p *PaperProvider) applyToPosition(order *paperOrder) {
-	if order.FilledNotional <= 0 || order.AverageFillPrice == nil {
-		return
-	}
-	signed := order.FilledNotional
-	if order.side != SideBuy {
-		signed = -signed
-	}
-	current := p.positions[order.symbol]
-	next := current.netNotional + signed
-
-	// Volume-weighted average while the position keeps its direction; a flip
-	// resets the basis to the price that flipped it.
-	flipped := sign(next) != sign(current.netNotional)
-	var avg float64
-	if current.averagePrice == nil || flipped {
-		avg = *order.AverageFillPrice
-	} else {
-		avg = (*current.averagePrice*math.Abs(current.netNotional) + *order.AverageFillPrice*math.Abs(signed)) /
-			math.Max(1, math.Abs(current.netNotional)+math.Abs(signed))
-	}
-	p.positions[order.symbol] = paperPosition{netNotional: next, averagePrice: &avg}
-}
-
-// Reset is a test hook: drop all simulated state.
-func (p *PaperProvider) Reset() {
+func (p *PaperVenue) Fills(_ context.Context, _ string, venueOrderID string) ([]Fill, error) {
 	p.mu.Lock()
-	p.orders = map[string]*paperOrder{}
-	p.byIdempotencyKey = map[string]string{}
-	p.positions = map[string]paperPosition{}
-	p.mu.Unlock()
-}
-
-func toResult(o *paperOrder) OrderResult {
-	r := o.OrderResult
-	r.Raw = nil
-	return r
-}
-
-func sign(v float64) float64 {
-	switch {
-	case v > 0:
-		return 1
-	case v < 0:
-		return -1
+	defer p.mu.Unlock()
+	for _, o := range p.orders {
+		if o.state.VenueOrderID == venueOrderID {
+			return append([]Fill(nil), o.fills...), nil
+		}
 	}
-	return 0
+	return []Fill{}, nil
+}
+
+func (p *PaperVenue) Position(context.Context, string) (Position, error) {
+	return Position{}, ErrUnsupported
+}
+
+func (p *PaperVenue) Funding(context.Context, string, int64) ([]Income, error) {
+	return []Income{}, nil
 }

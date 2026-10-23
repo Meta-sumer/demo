@@ -349,7 +349,7 @@ func touchSource(set bson.M, source string, now time.Time) {
 	switch source {
 	case "webhook":
 		set["lastWebhookAt"] = now
-	case "refresh", "sweeper", "admin", "user":
+	case "refresh", "sweeper", "admin", "user", "expiry", "poll", "reconcile":
 		set["lastRefreshedAt"] = now
 	}
 }
@@ -414,6 +414,13 @@ func applyInvoiceUpdate(ctx context.Context, id bson.ObjectID, u invoiceUpdate) 
 			note += "; " + micro.Format(u.Received.V-d.AmountCredited) + " USDT received beyond the credited amount needs manual review"
 			logx.Warn("USDT received beyond a credited deposit", "depositId", d.ID.Hex(),
 				"credited", micro.Format(d.AmountCredited), "received", u.Received.Raw)
+			RaiseAlert(ctx, Alert{
+				Kind: models.AlertKindDeposit, Code: AlertDepositReceivedBeyond, Severity: models.AlertWarning, Subject: d.ID.Hex(),
+				Message: micro.Format(u.Received.V-d.AmountCredited) + " USDT arrived on deposit " + d.OrderID +
+					" after it was credited; nothing more was credited automatically.",
+				Details:   map[string]any{"amountCredited": d.AmountCredited, "amountReceived": u.Received.V, "source": u.Source},
+				DepositID: &d.ID,
+			})
 		}
 		if _, err := depositsColl().UpdateOne(ctx, bson.M{"_id": d.ID, "credited": true}, bson.M{"$set": set}); err != nil {
 			return ApplyResult{}, err

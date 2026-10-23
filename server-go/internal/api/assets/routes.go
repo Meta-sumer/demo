@@ -3,6 +3,11 @@
 //
 // Each row carries its live payout table and feed status, which is what the
 // trading screen needs to decide whether the UP/DOWN buttons are enabled.
+// payouts[].payoutPercent is the pricing engine's current indicative payout
+// (the lower of UP and DOWN at the smallest stake, refreshed every second);
+// an expiry the engine cannot price is left out and named in
+// pricing.unavailable. GET /binary/quotes gives the exact per-direction
+// price for a stake.
 package assets
 
 import (
@@ -15,7 +20,7 @@ import (
 	assetsvc "binarytrading/internal/service/assets"
 	"binarytrading/internal/service/exposure"
 	"binarytrading/internal/service/marketdata"
-	"binarytrading/internal/service/payouts"
+	"binarytrading/internal/service/pricing"
 	"binarytrading/internal/service/riskconfig"
 )
 
@@ -29,8 +34,11 @@ func Mount(r chi.Router) {
 
 type assetDetail struct {
 	models.AssetView
-	Payouts []models.PayoutView       `json:"payouts"`
+	Payouts []pricing.CustomerPayout  `json:"payouts"`
 	Feed    models.FeedHealthSnapshot `json:"feed"`
+	// Pricing mode, model version and the expiries that cannot be priced
+	// right now, with the reason.
+	Pricing pricing.AssetPricing `json:"pricing"`
 	// Percent move of the last price against the first candle open of the
 	// last 24h; null when there is not enough data.
 	Change24hPercent *float64 `json:"change24hPercent"`
@@ -46,18 +54,18 @@ type assetListRow struct {
 }
 
 func detail(r *http.Request, asset models.AssetView, change map[string]*float64, drawPolicy models.DrawPolicy) (assetDetail, error) {
-	payoutRows, err := payouts.ListActivePayouts(r.Context(), asset.ID)
+	payoutRows, info, err := pricing.CustomerPayouts(r.Context(), asset.ID)
 	if err != nil {
 		return assetDetail{}, err
 	}
 	if payoutRows == nil {
-		payoutRows = []models.PayoutView{}
+		payoutRows = []pricing.CustomerPayout{}
 	}
 	feed, err := marketdata.GetFeedHealth(r.Context(), asset.ID, asset.Symbol)
 	if err != nil {
 		return assetDetail{}, err
 	}
-	return assetDetail{AssetView: asset, Payouts: payoutRows, Feed: feed, Change24hPercent: change[asset.ID], DrawPolicy: drawPolicy}, nil
+	return assetDetail{AssetView: asset, Payouts: payoutRows, Feed: feed, Pricing: info, Change24hPercent: change[asset.ID], DrawPolicy: drawPolicy}, nil
 }
 
 func list(w http.ResponseWriter, r *http.Request) error {

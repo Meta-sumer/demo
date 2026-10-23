@@ -125,6 +125,19 @@ func ApplyDrawPolicy(result models.TradeResult, policy models.DrawPolicy) models
 	return models.TradeResultDraw
 }
 
+// DrawPolicyFor is the tie rule a trade settles under: the one frozen on it
+// at acceptance; a trade accepted before the policy was stored settles under
+// the policy in force now (cfg).
+func DrawPolicyFor(trade *models.BinaryTrade, cfg *models.RiskConfig) models.DrawPolicy {
+	if trade != nil && trade.DrawPolicy != nil && *trade.DrawPolicy != "" {
+		return *trade.DrawPolicy
+	}
+	if cfg != nil && cfg.DrawPolicy != "" {
+		return cfg.DrawPolicy
+	}
+	return models.DrawPolicyRefund
+}
+
 // Reschedule puts a trade back on the expiry queue so the expiry worker hands
 // it to settlement again at `at` (epoch ms). Idempotent.
 func Reschedule(ctx context.Context, tradeID string, at int64) error {
@@ -253,10 +266,11 @@ func settleOpen(ctx context.Context, trade *models.BinaryTrade, settledBy string
 		return Outcome{TradeID: tradeID, Status: status, RetryAt: &at}, nil
 	}
 
+	drawPolicy := DrawPolicyFor(trade, cfg)
 	evidence := models.SettlementEvidence{
 		Rule:                    decision.Rule,
 		Kind:                    models.SettlementKindExpiry,
-		DrawPolicy:              cfg.DrawPolicy,
+		DrawPolicy:              drawPolicy,
 		PostExpiryTickSeen:      candidates.PostExpiryTickSeen,
 		PostExpiryTickTimestamp: candidates.PostExpiryTickTimestamp,
 		CandidatesConsidered:    int64(decision.Candidates),
@@ -271,11 +285,12 @@ func settleOpen(ctx context.Context, trade *models.BinaryTrade, settledBy string
 		raw := DetermineResult(trade.Direction, trade.EntryPrice, decision.Tick.Price)
 		evidence.RawResult = &raw
 		price := decision.Tick.Price
-		intent = expiryIntent(trade, ApplyDrawPolicy(raw, cfg.DrawPolicy), &price, evidence, settledBy)
+		intent = expiryIntent(trade, ApplyDrawPolicy(raw, drawPolicy), &price, evidence, settledBy)
 	} else {
 		// Void: no price is compared, so the draw policy does not apply.
 		evidence.DrawPolicy = ""
 		evidence.Note = "no tick at or before expiry within the policy; voided and stake returned"
+		evidence.NoPriceReason, evidence.FeedGapID = noPriceReason(ctx, assetHex, trade.ExpiryTimestamp, policy)
 		intent = expiryIntent(trade, models.TradeResultDraw, nil, evidence, settledBy)
 		logx.Error("no usable expiry price - trade voided under the no-price rule",
 			"tradeId", tradeID, "symbol", trade.Symbol, "expiry", trade.ExpiryTimestamp, "rule", policy.NoPriceRule)

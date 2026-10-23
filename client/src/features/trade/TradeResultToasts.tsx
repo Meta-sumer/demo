@@ -6,7 +6,7 @@ import { useTradeResultStore } from '../../stores/tradeResultStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { formatExpiry, formatMoney, formatSignedMoney } from '../../utils/format';
-import { durationOf, statusLabel } from '../../utils/tradeStatus';
+import { durationOf, tradeLabel } from '../../utils/tradeStatus';
 import { payoutOf, settlementOf } from './settlement';
 import { useTicketStore } from './ticketStore';
 import { DirectionWord, TradeDemoTag, useClockFormatter } from './tradeBits';
@@ -109,7 +109,7 @@ function ResultCard({ trade, onClose }: { trade: Trade; onClose: () => void }) {
 
   return (
     <article
-      aria-label={'Result: ' + statusLabel(trade.status) + ' ' + trade.symbol}
+      aria-label={'Result: ' + tradeLabel(trade) + ' ' + trade.symbol}
       className={clsx(
         'pointer-events-auto animate-fade-in rounded-2xl bg-surface-850 p-3 shadow-overlay ring-1',
         won ? 'ring-brand/50' : 'ring-surface-700',
@@ -122,7 +122,7 @@ function ResultCard({ trade, onClose }: { trade: Trade; onClose: () => void }) {
             won ? 'bg-brand text-surface-950' : 'bg-content-100 text-surface-950',
           )}
         >
-          {statusLabel(trade.status)}
+          {tradeLabel(trade)}
         </span>
         <span className="min-w-0 flex-1 truncate text-sm font-semibold text-content-100">{trade.symbol}</span>
         <TradeDemoTag trade={trade} />
@@ -203,7 +203,7 @@ function OlderRow({ trade, onClose }: { trade: Trade; onClose: () => void }) {
         }}
         className="flex min-w-0 flex-1 items-center gap-2 text-left"
       >
-        <span className="w-16 shrink-0 font-semibold text-content-300">{statusLabel(trade.status)}</span>
+        <span className="w-16 shrink-0 font-semibold text-content-300">{tradeLabel(trade)}</span>
         <span className="min-w-0 flex-1 truncate font-semibold text-content-100">{trade.symbol}</span>
         <TradeDemoTag trade={trade} />
         <span className={clsx('font-bold tnum', net > 0 ? 'text-brand' : 'text-content-100')}>

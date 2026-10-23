@@ -75,10 +75,87 @@ export interface PayoutConfig {
   id: string;
   assetId: string;
   expirySeconds: number;
+  /**
+   * The pricing engine's current payout for this duration (the lower of UP
+   * and DOWN at the smallest stake). A server that predates the engine sends
+   * the configured rate here.
+   */
   payoutPercent: number;
   minStake: number | null;
   maxStake: number | null;
   version: number;
+  /** The configured rate (the engine's cap). Absent from older servers. */
+  configuredPayoutPercent?: number;
+  /** The engine's payout per direction; null when that side cannot trade. */
+  payoutPercentUp?: number | null;
+  payoutPercentDown?: number | null;
+  pricingMode?: PricingMode;
+  ruleVersion?: string;
+}
+
+export type PricingMode = 'DYNAMIC' | 'FIXED';
+
+/** One direction of a quote (GET /binary/quotes): an offer, or why there is none. */
+export interface EntryOffer {
+  /** Send with the order. Single use; null when this side is not offered. */
+  offerId: string | null;
+  direction: Direction;
+  status: 'ok' | 'blocked';
+  available: boolean;
+  payoutPercent: number | null;
+  /** On a win at this payout, minor units. */
+  profit: number | null;
+  potentialReturn: number | null;
+  /** The mid the offer was made on; the order is refused if the price moves too far from it. */
+  referencePrice: number | null;
+  /** Why it is not offered (e.g. SYMBOL_HALTED, VOLATILITY_BLOCK, EXPOSURE_LIMIT). */
+  code: string | null;
+  reason: string | null;
+}
+
+/**
+ * The pricing engine's offers for an asset, duration and amount. Each offer
+ * locks its payout until validUntil and can be used once; the order is
+ * refused for a re-quote (OFFER_EXPIRED, OFFER_INVALID, PRICE_MOVED) with a
+ * fresh quote in the error details.
+ */
+export interface EntryQuote {
+  assetId: string;
+  symbol: string;
+  expirySeconds: number;
+  amount: number;
+  accountType: AccountType;
+  mode: PricingMode;
+  ruleVersion: string;
+  modelVersion: number;
+  riskConfigVersion: number;
+  payoutConfigVersion: number;
+  issuedAt: number;
+  validUntil: number;
+  validForMs: number;
+  maxSlippageBps: number;
+  /** The lower available payout; null when neither side is offered. */
+  payoutPercent: number | null;
+  up: EntryOffer;
+  down: EntryOffer;
+}
+
+/** The catalogue's pricing block: which durations cannot be offered now, and why. */
+export interface AssetPricing {
+  /**
+   * False when the platform cannot price the instrument at all (launch scope:
+   * only BTC/USD and ETH/USD are priced). Such an asset is not offered.
+   * Absent from a server that predates it.
+   */
+  priced?: boolean;
+  notPricedReason?: string;
+  mode: PricingMode;
+  ruleVersion: string;
+  modelVersion: number;
+  computedAt: number;
+  halted: boolean;
+  haltReason?: string;
+  unavailable: { expirySeconds: number; reason: string; message: string }[];
 }
 
 export interface FeedHealth {
@@ -123,6 +200,8 @@ export interface Asset {
    * which only ever refunds.
    */
   drawPolicy?: DrawPolicy;
+  /** Absent from a server that predates the pricing engine. */
+  pricing?: AssetPricing;
 }
 
 /** A tie refunds the investment (the default), or counts as a loss or a win. */
@@ -163,6 +242,18 @@ export interface Trade {
   payoutPercent: number;
   profit: number;
   potentialReturn: number;
+  /** The offer the trade was accepted on. */
+  offerId?: string;
+  /** The settlement rule behind expiryPrice, e.g. NO_PRICE_VOID_REFUND. */
+  expiryPriceSource?: string;
+  /**
+   * Voided because no valid market price existed at expiry: the stake was
+   * returned. Status stays DRAW for older readers.
+   */
+  voided?: boolean;
+  voidReason?: string;
+  /** The tie rule frozen on the trade when it was accepted. */
+  drawPolicy?: DrawPolicy;
   entryPrice: number;
   expiryPrice: number | null;
   entryTimestamp: number;

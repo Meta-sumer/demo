@@ -15,6 +15,7 @@ import (
 	"binarytrading/internal/platform/redisx"
 	"binarytrading/internal/platform/util"
 	"binarytrading/internal/service/marketdata"
+	"binarytrading/internal/service/pricing"
 	"binarytrading/internal/service/riskconfig"
 	"binarytrading/internal/service/settlement"
 )
@@ -78,6 +79,7 @@ type earlyClosePricing struct {
 	feedStatus       models.FeedStatus
 	feedAgeMs        int64
 	vol              float64
+	correction       models.EarlyCloseCalibrationRow
 	secondsRemaining float64
 	currentPrice     float64
 	quote            EarlyCloseQuote
@@ -114,9 +116,18 @@ func priceEarlyClose(ctx context.Context, trade *models.BinaryTrade, now int64) 
 		p.refuse("This trade is already "+strings.Replace(strings.ToLower(string(trade.Status)), "_", " ", 1),
 			apperr.ConflictErr(apperr.AlreadySettled, "This trade is no longer open"))
 	}
-	if cfg.TradingHalted {
-		p.refuse("Trading is currently halted",
-			apperr.Unavailable(apperr.TradingHalted, "Trading is currently halted. Closing early is paused."))
+	// A Sell-now is a new acceptance of a price, so the kill switch stops it
+	// like any acceptance (pricing specification 7.4): the global halt, and a
+	// halt on this trade's symbol. The trade itself still settles at expiry.
+	if code, reason, halted := pricing.HaltFor(cfg, trade.Symbol); halted {
+		if code == pricing.CodeTradingHalted {
+			p.refuse("Trading is currently halted",
+				apperr.Unavailable(apperr.TradingHalted, "Trading is currently halted. Closing early is paused."))
+		} else {
+			msg := "Trading on " + trade.Symbol + " is halted: " + reason + ". Closing early is paused."
+			p.refuse("Trading on "+trade.Symbol+" is halted",
+				apperr.New(apperr.TradingHalted, msg, 503, map[string]any{"reason": code, "symbol": trade.Symbol}))
+		}
 	}
 	remainingMs := trade.ExpiryTimestamp - now
 	if remainingMs < p.floorMs {
@@ -142,14 +153,26 @@ func priceEarlyClose(ctx context.Context, trade *models.BinaryTrade, now int64) 
 		// Classified from this very tick, so the gate and the price agree.
 		p.feedStatus = marketdata.ClassifyFeed(marketdata.FeedClassificationInput{
 			AgeMs: p.feedAgeMs, LatencyMs: tick.TotalLatencyMs,
-			HealthyMaxMs: cfg.FeedHealthyMaxMs, DegradedMaxMs: cfg.FeedDegradedMaxMs,
-			StaleMaxMs: cfg.FeedStaleMaxMs, TickMaxAgeMs: cfg.FeedTickMaxAgeMs,
+			HealthyMaxMs: cfg.FeedHealthyMaxMs, DegradedMaxMs: cfg.FeedDegradedMaxMs, TickMaxAgeMs: cfg.FeedTickMaxAgeMs,
 		})
+		// Feed data rules (dropped ticks, clock drift) refuse as for new
+		// trades, whatever the halt switches say.
+		block, err := marketdata.FeedBlockFor(ctx, assetHex)
+		if err != nil {
+			return nil, err
+		}
+		if block != nil && p.feedStatus != models.FeedStatusOffline {
+			p.feedStatus = models.FeedStatusStale
+		}
 		blocked := p.feedStatus == models.FeedStatusOffline ||
 			(cfg.HaltTradingOnStaleFeed && p.feedStatus == models.FeedStatusStale) ||
 			(cfg.HaltTradingOnDegradedFeed && p.feedStatus == models.FeedStatusDegraded)
 		if blocked {
 			msg := "Market data for " + trade.Symbol + " is " + string(p.feedStatus) + ". Closing early is paused."
+			p.refuse(msg, apperr.Unavailable(apperr.FeedUnhealthy, msg))
+		}
+		if block != nil {
+			msg := "Market data for " + trade.Symbol + " cannot be trusted right now (" + block.Code + "). Closing early is paused."
 			p.refuse(msg, apperr.Unavailable(apperr.FeedUnhealthy, msg))
 		}
 		if p.feedAgeMs > policy.EarlyCloseMaxTickAgeMs {
@@ -168,15 +191,26 @@ func priceEarlyClose(ctx context.Context, trade *models.BinaryTrade, now int64) 
 			apperr.Unavailable(apperr.NoPriceAvailable, msg))
 	}
 
+	// Calibrated correction for this horizon and volatility (audit F-12).
+	volRatio, baseline := 0.0, 0.0
+	if rule := pricing.FindSymbolRule(cfg, trade.Symbol); rule != nil && rule.BaselineVol > 0 {
+		baseline = rule.BaselineVol
+		volRatio = p.vol / baseline
+	}
+	p.correction = EarlyCloseCorrection(cfg.EarlyCloseCalibration, trade.Symbol, p.secondsRemaining, volRatio)
 	p.quote = QuoteEarlyClose(EarlyCloseInput{
-		Stake:               trade.Stake,
-		PayoutPercent:       trade.PayoutPercent,
-		Direction:           trade.Direction,
-		EntryPrice:          trade.EntryPrice,
-		CurrentPrice:        p.currentPrice,
-		SecondsRemaining:    p.secondsRemaining,
-		VolatilityPerSecond: p.vol,
-		FeePercent:          cfg.EarlyCloseFeePercent,
+		Stake:                  trade.Stake,
+		PayoutPercent:          trade.PayoutPercent,
+		Direction:              trade.Direction,
+		EntryPrice:             trade.EntryPrice,
+		CurrentPrice:           p.currentPrice,
+		SecondsRemaining:       p.secondsRemaining,
+		VolatilityPerSecond:    p.vol,
+		FeePercent:             cfg.EarlyCloseFeePercent,
+		SigmaScale:             p.correction.SigmaScale,
+		MinVolatilityPerSecond: p.correction.MinVolRatio * baseline,
+		Stickiness:             p.correction.Stickiness,
+		MinProbabilityPercent:  cfg.EarlyCloseMinProbabilityPercent,
 	})
 	return p, nil
 }

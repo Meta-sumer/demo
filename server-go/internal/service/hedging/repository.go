@@ -14,30 +14,31 @@ import (
 	"binarytrading/internal/service/risk"
 )
 
-// Port of hedge.repository.ts.
+type mongoColl = mongo.Collection
 
-// ActiveHedgeStatuses are the statuses that still contribute to the
-// platform's live hedge position.
+// ActiveHedgeStatuses are the working (contingent) statuses: an order in one
+// of them may still fill, but only its fills count as protection.
 var ActiveHedgeStatuses = []models.HedgeOrderStatus{
-	models.HedgeOrderStatusPending, models.HedgeOrderStatusPartiallyFilled, models.HedgeOrderStatusFilled,
+	models.HedgeOrderStatusPending, models.HedgeOrderStatusAccepted, models.HedgeOrderStatusPartiallyFilled,
 }
 
 func orders() *mongo.Collection { return mongox.C(models.CollHedgeOrders) }
 
-// CreateHedgeOrder inserts the order, stamping timestamps.
+// CreateHedgeOrder inserts the order, stamping timestamps. A second working
+// order for the same asset fails with a duplicate key (workingSlot).
 func CreateHedgeOrder(ctx context.Context, o *models.HedgeOrder) (*models.HedgeOrder, error) {
 	now := mongox.Now()
 	o.CreatedAt, o.UpdatedAt = now, now
-	res, err := orders().InsertOne(ctx, o)
-	if err != nil {
+	if o.ID.IsZero() {
+		o.ID = bson.NewObjectID()
+	}
+	if o.Decision.Legs == nil {
+		o.Decision.Legs = []models.HedgeLeg{}
+	}
+	if _, err := orders().InsertOne(ctx, o); err != nil {
 		return nil, err
 	}
-	o.ID = res.InsertedID.(bson.ObjectID)
 	return o, nil
-}
-
-func FindByIdempotencyKey(ctx context.Context, key string) (*models.HedgeOrder, error) {
-	return findOne(ctx, bson.M{"idempotencyKey": key})
 }
 
 func findOne(ctx context.Context, filter bson.M) (*models.HedgeOrder, error) {
@@ -49,6 +50,12 @@ func findOne(ctx context.Context, filter bson.M) (*models.HedgeOrder, error) {
 		return nil, err
 	}
 	return &o, nil
+}
+
+// FindByIdempotencyKey looks an order up by its idempotency key (which is
+// its client order id).
+func FindByIdempotencyKey(ctx context.Context, key string) (*models.HedgeOrder, error) {
+	return findOne(ctx, bson.M{"idempotencyKey": key})
 }
 
 // UpdateHedgeOrder $sets patch (bson field names) and returns the new
@@ -73,42 +80,23 @@ func UpdateHedgeOrder(ctx context.Context, id bson.ObjectID, patch bson.M) (*mod
 func parseAssetID(assetID string) (bson.ObjectID, error) {
 	id, ok := mongox.ParseID(assetID)
 	if !ok {
-		// new Types.ObjectId(bad) throws a BSONError in TS (a 500).
 		return id, apperr.Internal("input must be a 24 character hex string, 12 byte Uint8Array, or an integer")
 	}
 	return id, nil
 }
 
-// GetSignedHedgeNotional is the signed hedge notional held on an asset.
-// Positive means the platform is long the underlying, negative means short.
+// GetSignedHedgeNotional is the signed filled hedge of an asset at the last
+// mark, minor units (+ long). Working orders do not count.
 func GetSignedHedgeNotional(ctx context.Context, assetID string) (int64, error) {
 	id, err := parseAssetID(assetID)
 	if err != nil {
 		return 0, err
 	}
-	cur, err := orders().Aggregate(ctx, bson.A{
-		bson.M{"$match": bson.M{"assetId": id, "status": bson.M{"$in": ActiveHedgeStatuses}, "closedAt": nil}},
-		bson.M{"$group": bson.M{"_id": "$side", "filled": bson.M{"$sum": "$filledNotional"}}},
-	})
-	if err != nil {
+	p, err := GetPosition(ctx, id)
+	if err != nil || p == nil {
 		return 0, err
 	}
-	var rows []struct {
-		Side   models.Direction `bson:"_id"`
-		Filled int64            `bson:"filled"`
-	}
-	if err := cur.All(ctx, &rows); err != nil {
-		return 0, err
-	}
-	var signed int64
-	for _, r := range rows {
-		if r.Side == models.DirectionUp {
-			signed += r.Filled
-		} else {
-			signed -= r.Filled
-		}
-	}
-	return signed, nil
+	return sgn(p.QtyE8) * p.NotionalInr, nil
 }
 
 // GetHedgedNotionalByAsset delegates to risk, where the query lives to avoid
@@ -165,13 +153,12 @@ func ListHedgeOrders(ctx context.Context, q HedgeOrderQuery) ([]models.HedgeOrde
 	return items, total, nil
 }
 
-// FindPendingOrders returns up to limit (default 200) non-final orders, oldest first.
-func FindPendingOrders(ctx context.Context, limit int64) ([]models.HedgeOrder, error) {
+// FindWorkingOrders returns up to limit working orders, oldest first.
+func FindWorkingOrders(ctx context.Context, limit int64) ([]models.HedgeOrder, error) {
 	if limit <= 0 {
 		limit = 200
 	}
-	cur, err := orders().Find(ctx,
-		bson.M{"status": bson.M{"$in": bson.A{models.HedgeOrderStatusPending, models.HedgeOrderStatusPartiallyFilled}}},
+	cur, err := orders().Find(ctx, bson.M{"status": bson.M{"$in": ActiveHedgeStatuses}},
 		options.Find().SetSort(bson.D{{Key: "createdAt", Value: 1}}).SetLimit(limit))
 	if err != nil {
 		return nil, err
@@ -180,37 +167,30 @@ func FindPendingOrders(ctx context.Context, limit int64) ([]models.HedgeOrder, e
 	return items, cur.All(ctx, &items)
 }
 
-type HedgePnlSummary struct {
-	Realised   int64 `json:"realised" bson:"realised"`
-	Unrealised int64 `json:"unrealised" bson:"unrealised"`
-	Orders     int64 `json:"orders" bson:"orders"`
+// FindPendingOrders is FindWorkingOrders (kept for callers of the old name).
+func FindPendingOrders(ctx context.Context, limit int64) ([]models.HedgeOrder, error) {
+	return FindWorkingOrders(ctx, limit)
 }
 
-func GetHedgePnlSummary(ctx context.Context, from *time.Time) (HedgePnlSummary, error) {
-	match := bson.M{}
-	if from != nil {
-		match["createdAt"] = bson.M{"$gte": *from}
-	}
-	cur, err := orders().Aggregate(ctx, bson.A{
-		bson.M{"$match": match},
-		bson.M{"$group": bson.M{
-			"_id":        nil,
-			"realised":   bson.M{"$sum": "$realisedPnl"},
-			"unrealised": bson.M{"$sum": "$unrealisedPnl"},
-			"orders":     bson.M{"$sum": 1},
-		}},
-	})
+// findOrdersMissingFills: final orders whose fills the ledger does not hold
+// yet (fills can lag the order state).
+func findOrdersMissingFills(ctx context.Context, limit int64) ([]models.HedgeOrder, error) {
+	cur, err := orders().Find(ctx, bson.M{
+		"status":        bson.M{"$in": bson.A{models.HedgeOrderStatusFilled, models.HedgeOrderStatusCancelled}},
+		"$expr":         bson.M{"$lt": bson.A{"$fillsQtyE8", "$filledQtyE8"}},
+		"venue":         bson.M{"$exists": true},
+		"finalAt":       bson.M{"$ne": nil},
+		"clientOrderId": bson.M{"$type": "string"},
+	}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: 1}}).SetLimit(limit))
 	if err != nil {
-		return HedgePnlSummary{}, err
+		return nil, err
 	}
-	var rows []HedgePnlSummary
-	if err := cur.All(ctx, &rows); err != nil {
-		return HedgePnlSummary{}, err
-	}
-	if len(rows) == 0 {
-		return HedgePnlSummary{}, nil
-	}
-	return rows[0], nil
+	items := []models.HedgeOrder{}
+	return items, cur.All(ctx, &items)
+}
+
+func findWorkingOrderFor(ctx context.Context, assetID bson.ObjectID) (*models.HedgeOrder, error) {
+	return findOne(ctx, bson.M{"assetId": assetID, "status": bson.M{"$in": ActiveHedgeStatuses}})
 }
 
 // FindHedgeOrderByID returns nil for an unknown or malformed id.
@@ -220,4 +200,28 @@ func FindHedgeOrderByID(ctx context.Context, id string) (*models.HedgeOrder, err
 		return nil, nil
 	}
 	return findOne(ctx, bson.M{"_id": oid})
+}
+
+// ListFills returns ledger rows newest first.
+func ListFills(ctx context.Context, assetID string, page, limit int64) ([]models.HedgeFill, int64, error) {
+	filter := bson.M{}
+	if assetID != "" {
+		id, err := parseAssetID(assetID)
+		if err != nil {
+			return nil, 0, err
+		}
+		filter["assetId"] = id
+	}
+	page, limit = max(page, 1), max(limit, 1)
+	cur, err := fills().Find(ctx, filter, options.Find().
+		SetSort(bson.D{{Key: "tradeTime", Value: -1}, {Key: "tradeId", Value: -1}}).SetSkip((page-1)*limit).SetLimit(limit))
+	if err != nil {
+		return nil, 0, err
+	}
+	items := []models.HedgeFill{}
+	if err := cur.All(ctx, &items); err != nil {
+		return nil, 0, err
+	}
+	total, err := fills().CountDocuments(ctx, filter)
+	return items, total, err
 }

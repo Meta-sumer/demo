@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Keyboard, Pressable, ScrollView, View } from 'react-native';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { randomUUID } from 'expo-crypto';
 import * as Haptics from 'expo-haptics';
 import Animated, { useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
@@ -40,7 +40,8 @@ import {
   stakeLimits,
   stepAmount,
 } from './ticketModel';
-import type { Asset, AssetSentiment, Direction } from '../../types/api';
+import { isPaused, isRequote, quoteBlockedReason, requoteFrom, shownPayout, shownTerms, sidePayout } from './livePayout';
+import type { Asset, AssetSentiment, Direction, EntryQuote } from '../../types/api';
 
 /**
  * The trade ticket.
@@ -124,6 +125,10 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
   const [sheetError, setSheetError] = useState<string | null>(null);
   /** Set when the server refused the fill because the price moved. */
   const [reQuote, setReQuote] = useState<{ direction: Direction; serverPrice: number } | null>(null);
+  /** Set when the server refused the order because its offer expired, was used or the payout moved. */
+  const [payoutChange, setPayoutChange] = useState<{ direction: Direction; payoutPercent: number | null } | null>(
+    null,
+  );
   const cooldownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /**
    * True from the moment an order is sent until its cooldown ends.
@@ -156,7 +161,10 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
   // The durations belong to the asset they were listed for.
   useEffect(() => setTimeOpen(false), [asset?.id]);
 
-  useEffect(() => setReQuote(null), [asset?.id, expirySeconds, text]);
+  useEffect(() => {
+    setReQuote(null);
+    setPayoutChange(null);
+  }, [asset?.id, expirySeconds, text]);
 
   useEffect(
     () => () => {
@@ -194,6 +202,32 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
   const stake = amount.kind === 'valid' ? amount.value : null;
   const presets = amountPresets(limits, available);
 
+  // The pricing engine's offers for this asset, duration and amount, fetched
+  // every second while the ticket is open (each offer locks its payout for a
+  // few seconds and is good for one order). The catalogue's figure stands in
+  // until the first one lands.
+  const quoteKey = ['entry-quote', asset?.id, expirySeconds, stake, account] as const;
+  const quoteQuery = useQuery({
+    queryKey: quoteKey,
+    queryFn: () =>
+      api.trades.entryQuote({ assetId: asset!.id, expirySeconds, amount: stake ?? undefined, accountType: account }),
+    enabled: !!asset && !!payout && asset.marketOpen,
+    refetchInterval: 1000,
+    retry: false,
+    // Across a change of amount the last offers for the same market stay up.
+    placeholderData: (previous) =>
+      previous && previous.assetId === asset?.id && previous.expirySeconds === expirySeconds && previous.accountType === account
+        ? previous
+        : undefined,
+  });
+  const quote: EntryQuote | null = quoteQuery.data ?? null;
+  const quoteRef = useRef(quote);
+  quoteRef.current = quote;
+  const catalogue = payout?.payoutPercent ?? null;
+  const upPayout = sidePayout(quote, 'UP', catalogue);
+  const downPayout = sidePayout(quote, 'DOWN', catalogue);
+  const livePayout = shownPayout(quote, catalogue);
+
   const feedBlocked = !asset || asset.feed.status === 'OFFLINE' || asset.feed.status === 'STALE';
 
   // What stops a trade that is not about the amount. The amount has its own
@@ -208,7 +242,7 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
           ? 'Price feed ' + asset.feed.status.toLowerCase() + ' - trading paused'
           : !payout
             ? 'This duration is not available right now'
-            : null;
+            : quoteBlockedReason(quote);
   const cannotTrade = !!blockedReason || stake === null;
 
   /**
@@ -226,10 +260,10 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
       stake,
       currency,
       expirySeconds,
-      payoutPercent: payout.payoutPercent,
-      potentialReturn: stake + Math.round((stake * payout.payoutPercent) / 100),
+      payoutPercent: livePayout ?? payout.payoutPercent,
+      potentialReturn: stake + Math.round((stake * (livePayout ?? payout.payoutPercent)) / 100),
     };
-  }, [asset, payout, stake, currency, expirySeconds]);
+  }, [asset, payout, stake, currency, expirySeconds, livePayout]);
 
   // While the confirmation is open the chart shows the order it describes.
   // Re-shown once a refused attempt's cancelled marker has cleared, so the
@@ -277,6 +311,9 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
           amount: stake!,
           expirySeconds,
           quotedPrice,
+          // The offer on screen (its payout is locked) and the payout shown;
+          // terms that moved in flight come back as a re-quote.
+          ...shownTerms(quoteRef.current, direction, catalogue),
           // Read at the moment of sending, not from the render: an account
           // switch a moment ago must not be undone by a stale closure.
           accountType: useAccountStore.getState().active,
@@ -285,6 +322,9 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
       ),
     onSuccess: (trade) => {
       setReQuote(null);
+      setPayoutChange(null);
+      // The offer is used up: fetch the next one now rather than in a second.
+      void quoteQuery.refetch();
       setSheetError(null);
       setConfirming(null);
       // The server's row takes over the drawing; the preview has done its job.
@@ -305,7 +345,24 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
     onError: (error, variables) => {
       // Nothing was placed. The marker shows that rather than disappearing.
       rejectPreview();
+      if (error instanceof ApiRequestError && isRequote(error.code)) {
+        // The offer expired, was used, or the payout moved while the order
+        // was in flight. Nothing was placed: show the fresh offer and ask.
+        const fresh = requoteFrom(error.details);
+        if (fresh) queryClient.setQueryData(quoteKey, fresh);
+        else void quoteQuery.refetch();
+        setPayoutChange({
+          direction: variables.direction,
+          payoutPercent: fresh ? sidePayout(fresh, variables.direction, null) : null,
+        });
+        if (confirmingRef.current) setSheetError(error.message);
+        return;
+      }
       if (error instanceof ApiRequestError && error.code === 'PRICE_MOVED') {
+        // The fresh offers come with the refusal: the re-sent order uses them.
+        const fresh = requoteFrom(error.details);
+        if (fresh) queryClient.setQueryData(quoteKey, fresh);
+        else void quoteQuery.refetch();
         const details = error.details as { serverPrice?: number } | undefined;
         // Offer the new price rather than just reporting the refusal - the
         // trader still wants the trade, at a price they can now see.
@@ -313,6 +370,13 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
           setReQuote({ direction: variables.direction, serverPrice: details.serverPrice });
           return;
         }
+      }
+      if (error instanceof ApiRequestError && isPaused(error.code)) {
+        // Not the trader's doing (a halt, the feed, the book): the refusal
+        // carries a fresh quote, so the ticket shows what is offered now.
+        const fresh = requoteFrom(error.details);
+        if (fresh) queryClient.setQueryData(quoteKey, fresh);
+        else void quoteQuery.refetch();
       }
       const message = error instanceof ApiRequestError ? error.message : 'Could not place the trade';
       // Inside the confirmation the reason belongs next to the button that
@@ -350,6 +414,7 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
     if (pending || sendingRef.current || cannotTrade) return;
     Keyboard.dismiss();
     setReQuote(null);
+    setPayoutChange(null);
     if (confirmBeforeTrade) {
       setSheetError(null);
       setDontAskAgain(false);
@@ -378,6 +443,7 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
   const edit = useCallback(() => {
     setConfirming(null);
     setReQuote(null);
+    setPayoutChange(null);
     setSheetError(null);
     clearIntent();
   }, [clearIntent]);
@@ -388,6 +454,14 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
     const { direction, serverPrice } = reQuote;
     setReQuote(null);
     send(direction, serverPrice);
+  }
+
+  /** Re-send on the offer the server just made (one-tap trading). */
+  function confirmPayoutChange() {
+    if (!payoutChange || pending || cannotTrade) return;
+    const { direction } = payoutChange;
+    setPayoutChange(null);
+    send(direction, livePrice);
   }
 
   function writeAmount(minor: number) {
@@ -403,7 +477,8 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
     stake,
     currency,
     expirySeconds: payout ? expirySeconds : null,
-    payoutPercent: payout?.payoutPercent ?? null,
+    // The live offer: the confirming direction's own payout while confirming.
+    payoutPercent: confirming ? sidePayout(quote, confirming, catalogue) : livePayout,
     account,
   };
 
@@ -599,10 +674,49 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
           </View>
         ) : null}
 
+        {/* The offer expired, was used or the payout moved while the order was
+            in flight: nothing was placed, and the new payout is offered. */}
+        {payoutChange && !confirming && !blockedReason ? (
+          <View accessibilityRole="alert" className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2.5">
+            <Text className="text-[11px] font-semibold text-warn">The payout changed before your order landed</Text>
+            <Text className="mt-1 text-[11px] text-content-300">
+              {payoutChange.payoutPercent !== null
+                ? 'Nothing was placed. ' + payoutChange.direction + ' now pays ' + payoutChange.payoutPercent + '%.'
+                : 'Nothing was placed. ' + payoutChange.direction + ' cannot be traded right now.'}
+            </Text>
+            <View className="mt-2 flex-row gap-1.5">
+              {payoutChange.payoutPercent !== null ? (
+                <Pressable
+                  onPress={confirmPayoutChange}
+                  disabled={pending !== null}
+                  accessibilityRole="button"
+                  className={cn(
+                    'flex-1 items-center rounded-md px-2 py-2 active:opacity-90',
+                    payoutChange.direction === 'UP' ? 'bg-up-solid' : 'bg-down-solid',
+                    pending !== null && 'opacity-40',
+                  )}
+                >
+                  <Text className="text-[11px] font-bold text-white">
+                    Place {payoutChange.direction} at {payoutChange.payoutPercent}%
+                  </Text>
+                </Pressable>
+              ) : null}
+              <Pressable
+                onPress={() => setPayoutChange(null)}
+                accessibilityRole="button"
+                className="items-center rounded-md px-3 py-2 active:bg-surface-800"
+              >
+                <Text className="text-[11px] font-semibold text-content-400">Cancel</Text>
+              </Pressable>
+            </View>
+          </View>
+        ) : null}
+
         <View className="flex-row gap-2">
           <DirectionButton
             direction="UP"
-            blocked={cannotTrade}
+            payoutPercent={upPayout}
+            blocked={cannotTrade || upPayout === null}
             pending={pending === 'UP'}
             busy={pending !== null}
             onPlace={() => press('UP')}
@@ -611,7 +725,8 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
           />
           <DirectionButton
             direction="DOWN"
-            blocked={cannotTrade}
+            payoutPercent={downPayout}
+            blocked={cannotTrade || downPayout === null}
             pending={pending === 'DOWN'}
             busy={pending !== null}
             onPlace={() => press('DOWN')}
@@ -682,7 +797,7 @@ export function TradeTicket({ asset, mode, tradesOpen, onToggleTrades, openCount
       <HowItWorksSheet
         open={guideOpen}
         onClose={() => setGuideOpen(false)}
-        example={{ stake, payoutPercent: payout?.payoutPercent ?? null, currency }}
+        example={{ stake, payoutPercent: livePayout, currency }}
       />
     </View>
   );
@@ -790,6 +905,7 @@ function MajorityOpinion({ sentiment }: { sentiment: AssetSentiment | null | und
  */
 function DirectionButton({
   direction,
+  payoutPercent,
   blocked,
   pending,
   busy,
@@ -798,6 +914,8 @@ function DirectionButton({
   onLeave,
 }: {
   direction: Direction;
+  /** The live payout for this direction, when known. */
+  payoutPercent?: number | null;
   blocked: boolean;
   pending: boolean;
   busy: boolean;
@@ -829,6 +947,9 @@ function DirectionButton({
         <Icon as={up ? ArrowUp : ArrowDown} size={20} strokeWidth={3} color="#fff" />
       )}
       <Text className="text-base font-black tracking-wide text-white">{direction}</Text>
+      {payoutPercent != null ? (
+        <Text className="text-xs font-bold tnum text-white opacity-80">{payoutPercent}%</Text>
+      ) : null}
     </Pressable>
   );
 }

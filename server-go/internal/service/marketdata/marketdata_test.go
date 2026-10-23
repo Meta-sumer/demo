@@ -10,7 +10,7 @@ import (
 
 // Ported from server/tests/unit/feed-health.test.ts.
 
-var thresholds = FeedClassificationInput{HealthyMaxMs: 100, DegradedMaxMs: 300, StaleMaxMs: 1000, TickMaxAgeMs: 5000}
+var thresholds = FeedClassificationInput{HealthyMaxMs: 100, DegradedMaxMs: 300, TickMaxAgeMs: 5000}
 
 func classify(age, latency int64, t FeedClassificationInput) models.FeedStatus {
 	t.AgeMs, t.LatencyMs = age, latency
@@ -18,7 +18,7 @@ func classify(age, latency int64, t FeedClassificationInput) models.FeedStatus {
 }
 
 func TestFeedHealthClassification(t *testing.T) {
-	strict := FeedClassificationInput{HealthyMaxMs: 10, DegradedMaxMs: 20, StaleMaxMs: 30, TickMaxAgeMs: 40}
+	strict := FeedClassificationInput{HealthyMaxMs: 10, DegradedMaxMs: 20, TickMaxAgeMs: 40}
 	cases := []struct {
 		name         string
 		age, latency int64

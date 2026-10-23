@@ -16,18 +16,50 @@ var (
 	opts   *redis.Options
 )
 
+// Command retry policy. A transient failure (a dropped or reset connection,
+// a Redis restart or LOADING, a pool timeout) is retried on a fresh
+// connection instead of failing the command, as the Node server's ioredis
+// client did. The budget is bounded so a real outage still surfaces within
+// about two seconds and the callers' own fallbacks take over (rate-limit
+// memory window, session state from MongoDB, the next worker tick).
+//
+// In go-redis v9, MaxRetries -1 DISABLES retries (0 means the default of 3),
+// which is why an earlier "-1 = never give up" setting left every command
+// with no retry at all.
+//
+// A command whose reply was lost may run twice. Every script and key this
+// server writes tolerates that: the exposure book and the expiry queue use
+// idempotent per-trade scripts, a lock SET NX that is replayed finds its own
+// key and the waiter retries until the TTL, and a doubled rate-limit INCR
+// only errs on the strict side.
+const (
+	MaxRetries      = 3
+	MinRetryBackoff = 100 * time.Millisecond
+	MaxRetryBackoff = time.Second
+	PoolSize        = 64
+)
+
+// ClientOptions parses url and applies the server's pool and retry policy.
+func ClientOptions(url string) (*redis.Options, error) {
+	o, err := redis.ParseURL(url)
+	if err != nil {
+		return nil, err
+	}
+	o.MaxRetries = MaxRetries
+	o.MinRetryBackoff = MinRetryBackoff
+	o.MaxRetryBackoff = MaxRetryBackoff
+	o.PoolSize = PoolSize
+	return o, nil
+}
+
 // Connect opens the shared pool. go-redis multiplexes a pool, so unlike
 // ioredis there is no separate publisher connection; subscriptions and
 // blocking commands take their own connection from the pool automatically.
 func Connect(ctx context.Context, url string) error {
-	o, err := redis.ParseURL(url)
+	o, err := ClientOptions(url)
 	if err != nil {
 		return err
 	}
-	o.MaxRetries = -1 // never fail a command because of a retry budget
-	o.MinRetryBackoff = 200 * time.Millisecond
-	o.MaxRetryBackoff = 5 * time.Second
-	o.PoolSize = 64
 	opts = o
 	client = redis.NewClient(o)
 	if err := client.Ping(ctx).Err(); err != nil {
@@ -41,7 +73,7 @@ func Connect(ctx context.Context, url string) error {
 func R() *redis.Client { return client }
 
 // NewConnection returns a dedicated client for a consumer that blocks
-// (BRPOP), so it cannot starve the shared pool.
+// (BRPOP), so it cannot starve the shared pool. It keeps the retry policy.
 func NewConnection() *redis.Client {
 	o := *opts
 	o.PoolSize = 2

@@ -1,0 +1,6 @@
+# Host watchdog for wintratrade.online (installed by deploy/vps/deploy.sh):
+# emails when the API stops answering /ready, the disk fills or the TLS
+# certificate is about to expire. See deploy/vps/monitor.sh.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root bash /opt/wintratrade/deploy/vps/monitor.sh >> /var/log/wintratrade-monitor.log 2>&1

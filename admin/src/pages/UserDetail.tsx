@@ -8,6 +8,13 @@ import { useAuthStore } from '../stores/authStore';
 import { toast } from '../hooks/useToast';
 import { formatDateTime, formatMoney, formatSignedMoney, fromMinor, toMinor } from '../utils/format';
 import { createAttemptKey } from '../utils/idempotency';
+import {
+  ADJUSTMENT_ACCOUNTS,
+  adjustmentCurrency,
+  formatAdjustment,
+  parseAdjustmentAmount,
+  type AdjustmentAccount,
+} from '../utils/adjustment';
 import { Badge, Panel, PanelHeader, Skeleton, Stat, StatusBadge } from '../components/ui';
 
 /**
@@ -23,10 +30,13 @@ export function UserDetailPage() {
   const query = useQuery({ queryKey: ['users', id], queryFn: () => api.users.detail(id) });
 
   const [adjustment, setAdjustment] = useState({
-    amountMinor: 1_000_00,
+    account: 'LIVE' as AdjustmentAccount,
+    amountText: '1000',
     direction: 'CREDIT' as 'CREDIT' | 'DEBIT',
     reason: '',
   });
+  // In the selected wallet's minor unit (paise, or micro-USDT for FUNDING).
+  const adjustmentAmount = parseAdjustmentAmount(adjustment.amountText, adjustment.account);
 
   const statusMutation = useMutation({
     mutationFn: (status: string) => api.users.update(id, { status }),
@@ -53,7 +63,12 @@ export function UserDetailPage() {
 
   const adjustMutation = useMutation({
     mutationFn: () => {
-      const input = { amount: adjustment.amountMinor, direction: adjustment.direction, reason: adjustment.reason };
+      const input = {
+        amount: adjustmentAmount ?? 0,
+        direction: adjustment.direction,
+        reason: adjustment.reason,
+        accountType: adjustment.account,
+      };
       return api.users.adjustWallet(id, input, adjustKey.for({ id, ...input }));
     },
     onSuccess: () => {
@@ -71,6 +86,9 @@ export function UserDetailPage() {
 
   const { user, wallet, stats, openExposure } = query.data;
   const demoWallet = query.data.wallets?.find((w) => w.accountType === 'DEMO');
+  const fundingWallet = query.data.fundingWallet ?? null;
+  const adjustedWallet =
+    adjustment.account === 'FUNDING' ? fundingWallet : adjustment.account === 'DEMO' ? (demoWallet ?? null) : wallet;
 
   return (
     <div className="space-y-4">
@@ -205,16 +223,37 @@ export function UserDetailPage() {
             description="Recorded in the append-only audit log with your account and the stated reason"
           />
           <form
-            className="grid gap-3 p-4 sm:grid-cols-[140px_180px_minmax(0,1fr)_auto]"
+            className="grid gap-3 p-4 sm:grid-cols-[150px_120px_180px_minmax(0,1fr)_auto]"
             onSubmit={(event) => {
               event.preventDefault();
               if (adjustment.reason.trim().length < 3) {
                 toast('error', 'A reason is required');
                 return;
               }
+              if (adjustmentAmount === null) {
+                toast('error', 'Enter a positive amount in ' + adjustmentCurrency(adjustment.account));
+                return;
+              }
               adjustMutation.mutate();
             }}
           >
+            <div>
+              <label className="label" htmlFor="account">
+                Wallet
+              </label>
+              <select
+                id="account"
+                className="field"
+                value={adjustment.account}
+                onChange={(event) => setAdjustment((a) => ({ ...a, account: event.target.value as AdjustmentAccount }))}
+              >
+                {ADJUSTMENT_ACCOUNTS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
             <div>
               <label className="label" htmlFor="direction">
                 Direction
@@ -233,15 +272,17 @@ export function UserDetailPage() {
             </div>
             <div>
               <label className="label" htmlFor="amount">
-                Amount
+                Amount ({adjustmentCurrency(adjustment.account)})
               </label>
               <input
                 id="amount"
                 className="field tnum"
-                value={fromMinor(adjustment.amountMinor)}
+                inputMode="decimal"
+                value={adjustment.amountText}
+                aria-invalid={adjustmentAmount === null}
                 onChange={(event) => {
-                  const parsed = Number(event.target.value.replace(/[^0-9.]/g, ''));
-                  if (Number.isFinite(parsed)) setAdjustment((a) => ({ ...a, amountMinor: toMinor(parsed) }));
+                  const amountText = event.target.value.replace(/[^0-9.,]/g, '');
+                  setAdjustment((a) => ({ ...a, amountText }));
                 }}
               />
             </div>
@@ -258,10 +299,23 @@ export function UserDetailPage() {
               />
             </div>
             <div className="flex items-end">
-              <button type="submit" className="btn-primary" disabled={adjustMutation.isPending}>
+              <button type="submit" className="btn-primary" disabled={adjustMutation.isPending || adjustmentAmount === null}>
                 Apply
               </button>
             </div>
+            <p className="text-[11px] text-content-400 sm:col-span-5">
+              {adjustedWallet
+                ? 'Balance ' +
+                  formatAdjustment(adjustedWallet.balance, adjustment.account) +
+                  ', available ' +
+                  formatAdjustment(adjustedWallet.availableBalance, adjustment.account)
+                : 'No USDT wallet yet: a credit opens it.'}
+              {adjustmentAmount !== null
+                ? ' - this ' +
+                  (adjustment.direction === 'CREDIT' ? 'adds ' : 'removes ') +
+                  formatAdjustment(adjustmentAmount, adjustment.account)
+                : ''}
+            </p>
           </form>
         </Panel>
       ) : null}

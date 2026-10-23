@@ -34,12 +34,16 @@ export const STANDING_WORDS: Record<Standing, string> = {
   draw: 'draw, refunded',
 };
 
-type Terms = Pick<Trade, 'direction' | 'entryPrice' | 'stake' | 'profit'>;
+type Terms = Pick<Trade, 'direction' | 'entryPrice' | 'stake' | 'profit' | 'drawPolicy'>;
 
 const WINNING = (trade: Terms): LiveResult => ({ standing: 'winning', amount: trade.profit });
 const LOSING = (trade: Terms): LiveResult => ({ standing: 'losing', amount: -trade.stake });
 
-/** Null without a usable price: no number is better than one computed from nothing. */
+/**
+ * Null without a usable price: no number is better than one computed from nothing.
+ * A tie follows the rule frozen on the trade when the server sends it; `drawPolicy`
+ * (the platform's current rule) is only the fallback for older trades.
+ */
 export function liveResult(
   trade: Terms,
   price: number | null | undefined,
@@ -47,8 +51,9 @@ export function liveResult(
 ): LiveResult | null {
   if (price === null || price === undefined || !Number.isFinite(price)) return null;
   if (price === trade.entryPrice) {
-    if (drawPolicy === 'LOSS') return LOSING(trade);
-    if (drawPolicy === 'WIN') return WINNING(trade);
+    const policy = trade.drawPolicy ?? drawPolicy;
+    if (policy === 'LOSS') return LOSING(trade);
+    if (policy === 'WIN') return WINNING(trade);
     return { standing: 'draw', amount: 0 };
   }
   const above = price > trade.entryPrice;

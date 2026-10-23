@@ -26,8 +26,8 @@ trustworthy with money:
 | Redis is never the accounting record | MongoDB owns every financial fact; exposure counters and the expiry queue are rebuilt from it at boot |
 | A position cannot be closed early and settled at expiry | Early close takes the same `OPEN → SETTLING` claim and the same `trade:settle:<id>` ledger key as expiry settlement |
 | A stale feed stops new trades | `assertFeedTradable` refuses the trade; open trades still settle under their published terms |
-| Hedging cannot touch a customer | The settlement path never reads a hedge order — there is a test that proves the outcome is identical hedged and unhedged |
-| Every financial change is auditable | Append-only `audit_logs`, with mutation blocked at the schema level |
+| Hedging cannot touch a customer | The settlement path never reads a hedge order: `internal/service/settlement` does not depend on `internal/service/hedging` at all (`go list -deps ./internal/service/settlement`) |
+| Every financial change is auditable | `audit_logs` rows for approvals, adjustments, settings and settlements; append-only by convention (no code path updates or deletes them; there is no database-level guard, see `docs/audit/security/threat-model.md` R7) |
 
 ---
 
@@ -370,54 +370,62 @@ replaces a class and nothing else changes.
 npm test                       # go test ./... in server-go, then the client tests
 npm run typecheck              # go vet ./..., then strict TypeScript in client and admin
 npm run build                  # server binary and production frontend builds
+npm run test --workspace admin # the admin console's tests
+cd mobile && npm test          # the Android app's tests (its own npm install)
 ```
 
-The Go tests are unit tests of the pure logic (money, risk scoring and limits,
-settlement rules, early-close pricing, exposure derivation, validation) and need
-neither MongoDB nor Redis.
+**Go (`server-go`, about 400 test functions).** Unit tests cover the pure
+logic (money, risk scoring and limits, settlement and price rules, pricing,
+early-close pricing, validation, TOTP, configuration). The integration tests
+run against a real MongoDB replica set and Redis: point `MONGO_URI` at a
+replica set and `REDIS_URL` at a Redis, and each test creates a throwaway
+database (dropped afterwards) and keys of its own
+(`internal/testsupport.LiveStores`). Without them those tests skip. The main
+integration suites:
 
-The table below lists the concurrency and integration suites of the former
-Node/TypeScript server. They described the behaviour the Go server was ported
-to preserve; they have not been ported to Go (`indicators.test.ts` is a
-client suite and still runs):
-
-| Test | What it proves |
+| Package | What the tests prove |
 |---|---|
-| `exposure.test.ts` | The specification's worked example: UP 10,000 / DOWN 4,000 → net 6,000, gross 14,000 |
-| `wallet.test.ts` | 25 concurrent locks against a 1,000 balance yield exactly 10 successes and never oversell |
-| `wallet.test.ts` | Ten simultaneous identical settlements credit the customer once |
-| `trade.test.ts` | 100 concurrent requests create 100 distinct trades; 20 sharing an idempotency key create one |
-| `trade.test.ts` | A stale feed and a missing price both refuse new trades |
-| `settlement.test.ts` | Ten workers racing on one trade produce one settlement row and one wallet movement |
-| `settlement.test.ts` | 25 trades expiring at the same instant, each settled twice, settle exactly once each |
-| `settlement.test.ts` | A trade orphaned in `SETTLING` by a crashed worker is recovered |
-| `settlement.test.ts` | With no price available, settlement defers rather than guessing |
-| `hedging.test.ts` | A customer settles identically whether or not the book was hedged |
-| `api.test.ts` | RBAC, token rotation with replay detection, rate limiting, and that one user cannot read another's trade |
-| `early-close.test.ts` | A quote never mutates the position; closing twice is refused; a winning position is quoted above a losing one; the value stays under the full payout |
-| `candles.test.ts` | Folding minutes into wider frames preserves the first open, the last close and both extremes, and every frame comes back aligned and in order |
-| `indicators.test.ts` | The overlays are correct at the boundaries: no partial windows, no drift over a long series, population deviation for the bands |
-| `transfers.test.ts` | A deposit claim credits nothing until approved; the same UTR cannot be claimed twice, even across customers or by changing case; two operators approving together credit once; a withdrawal cannot be approved without its payout UTR; rejecting releases the reservation |
+| `internal/service/settlement` | Two workers on one trade, duplicate queue entries, crashes after the wallet move or the settlement row: one claim, one ledger movement, one settlement row (`statemachine_test.go`) |
+| `internal/service/exposure` | Concurrent reservations never breach the gross, net, user or liability limits; a rebuild during trading is exact; reconcile repairs drift; safe mode when counters vanish (`reserve_test.go`, `rebuild_test.go`) |
+| `internal/service/expiry`, `internal/platform/leader` | Leader fencing: a paused former leader's queue writes are refused; the queue is rebuilt from MongoDB |
+| `internal/service/binary` | Idempotent trade acceptance, early close (concurrent duplicate closes move money once), pricing acceptance |
+| `internal/service/wallets`, `internal/service/transfers` | Locks never oversell; settlements and approvals credit once; deposit and withdrawal flows; admin adjustments with an Idempotency-Key |
+| `internal/service/auth`, `internal/service/users`, `internal/platform/httpx` | Admin two-factor sign-in and recovery, session revocation (also on open websockets), spoofed `X-Forwarded-For`, the rate limiter with Redis down |
+| `internal/service/usdt`, `internal/service/hedging` | USDT deposits, withdrawals and provider reconciliation against the mock gateway; the hedge order lifecycle against a fake Binance |
+| `internal/service/reconciliation`, `internal/service/alerts` | Ledger and transfer checks, stuck settlements; alert de-duplication, email over STARTTLS / implicit TLS, retries, rate limit and digests |
+| `internal/platform/redisx` | A dropped Redis connection is retried, not failed |
 
-### Load test
+**Web and mobile.** `client/tests` (vitest: trade ticket model, payouts,
+time, CSV, USDT money, theme contrast and more), `admin/tests` and
+`mobile/tests` (the web client's pure-logic suites against the app's
+modules).
 
-The load-test harness belonged to the former Node server and has not been
-ported to Go. The figures below were measured with it, against the Node server:
+**CI.** `.github/workflows/ci.yml` runs on every push and pull request: Go
+build, `go vet`, a `gofmt` check and the whole Go suite against a MongoDB
+replica set and Redis started in the job, with a coverage report (job summary
+and artifact, per commit); the client and admin type check and tests; the
+mobile type check and tests.
 
+### Load and failover tests
+
+Two opt-in Go tests (build tag `loadtest`, `LOADTEST=1`; never part of
+`go test ./...` or CI) exercise the trade path under load and across real
+server processes:
+
+```bash
+cd server-go
+MONGO_URI=... REDIS_URL=... LOADTEST=1 go test -tags loadtest -run TestLoadTradeStormAndBookRebuild -v ./cmd/server
+MONGO_URI=... REDIS_URL=... LOADTEST=1 go test -tags loadtest -run TestFailoverMultiProcess -v ./cmd/server
 ```
-Orders      1921 sent, 1921 accepted, 0 rejected, 96 orders/sec sustained
-Acceptance  p50 210ms   p95 457ms   p99 660ms
-WebSockets  500/500 connected, delivery p50 12ms  p95 27ms  p99 42ms
-Feed        provider→server p99 1ms, processing p99 7ms
-```
 
-**This is not a capacity claim.** It was measured on one developer laptop:
-a single Node process, MongoDB and Redis in Docker Desktop on Windows, and the
-load generator on the same host. Acceptance latency is dominated by the wallet
-transaction committing with majority write concern on a single-node replica
-set. Per spec rule 15, production capacity should not be claimed until the same
-test is run against production-shaped infrastructure with several server
-instances and a real replica set.
+The first sends thousands of concurrent LIVE trade requests (with client
+retries on the same idempotency key, a forced exposure-book rebuild and a
+safe-mode episode in the middle) through the HTTP router; the second runs
+three server processes, kills the leader while trades are open and restarts
+it. Both then check that limits, the book, the ledger and the wallets
+reconcile exactly. The commands, the figures measured and what they mean are
+in `docs/audit/operations/load-and-failover.md`. They were measured on a
+developer machine and are **not a capacity claim** for production.
 
 ---
 
@@ -506,10 +514,12 @@ behaviour most:
 |---|---|
 | `MARKET_DATA_PROVIDER` | `simulated`, `binance` or `generic-ws`. Production refuses `simulated`. |
 | `HEDGE_PROVIDER` + `HEDGE_LIVE_EXECUTION_ENABLED` | Live orders require both. |
-| `FEED_HEALTHY_MAX_MS` / `FEED_DEGRADED_MAX_MS` / `FEED_STALE_MAX_MS` | Feed classification bands; also editable at runtime from the admin console. |
+| `FEED_HEALTHY_MAX_MS` / `FEED_DEGRADED_MAX_MS` / `FEED_TICK_MAX_AGE_MS` | Feed classification bands (HEALTHY up to the first, DEGRADED up to the second, STALE above it, OFFLINE past the tick age). They only seed the first risk configuration; afterwards the admin console (Settings) is the authority (`docs/audit/operations/feed-rules.md`). `FEED_STALE_MAX_MS` is retired and ignored. |
 | `ENABLE_MONGO_TRANSACTIONS` | Set false only for a standalone `mongod`. |
 | `WORKERS_ENABLED` | Set false on API-only replicas. |
 | `MONGO_PORT` | Host port for the dockerised MongoDB, if 27017 is taken. |
-#   b i n n a r y  
- #   d e m o  
+#   b i n n a r y 
+ 
+ #   d e m o 
+ 
  

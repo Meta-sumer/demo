@@ -15,11 +15,18 @@ import (
 	"binarytrading/internal/platform/mongox"
 )
 
-// Background work, each on exactly one instance (leader loops):
+// Background work, each on exactly one instance (leader loops, fenced: a
+// loop whose lease ran out stops between records, and every money effect is
+// keyed and conditional anyway, so an overlapping former leader can only
+// repeat a no-op):
 //   - webhook retry: reprocess stored events that failed or were deferred;
 //   - payout submission: re-send payouts whose outcome is unknown;
+//   - invoice expiry: ask BeeX about invoices whose window has passed;
+//   - payout polling: ask BeeX about submitted payouts gone quiet;
 //   - reconciliation sweep: poll BeeX for records webhooks seem to have
-//     missed. Webhooks stay primary; this is the fallback.
+//     missed. Webhooks stay primary; this is the fallback;
+//   - provider reconciliation: BeeX vs our records vs the ledger; whatever
+//     disagrees becomes an alert.
 
 const (
 	retryInterval   = 30 * time.Second
@@ -30,6 +37,10 @@ const (
 	stuckAfter      = 30 * time.Minute
 	reRefreshAfter  = 10 * time.Minute
 	sweepCallBudget = 5 * time.Minute
+
+	expiryInterval    = time.Minute
+	pollInterval      = time.Minute
+	reconcileInterval = 15 * time.Minute
 )
 
 // SweepResult reports one reconciliation sweep.
@@ -73,6 +84,9 @@ func Sweep(ctx context.Context, now time.Time) (SweepResult, error) {
 		return res, err
 	}
 	for _, d := range deps {
+		if err := stillLeader(ctx); err != nil {
+			return res, err
+		}
 		res.Deposits++
 		r, _, err := RefreshDeposit(ctx, d.ID, "sweeper")
 		if err != nil {
@@ -104,6 +118,9 @@ func Sweep(ctx context.Context, now time.Time) (SweepResult, error) {
 			return res, err
 		}
 		for _, w := range ws {
+			if err := stillLeader(ctx); err != nil {
+				return res, err
+			}
 			res.Withdrawals++
 			r, _, err := RefreshWithdrawal(ctx, w.ID, "sweeper")
 			if err != nil {
@@ -145,16 +162,28 @@ func Start() {
 	if len(loops) == 0 {
 		loops = []*leader.Loop{
 			leader.New(leader.Options{
-				Name: "usdt-webhook-retry", Interval: retryInterval, LockTTL: 5 * time.Minute,
+				Name: "usdt-webhook-retry", Interval: retryInterval, LockTTL: 5 * time.Minute, BoundTickToLease: true,
 				OnTick: func(ctx context.Context) error { _, err := RetryWebhookEvents(ctx, retryBatch); return err },
 			}),
 			leader.New(leader.Options{
-				Name: "usdt-payout-submit", Interval: retryInterval, LockTTL: 10 * time.Minute,
+				Name: "usdt-payout-submit", Interval: retryInterval, LockTTL: 10 * time.Minute, BoundTickToLease: true,
 				OnTick: func(ctx context.Context) error { _, err := RetryPendingSubmissions(ctx, submitBatch); return err },
 			}),
 			leader.New(leader.Options{
-				Name: "usdt-reconciliation", Interval: sweepInterval, LockTTL: 2 * sweepInterval,
+				Name: "usdt-invoice-expiry", Interval: expiryInterval, LockTTL: 10 * time.Minute, BoundTickToLease: true,
+				OnTick: func(ctx context.Context) error { _, err := ExpireOverdueDeposits(ctx, time.Now()); return err },
+			}),
+			leader.New(leader.Options{
+				Name: "usdt-payout-poll", Interval: pollInterval, LockTTL: 10 * time.Minute, BoundTickToLease: true,
+				OnTick: func(ctx context.Context) error { _, err := PollPayouts(ctx, time.Now()); return err },
+			}),
+			leader.New(leader.Options{
+				Name: "usdt-reconciliation", Interval: sweepInterval, LockTTL: 2 * sweepInterval, BoundTickToLease: true,
 				OnTick: func(ctx context.Context) error { _, err := Sweep(ctx, time.Now()); return err },
+			}),
+			leader.New(leader.Options{
+				Name: "usdt-provider-reconcile", Interval: reconcileInterval, LockTTL: 2 * reconcileInterval, BoundTickToLease: true,
+				OnTick: func(ctx context.Context) error { _, err := ReconcileProvider(ctx, time.Now()); return err },
 			}),
 		}
 	}

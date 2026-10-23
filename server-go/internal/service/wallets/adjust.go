@@ -25,6 +25,12 @@ import (
 // returns that result instead of moving money a second time. The same key with
 // a different body is refused: it is a different adjustment, and silently
 // replaying the first one would be wrong either way.
+//
+// The target is the customer's LIVE or DEMO trading wallet (INR, paise) or
+// the FUNDING wallet (USDT, micro-USDT) - the correction path when BeeX
+// contradicts itself after a money effect was applied. The rules are the
+// same for every account; the account (and so the currency) is part of the
+// request hash, so a key reused for another account is refused.
 
 const refAdminAdjustment = "AdminAdjustment"
 
@@ -46,7 +52,7 @@ func ValidateClientIdempotencyKey(key string) error {
 // AdminAdjustmentInput is one manual credit or debit.
 type AdminAdjustmentInput struct {
 	UserID string
-	// LIVE or DEMO; "" means LIVE.
+	// LIVE, DEMO or FUNDING; "" means LIVE. FUNDING amounts are micro-USDT.
 	AccountType string
 	// "CREDIT" or "DEBIT".
 	Direction string
@@ -83,6 +89,15 @@ func AdjustmentLedgerKey(actorID, clientKey string) string {
 	return "adjust:" + actorID + ":" + hex.EncodeToString(sum[:])[:32]
 }
 
+// AdjustmentCurrency is the currency of an account's wallet: USDT for
+// FUNDING, INR otherwise.
+func AdjustmentCurrency(accountType string) string {
+	if models.NormAccountType(accountType) == models.AccountFunding {
+		return models.CurrencyUSDT
+	}
+	return models.WalletDefaultCurrency
+}
+
 // AdminAdjustWallet applies a manual credit or debit exactly once per
 // Idempotency-Key. A replay returns the original result; the same key with a
 // different body fails 422 IDEMPOTENCY_PAYLOAD_MISMATCH. A debit that failed
@@ -101,6 +116,11 @@ func AdminAdjustWallet(ctx context.Context, in AdminAdjustmentInput) (AdminAdjus
 	if _, ok := mongox.ParseID(in.ActorID); !ok {
 		return AdminAdjustmentResult{}, apperr.Unauth()
 	}
+	switch in.AccountType {
+	case "", models.AccountLive, models.AccountDemo, models.AccountFunding:
+	default:
+		return AdminAdjustmentResult{}, apperr.Validation("accountType must be LIVE, DEMO or FUNDING", nil)
+	}
 	ctx = context.WithoutCancel(ctx)
 	account := models.NormAccountType(in.AccountType)
 	hash := adjustmentRequestHash(in)
@@ -116,6 +136,7 @@ func AdminAdjustWallet(ctx context.Context, in AdminAdjustmentInput) (AdminAdjus
 	adj := AdjustmentInput{
 		UserID:         in.UserID,
 		AccountType:    account,
+		Currency:       AdjustmentCurrency(account),
 		Amount:         in.Amount,
 		ReferenceType:  refAdminAdjustment,
 		ReferenceID:    ref,

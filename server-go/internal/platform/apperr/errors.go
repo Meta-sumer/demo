@@ -46,6 +46,16 @@ const (
 	IdempotencyInProgress      = "IDEMPOTENCY_IN_PROGRESS"
 	IdempotencyPayloadMismatch = "IDEMPOTENCY_PAYLOAD_MISMATCH"
 
+	// Pricing engine (docs/audit/pricing/pricing-spec.md): no offer can be
+	// made now (503, details.reason); the offer the app traded on is unknown,
+	// already used or for another trade (409), or expired (409); a trade sent
+	// without an offer would pay less than the app displayed (409). The 409s
+	// carry a fresh quote in details.quote.
+	PricingUnavailable = "PRICING_UNAVAILABLE"
+	OfferInvalid       = "OFFER_INVALID"
+	OfferExpired       = "OFFER_EXPIRED"
+	PayoutChanged      = "PAYOUT_CHANGED"
+
 	AlreadySettled        = "ALREADY_SETTLED"
 	SettlementFailed      = "SETTLEMENT_FAILED"
 	HedgeProviderError    = "HEDGE_PROVIDER_ERROR"

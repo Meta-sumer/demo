@@ -108,14 +108,15 @@ func cancelURL() string {
 }
 
 // ModeAccepted decides whether money reported in this BeeX mode may be
-// credited. Production credits live only; development also accepts test
-// when BEEX_ACCEPT_TEST_MODE=true (which config refuses in production).
+// credited. Production credits live only, unless it deliberately runs the
+// sandbox (ALLOW_BEEX_SANDBOX_IN_PRODUCTION=true); development also accepts
+// test when BEEX_ACCEPT_TEST_MODE=true.
 func ModeAccepted(mode string) error {
 	switch mode {
 	case "live":
 		return nil
 	case "test":
-		if !config.IsProduction() && env().BeexAcceptTestMode {
+		if env().BeexAcceptTestMode && (!config.IsProduction() || env().AllowBeexSandboxInProduction) {
 			return nil
 		}
 		if config.IsProduction() {
@@ -127,6 +128,20 @@ func ModeAccepted(mode string) error {
 	}
 	return errors.New("unknown payment mode " + mode)
 }
+
+// ProviderMode is the configured provider's mode: "live" for a ck_live_
+// key, "test" for a ck_test_ key or the mock, "" when it cannot be built.
+func ProviderMode() string {
+	p, err := beex.Get()
+	if err != nil {
+		return ""
+	}
+	return p.Mode()
+}
+
+// Sandbox reports that no real money can move: the provider is the mock or
+// runs on a test key.
+func Sandbox() bool { return ProviderMode() != "live" }
 
 func provider() (beex.Provider, error) {
 	p, err := beex.Get()

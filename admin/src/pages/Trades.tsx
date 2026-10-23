@@ -4,6 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import clsx from 'clsx';
 import { api } from '../services/api';
 import { formatDateTime, formatMoney, formatPrice, formatSignedMoney } from '../utils/format';
+import { isVoided, VOID_LABEL } from '../utils/tradeStatus';
 import { AccountBadge, Badge, Pagination, Panel, PanelHeader, StatusBadge, TableSkeleton } from '../components/ui';
 
 /** All customer trades (spec section 19). */
@@ -45,7 +46,7 @@ export function TradesPage() {
               <option value="SETTLING">Settling</option>
               <option value="WON">Won</option>
               <option value="LOST">Lost</option>
-              <option value="DRAW">Draw</option>
+              <option value="DRAW">Draw / void</option>
               <option value="CANCELLED">Cancelled</option>
             </select>
             <select
@@ -116,7 +117,13 @@ export function TradesPage() {
                       {trade.expiryPrice !== null ? formatPrice(trade.expiryPrice, 2) : '--'}
                     </td>
                     <td>
-                      <StatusBadge status={trade.status} />
+                      {isVoided(trade) ? (
+                        <span title={trade.voidReason ?? ''}>
+                          <Badge tone="warn">{VOID_LABEL}</Badge>
+                        </span>
+                      ) : (
+                        <StatusBadge status={trade.status} />
+                      )}
                     </td>
                     <td
                       className={clsx(

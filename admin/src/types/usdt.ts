@@ -90,6 +90,18 @@ export interface UsdtWithdrawalView {
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
+  /** Admin view: the last submission error. */
+  lastSubmitError?: string | null;
+  /** Admin view: BeeX's answer that did not match this withdrawal (not applied). */
+  providerMismatch?: string | null;
+  providerMismatchAt?: string | null;
+  /** Admin view: the automatic paths cannot finish it; an operator may mark it completed or failed. */
+  operatorResolvable?: boolean;
+  /** Admin view: an operator's resolution after checking the payout with BeeX. */
+  resolution?: 'completed' | 'failed' | null;
+  resolvedBy?: string | null;
+  resolvedAt?: string | null;
+  resolutionNote?: string | null;
 }
 
 export interface WebhookEventView {
@@ -176,6 +188,41 @@ export interface UsdtSummary {
     /** Shape is the provider's; rendered generically (map or list of currency/amount). */
     balances?: unknown;
   };
+  enabled?: boolean;
+  /** The mock or a test key: no real money moves. */
+  sandbox?: boolean;
+  /** Withdrawals above this wait for an operator; 0 = every one does. */
+  reviewAbove?: number;
+  alerts?: UsdtAlertSummary;
+}
+
+export type UsdtAlertSeverity = 'warning' | 'critical';
+
+/** A disagreement between BeeX, our records and the ledger, raised by the server; never auto-corrected. */
+export interface UsdtAlertView {
+  id: string;
+  key: string;
+  kind: 'deposit' | 'withdrawal' | 'webhook' | 'provider' | string;
+  code: string;
+  severity: UsdtAlertSeverity | string;
+  message: string;
+  details: unknown;
+  depositId: string | null;
+  withdrawalId: string | null;
+  eventId: string | null;
+  status: 'open' | 'resolved' | string;
+  occurrences: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  resolvedBy: string | null;
+  resolvedAt: string | null;
+  resolutionNote: string | null;
+}
+
+export interface UsdtAlertSummary {
+  open: number;
+  critical: number;
+  latest: UsdtAlertView[];
 }
 
 export interface UsdtPayoutLimits {

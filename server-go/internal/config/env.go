@@ -37,10 +37,16 @@ type Env struct {
 	MarketDataAPISecret            string
 	MarketDataWSURL                string
 	AllowSimulatedFeedInProduction bool
+	// APPLY_LAUNCH_SCOPE=true switches off, at boot, the assets that are not
+	// in the launch scope (EUR/USD, GBP/USD, XAU/USD): idempotent and
+	// audited (service/assets/launchscope.go). Set it for the deploy that
+	// introduces the launch scope; harmless if left on.
+	ApplyLaunchScope bool
 
+	// Seed version 1 of the risk configuration only; afterwards the active
+	// risk configuration is the authority (FEED_STALE_MAX_MS is retired).
 	FeedHealthyMaxMs  int64
 	FeedDegradedMaxMs int64
-	FeedStaleMaxMs    int64
 	FeedTickMaxAgeMs  int64
 
 	HedgeProvider             string
@@ -48,6 +54,30 @@ type Env struct {
 	HedgeAPISecret            string
 	HedgeAPIURL               string
 	HedgeLiveExecutionEnabled bool
+
+	// Hedging on Binance USDⓈ-M futures (docs/audit/hedging/hedging-spec.md).
+	// HedgeBinanceEnv picks the venue: "testnet" (default) or "live".
+	// HedgeAPIURL, when set, overrides the base URL of that environment.
+	HedgeBinanceEnv string
+	// Platform asset symbol -> Binance futures symbol. Only these assets can
+	// ever be hedged (HEDGE_SYMBOLS).
+	HedgeSymbols map[string]string
+	// Configured INR per USDT and the time it was observed (epoch ms; 0 =
+	// none). Older than HedgeFXMaxAgeMs means hedging is unavailable.
+	HedgeINRPerUSDT     float64
+	HedgeINRPerUSDTAsOf int64
+	HedgeFXMaxAgeMs     int64
+	// Cost model inputs (basis points of notional, per side) and limits.
+	HedgeTakerFeeBps          float64
+	HedgeSlippageBps          float64
+	HedgeFallbackSpreadBps    float64
+	HedgeMaxCostBps           float64
+	HedgeMaxLiabilityMultiple float64
+	HedgeMaxOrderUSDT         float64
+	HedgeReconcileIntervalMs  int64
+	HedgeRecvWindowMs         int64
+	HedgeRequestTimeoutMs     int64
+	HedgeVenueMaxAgeMs        int64
 
 	WorkersEnabled           bool
 	ExpiryTickMs             int64
@@ -105,6 +135,13 @@ type Env struct {
 	// Per-customer rolling 24h withdrawal total (micro); 0 = BeeX's
 	// dailyWithdrawalCap.
 	UsdtUserDailyWithdrawalLimit int64
+	// AllowBeexSandboxInProduction lets NODE_ENV=production run USDT against
+	// the BeeX sandbox (BEEX_PROVIDER=mock or a ck_test_ key) until live keys
+	// exist. Off, production accepts only a ck_live_ key.
+	AllowBeexSandboxInProduction bool
+
+	// Operational alerting by email (ALERT_* and SMTP_*, config/alerts.go).
+	Alerts AlertSettings
 }
 
 // BeexKeyMode is "live" for a ck_live_ key, "test" for ck_test_, "" otherwise.
@@ -222,13 +259,13 @@ func Load() (*Env, error) {
 		MarketDataAPISecret:            l.str("MARKET_DATA_API_SECRET", ""),
 		MarketDataWSURL:                l.str("MARKET_DATA_WS_URL", ""),
 		AllowSimulatedFeedInProduction: l.boolean("ALLOW_SIMULATED_FEED_IN_PRODUCTION", false),
+		ApplyLaunchScope:               l.boolean("APPLY_LAUNCH_SCOPE", false),
 
 		FeedHealthyMaxMs:  l.integer("FEED_HEALTHY_MAX_MS", 100, 1),
 		FeedDegradedMaxMs: l.integer("FEED_DEGRADED_MAX_MS", 300, 1),
-		FeedStaleMaxMs:    l.integer("FEED_STALE_MAX_MS", 1000, 1),
 		FeedTickMaxAgeMs:  l.integer("FEED_TICK_MAX_AGE_MS", 5000, 1),
 
-		HedgeProvider:             l.enum("HEDGE_PROVIDER", "paper", "paper", "broker", "lp"),
+		HedgeProvider:             l.enum("HEDGE_PROVIDER", "paper", "paper", "binance", "broker", "lp"),
 		HedgeAPIKey:               l.str("HEDGE_API_KEY", ""),
 		HedgeAPISecret:            l.str("HEDGE_API_SECRET", ""),
 		HedgeAPIURL:               l.str("HEDGE_API_URL", ""),
@@ -266,11 +303,14 @@ func Load() (*Env, error) {
 		UsdtWithdrawalReviewAbove:    l.integer("USDT_WITHDRAWAL_REVIEW_ABOVE", 0, 0),
 		UsdtTransferToTradingEnabled: l.boolean("USDT_TRANSFER_TO_TRADING_ENABLED", false),
 		UsdtUserDailyWithdrawalLimit: l.integer("USDT_USER_DAILY_WITHDRAWAL_LIMIT", 0, 0),
+		AllowBeexSandboxInProduction: l.boolean("ALLOW_BEEX_SANDBOX_IN_PRODUCTION", false),
 	}
 	e.UsdtSuccessURL = l.str("USDT_SUCCESS_URL", strings.TrimRight(e.ClientURL, "/")+"/wallet/usdt/success")
 	e.UsdtCancelURL = l.str("USDT_CANCEL_URL", strings.TrimRight(e.ClientURL, "/")+"/wallet/usdt")
 	validateUsdt(l, e)
+	loadHedge(l, e)
 	loadSecurity(l, e)
+	loadAlerts(l, e)
 
 	if e.BcryptRounds > 15 {
 		l.fail("BCRYPT_ROUNDS", "Number must be less than or equal to 15")
@@ -281,8 +321,8 @@ func Load() (*Env, error) {
 	if len(e.JWTRefreshSecret) < 32 {
 		l.fail("JWT_REFRESH_SECRET", "JWT_REFRESH_SECRET must be at least 32 characters")
 	}
-	if !(e.FeedHealthyMaxMs < e.FeedDegradedMaxMs && e.FeedDegradedMaxMs < e.FeedStaleMaxMs) {
-		l.fail("FEED_HEALTHY_MAX_MS", "Feed thresholds must satisfy healthy < degraded < stale")
+	if !(e.FeedHealthyMaxMs < e.FeedDegradedMaxMs && e.FeedDegradedMaxMs < e.FeedTickMaxAgeMs) {
+		l.fail("FEED_HEALTHY_MAX_MS", "Feed thresholds must satisfy healthy < degraded < tick max age")
 	}
 	if e.NodeEnv == "production" {
 		if e.MarketDataProvider == "simulated" && !e.AllowSimulatedFeedInProduction {
@@ -320,25 +360,33 @@ func validateUsdt(l *loader, e *Env) {
 	if !strings.HasPrefix(e.BeexPayURLBase, "https://") && !strings.HasPrefix(e.BeexPayURLBase, "http://") {
 		l.fail("BEEX_PAY_URL_BASE", "Invalid url")
 	}
+	// The real gateway without credentials would boot a wallet whose every
+	// call fails, and a webhook endpoint that can verify nothing.
+	if e.UsdtEnabled && e.BeexProvider == "beex" {
+		if e.BeexAPIKey == "" {
+			l.fail("BEEX_API_KEY", "BEEX_API_KEY is required when USDT_ENABLED=true with BEEX_PROVIDER=beex (use BEEX_PROVIDER=mock to run without keys)")
+		}
+		if len(e.BeexWebhookSecret) < 16 {
+			l.fail("BEEX_WEBHOOK_SECRET", "BEEX_WEBHOOK_SECRET (at least 16 characters) is required when USDT_ENABLED=true with BEEX_PROVIDER=beex")
+		}
+	}
 	if !prod {
 		return
 	}
-	if e.BeexProvider == "mock" {
-		l.fail("BEEX_PROVIDER", "The mock BeeX provider simulates payments and cannot be used in production")
+	// ALLOW_BEEX_SANDBOX_IN_PRODUCTION is the deliberate switch for running
+	// the USDT wallet against the sandbox until live keys are added.
+	sandbox := e.AllowBeexSandboxInProduction
+	if e.BeexProvider == "mock" && !sandbox {
+		l.fail("BEEX_PROVIDER", "The mock BeeX provider simulates payments and cannot be used in production (set ALLOW_BEEX_SANDBOX_IN_PRODUCTION=true deliberately to run the sandbox)")
 	}
-	if e.BeexAcceptTestMode {
-		l.fail("BEEX_ACCEPT_TEST_MODE", "Test-mode payments can never be credited in production; remove BEEX_ACCEPT_TEST_MODE")
+	if e.BeexAcceptTestMode && !sandbox {
+		l.fail("BEEX_ACCEPT_TEST_MODE", "Test-mode payments can never be credited in production; remove BEEX_ACCEPT_TEST_MODE (or run the sandbox with ALLOW_BEEX_SANDBOX_IN_PRODUCTION=true)")
 	}
-	if !e.UsdtEnabled {
+	if !e.UsdtEnabled || e.BeexProvider != "beex" {
 		return
 	}
-	if e.BeexAPIKey == "" {
-		l.fail("BEEX_API_KEY", "BEEX_API_KEY is required when USDT_ENABLED=true in production")
-	} else if BeexKeyMode(e.BeexAPIKey) != "live" {
-		l.fail("BEEX_API_KEY", "Production requires a live BeeX key (ck_live_...)")
-	}
-	if len(e.BeexWebhookSecret) < 16 {
-		l.fail("BEEX_WEBHOOK_SECRET", "BEEX_WEBHOOK_SECRET (at least 16 characters) is required when USDT_ENABLED=true in production")
+	if e.BeexAPIKey != "" && BeexKeyMode(e.BeexAPIKey) != "live" && !sandbox {
+		l.fail("BEEX_API_KEY", "Production requires a live BeeX key (ck_live_...); a ck_test_ key needs ALLOW_BEEX_SANDBOX_IN_PRODUCTION=true")
 	}
 	if !strings.HasPrefix(e.BeexAPIBaseURL, "https://") {
 		l.fail("BEEX_API_BASE_URL", "BEEX_API_BASE_URL must use https in production")

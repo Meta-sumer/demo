@@ -24,10 +24,18 @@ the Android app download page, all over HTTPS.
    ```
 
 `./deploy.sh` pulls `main` and runs [`deploy.sh`](deploy.sh) from this folder:
-it builds the client and admin, publishes them and the download page, updates
-the nginx snippet, rebuilds the API and waits until it is healthy. If the web
-build fails, the live site is left as it was. MongoDB, Redis, `.env`, uploads
-and the APK are never touched.
+it adds any missing datastore password to `.env` (generated once, never
+printed), builds the client and admin, publishes them and the download page,
+updates the nginx snippets, installs the backup and monitor crons and the log
+rotation, builds the API, turns MongoDB access control on if it is still off
+([`mongo-auth.sh`](mongo-auth.sh)), recreates Redis if its configuration
+changed, restarts the API and waits until it is healthy. If the web build
+fails, the live site is left as it was. The database, uploads and the APK are
+never touched; `.env` only gains missing keys.
+
+The first deploy of the 22 Oct 2026 hardening has one-time steps (security
+headers include, alert email settings):
+`docs/audit/operations/production-readiness.md` §13.
 
 Never edit code on the server: the pull is fast-forward only and stops if the
 server copy differs from GitHub.
@@ -39,14 +47,22 @@ server copy differs from GitHub.
 | `pull-and-deploy.sh` | `/opt/wintratrade/deploy.sh` (untracked, so a pull never rewrites the running script) |
 | `deploy.sh` | run from the checkout by `./deploy.sh` |
 | `nginx/wintratrade-api.conf` | `/etc/nginx/snippets/wintratrade-api.conf`, copied on every deploy |
+| `nginx/wintratrade-security-headers.conf` | `/etc/nginx/snippets/wintratrade-security-headers.conf`, copied on every deploy; included by the page locations |
+| `nginx/wintratrade-logformat.conf` | `/etc/nginx/conf.d/wintratrade-logformat.conf`, copied on every deploy (the `/ws` log without its token) |
+| `nginx-enable-headers.sh` | run by hand once on a server installed before the headers: adds the include to the certbot-managed site file (backup, `nginx -t`, rollback) |
 | `nginx/wintratrade.conf` | `/etc/nginx/conf.d/wintratrade.conf`, first install only; certbot edits it afterwards |
 | `download/index.html` | `/var/www/wintratrade/downloads/index.html`, copied on every deploy |
-| `backup-mongo.sh` + `cron/wintratrade-backup` | `/etc/cron.d/wintratrade-backup`: nightly 02:30 dump of MongoDB to `/var/backups/wintratrade` (14 days kept), each archive verified by a scratch restore |
+| `backup-mongo.sh` + `cron/wintratrade-backup` | `/etc/cron.d/wintratrade-backup`: nightly 02:30 dump of MongoDB to `/var/backups/wintratrade` (14 days kept), each archive verified by a scratch restore; emails on failure |
+| `monitor.sh` + `cron/wintratrade-monitor` | `/etc/cron.d/wintratrade-monitor`: every minute, emails when `/ready` fails twice in a row (and when it recovers), when the disk passes 85 % or the certificate has under 14 days |
+| `logrotate/wintratrade` | `/etc/logrotate.d/wintratrade` (the backup and monitor logs) |
+| `mongo-auth.sh` | run by `deploy.sh` and `first-setup.sh`: MongoDB users and access control, idempotent |
+| `lib.sh` | helpers for the scripts and the runbooks: `.env` reading (never sourced), `send_email`, `mongo_js`, `mongo_tools` |
 | `bootstrap.sh`, `first-setup.sh` | fresh server only |
 
 Not in git, by design:
 
-- `/opt/wintratrade/.env` - production secrets, generated on the server.
+- `/opt/wintratrade/.env` - production secrets, generated on the server
+  (JWT secrets, MFA key, MongoDB and Redis passwords, SMTP settings).
 - `/opt/wintratrade/CREDENTIALS` - the seeded accounts' passwords (root-only).
 - `/var/www/wintratrade/downloads/binary-trading.apk` - a build output larger
   than GitHub's 100 MB file limit.
@@ -102,5 +118,9 @@ the machine (or enable Hostinger's VPS backups) to survive losing the VPS.
 
 - API logs: `docker logs bt-server --tail 100`
 - All containers: `docker ps`
+- Alerts: admin console, Governance > Alerts; host watchdog log
+  `/var/log/wintratrade-monitor.log`
+- MongoDB and Redis need credentials: use the `MONGO` / `REDIS` helpers of
+  `docs/audit/operations/production-readiness.md` §6
 - Roll back: `git checkout <older-commit> && bash deploy/vps/deploy.sh`, then
   `git checkout main` when the fix is pushed.

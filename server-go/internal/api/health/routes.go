@@ -22,6 +22,7 @@ import (
 	"binarytrading/internal/platform/redisx"
 	"binarytrading/internal/platform/util"
 	"binarytrading/internal/platform/ws"
+	"binarytrading/internal/service/exposure"
 	"binarytrading/internal/service/marketdata"
 	"binarytrading/internal/workers"
 )
@@ -75,6 +76,29 @@ func ready(w http.ResponseWriter, r *http.Request) error {
 	type redisCheck struct {
 		OK bool `json:"ok"`
 	}
+	// Monitoring only: neither fails readiness. LIVE trading refuses on its
+	// own while the book is not READY; the limiter never fails open. No
+	// reasons or ids are shown here (this route is public).
+	type bookCheck struct {
+		Status              string `json:"status"`
+		PendingReservations int64  `json:"pendingReservations"`
+	}
+	type limiterCheck struct {
+		// "redis" (limits shared by every instance) or "memory" (fallback).
+		Mode          string `json:"mode"`
+		DegradedSince int64  `json:"degradedSince"`
+	}
+	book := bookCheck{Status: "UNKNOWN"}
+	if redisOK {
+		if b, err := exposure.GetBookStatus(r.Context()); err == nil {
+			book = bookCheck{Status: b.Status, PendingReservations: b.PendingReservations}
+		}
+	}
+	lim := httpx.RateLimiterStatus()
+	limiter := limiterCheck{Mode: "redis", DegradedSince: lim.DegradedSince}
+	if lim.Degraded {
+		limiter.Mode = "memory"
+	}
 	type feedCheck struct {
 		Provider      string `json:"provider"`
 		State         string `json:"state"`
@@ -87,12 +111,16 @@ func ready(w http.ResponseWriter, r *http.Request) error {
 		MarketFeed feedCheck            `json:"marketFeed"`
 		Workers    workers.WorkerStatus `json:"workers"`
 		Websocket  ws.Stats             `json:"websocket"`
+		Book       bookCheck            `json:"exposureBook"`
+		Limiter    limiterCheck         `json:"rateLimiter"`
 	}{
 		mongoCheck{mongoOK, mongox.TransactionsAvailable()},
 		redisCheck{redisOK},
 		feedCheck{providerName, state, healthy, len(feeds)},
 		workers.Status(),
 		ws.GetStats(),
+		book,
+		limiter,
 	}
 	isReady := mongoOK && redisOK
 	status := http.StatusOK

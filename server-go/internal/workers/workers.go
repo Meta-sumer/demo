@@ -22,14 +22,18 @@ import (
 	"binarytrading/internal/platform/logx"
 	"binarytrading/internal/platform/mongox"
 	"binarytrading/internal/platform/redisx"
+	"binarytrading/internal/service/alerts"
+	"binarytrading/internal/service/alerts/monitor"
 	"binarytrading/internal/service/binary"
 	"binarytrading/internal/service/expiry"
 	"binarytrading/internal/service/exposure"
 	"binarytrading/internal/service/hedging"
 	"binarytrading/internal/service/marketdata"
+	"binarytrading/internal/service/payouts"
 	"binarytrading/internal/service/reconciliation"
 	"binarytrading/internal/service/risk"
 	"binarytrading/internal/service/settlement"
+	"binarytrading/internal/service/usdt"
 	"binarytrading/internal/service/wallets"
 )
 
@@ -64,10 +68,14 @@ func Start(ctx context.Context) error {
 		return err
 	}
 	// A crash between reserving a stake and writing its trade leaves the
-	// customer's funds locked against nothing. Nothing else recovers it.
-	if _, err := wallets.ReleaseOrphanedTradeLocks(ctx, time.Now()); err != nil {
-		return err
-	}
+	// customer's funds locked against nothing. The sweep that releases it
+	// runs on the leader (fenced): every 15 s over the recent stake locks,
+	// and over every stake lock when an instance takes the lead and every
+	// 30 minutes.
+	wallets.StartOrphanLockSweeper()
+	// A cancel interrupted before its stake release is finished here too
+	// (also from the admin console; reconciliation flags what is left).
+	binary.RepairCancelledTradesAtBoot(ctx)
 
 	marketdata.Start()
 	// Expiry is leader-elected and fences its queue writes with the leader
@@ -78,10 +86,20 @@ func Start(ctx context.Context) error {
 	// comments of service/settlement and service/expiry.
 	expiry.Start()
 	settlement.Start()
+	// Scheduled payout changes take effect (leader, every second).
+	payouts.StartScheduler()
 	risk.Start()
 	hedging.Start()
 	reconciliation.Start()
 	exposure.StartReconciler()
+	// USDT (BeeX): webhook retry, payout submission, invoice expiry, payout
+	// polling and provider reconciliation; no-op while USDT_ENABLED=false.
+	usdt.Start()
+	// Operational alerts: the email outbox (leader) and the condition
+	// monitor (book, feed, stuck settlements on the leader; the rate limiter
+	// on every instance).
+	alerts.Start()
+	monitor.Start()
 
 	logx.Info("all workers started")
 	return nil
@@ -163,7 +181,8 @@ func Stop(ctx context.Context) {
 		return
 	}
 	stops := []func(context.Context){
-		exposure.StopReconciler, reconciliation.Stop, hedging.Stop, risk.Stop, settlement.Stop, expiry.Stop, marketdata.Stop,
+		monitor.Stop, alerts.Stop, usdt.Stop, exposure.StopReconciler, reconciliation.Stop, hedging.Stop, risk.Stop, payouts.StopScheduler, settlement.Stop, expiry.Stop, marketdata.Stop,
+		wallets.StopOrphanLockSweeper,
 	}
 	var wg sync.WaitGroup
 	for _, stop := range stops {

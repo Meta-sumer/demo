@@ -16,6 +16,7 @@ import (
 	"binarytrading/internal/platform/httpx"
 	"binarytrading/internal/service/audit"
 	bsvc "binarytrading/internal/service/binary"
+	"binarytrading/internal/service/pricing"
 )
 
 func Mount(r chi.Router) {
@@ -28,6 +29,9 @@ func Mount(r chi.Router) {
 	read.Get("/trades/open", httpx.H(openTrades))
 	read.Get("/trades/{id}", httpx.H(getTrade))
 	read.Get("/trades/{id}/quote", httpx.H(quoteTrade))
+	// Entry pricing quote: the engine's payout for both directions, with a
+	// quote id per direction to trade on (docs/audit/pricing/pricing-spec.md).
+	read.Get("/quotes", httpx.H(entryQuote))
 
 	// Closing early moves money, so it is rate limited like opening a trade.
 	r.With(httpx.RequireActiveUser, httpx.RateLimit(httpx.RateLimits.Trade)).Post("/trades/{id}/close", httpx.H(closeTrade))
@@ -155,6 +159,16 @@ func parseCreateTrade(r *http.Request) (bsvc.CreateTradeInput, error) {
 		v.Enum("accountType", s, models.AccountTypeValues...)
 		in.AccountType = s
 	}
+	// Pricing: the offer accepted, and the payout on screen. Optional - apps
+	// that predate offers send neither and are priced at acceptance.
+	if s, ok := b.str("offerId", false, "string"); ok {
+		v.Str("offerId", s, 8, 128)
+		in.OfferID = &s
+	}
+	if f, ok := b.num("displayedPayoutPercent", false); ok {
+		v.Check(f >= 0 && f <= 500, "displayedPayoutPercent", "Number must be between 0 and 500")
+		in.DisplayedPayoutPercent = &f
+	}
 	if err := v.Err("request body"); err != nil {
 		return bsvc.CreateTradeInput{}, err
 	}
@@ -176,6 +190,12 @@ func inputDoc(in bsvc.CreateTradeInput) bson.D {
 		d = append(d, bson.E{Key: "idempotencyKey", Value: *in.IdempotencyKey})
 	}
 	d = append(d, bson.E{Key: "accountType", Value: in.AccountType})
+	if in.OfferID != nil {
+		d = append(d, bson.E{Key: "offerId", Value: *in.OfferID})
+	}
+	if in.DisplayedPayoutPercent != nil {
+		d = append(d, bson.E{Key: "displayedPayoutPercent", Value: *in.DisplayedPayoutPercent})
+	}
 	return d
 }
 
@@ -218,16 +238,22 @@ func createTrade(w http.ResponseWriter, r *http.Request) error {
 	e.Action = audit.TradeCreated
 	e.Resource = "BinaryTrade"
 	e.ResourceID = result.Trade.ID
-	e.After = bson.D{
+	after := bson.D{
 		{Key: "symbol", Value: result.Trade.Symbol},
 		{Key: "direction", Value: string(result.Trade.Direction)},
 		{Key: "accountType", Value: result.Trade.AccountType},
 		{Key: "stake", Value: result.Trade.Stake},
 		{Key: "entryPrice", Value: result.Trade.EntryPrice},
 		{Key: "payoutPercent", Value: result.Trade.PayoutPercent},
+		{Key: "offerId", Value: result.Trade.OfferID},
 		{Key: "expiryTimestamp", Value: result.Trade.ExpiryTimestamp},
 		{Key: "replayed", Value: result.Replayed},
 	}
+	if len(result.Degraded) > 0 {
+		// Accepted; these Redis steps are left to the repairs from MongoDB.
+		after = append(after, bson.E{Key: "degraded", Value: result.Degraded})
+	}
+	e.After = after
 	audit.Log(e)
 
 	status := http.StatusCreated
@@ -304,6 +330,37 @@ func getTrade(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	view, err := bsvc.GetTrade(r.Context(), id, actor.UserID)
+	if err != nil {
+		return err
+	}
+	return httpx.OK(w, view)
+}
+
+// entryQuote issues offers for a prospective trade (pricing specification
+// 8): GET /binary/quotes?assetId=&expirySeconds=&amount=&accountType=. One
+// offer per direction, valid for pricingOfferTtlMs and usable once.
+func entryQuote(w http.ResponseWriter, r *http.Request) error {
+	actor, err := httpx.RequireActor(r)
+	if err != nil {
+		return err
+	}
+	q := httpx.Query(r)
+	assetID := q.Str("assetId")
+	q.V.Match("assetId", assetID, hexID, "assetId must be a valid id")
+	expiry := q.Int("expirySeconds", 0, 1, 86_400)
+	if !q.Has("expirySeconds") {
+		q.V.Add("expirySeconds", "Required")
+	}
+	amount := q.OptInt("amount", 1, 1_000_000_000)
+	account := q.Enum("accountType", models.AccountLive, models.AccountTypeValues...)
+	if err := q.Err(); err != nil {
+		return err
+	}
+	in := pricing.QuoteRequest{AssetID: assetID, ExpirySeconds: expiry, AccountType: account}
+	if amount != nil {
+		in.Amount = *amount
+	}
+	view, err := pricing.IssueQuote(r.Context(), actor.UserID, in)
 	if err != nil {
 		return err
 	}

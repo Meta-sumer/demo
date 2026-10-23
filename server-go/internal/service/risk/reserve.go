@@ -24,6 +24,10 @@ type ReservationRequest struct {
 	Profit          int64
 	ExpiryTimestamp int64
 	UserMaxExposure *int64
+	// The pricing rule's max_exposure for the asset (pricing specification
+	// 7.2, final hard check): the trade's side may not lose more than this
+	// if it wins. 0 = no side limit.
+	SideLiabilityLimit int64
 }
 
 // How long a trade waits for the book to become READY (a rebuild running
@@ -83,6 +87,7 @@ func ReserveTradeExposure(ctx context.Context, req ReservationRequest) (*exposur
 		ExpiryTimestamp: req.ExpiryTimestamp,
 		Limits:          ReservationLimits(cfg, req.Asset, req.UserMaxExposure),
 	}
+	in.Limits.SideLiability = req.SideLiabilityLimit
 
 	for attempt := 0; ; attempt++ {
 		resv, out, err := exposure.Reserve(ctx, in)
@@ -97,6 +102,11 @@ func ReserveTradeExposure(ctx context.Context, req ReservationRequest) (*exposur
 		case exposure.ReserveRefused:
 			violations := make([]LimitViolation, 0, len(out.Rules))
 			for _, rule := range out.Rules {
+				if rule == exposure.RuleSideLiability {
+					violations = append(violations, LimitViolation{apperr.ExposureLimitExceeded,
+						"Exposure limit reached on the " + string(req.Direction) + " side for " + req.Asset.Symbol})
+					continue
+				}
 				violations = append(violations, violationFor(rule, req.Asset.Symbol))
 			}
 			first := violations[0]

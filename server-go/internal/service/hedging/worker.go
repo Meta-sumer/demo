@@ -9,23 +9,30 @@ import (
 	"binarytrading/internal/platform/leader"
 	"binarytrading/internal/platform/logx"
 	"binarytrading/internal/platform/redisx"
-	"binarytrading/internal/platform/util"
 	"binarytrading/internal/service/assets"
 )
 
-// Hedge worker (spec section 14).
+// Hedge worker. Leader-elected: two instances hedging the same book would
+// double the position. Each tick:
 //
-// Two triggers: assets whose exposure just changed (pushed onto a Redis queue
-// by the exposure engine) and a periodic full pass, so an asset whose exposure
-// is static but whose risk inputs moved - volatility, configuration - is still
-// re-evaluated. Leader-elected: two instances hedging the same book would
-// double the position.
+//   - refresh working orders and pull missing fills (recovery; also run the
+//     moment this instance becomes leader, i.e. after a restart);
+//   - evaluate the assets whose exposure just changed (Redis queue from the
+//     exposure engine);
+//   - every venueRefresh: refresh the venue snapshots (book, mark, funding
+//     rate, fee rate, filters) that cost estimates read;
+//   - every fullPass: evaluate every hedgeable asset (volatility and time
+//     move the delta even when the book does not) and mark positions;
+//   - every HEDGE_RECONCILE_INTERVAL_MS: reconcile positions and funding.
 
 var (
-	workerMu          sync.Mutex
-	hedgeLoop         *leader.Loop
-	ticksSinceFull    int64
-	fullPassEveryTick int64 = 1
+	workerMu        sync.Mutex
+	hedgeLoop       *leader.Loop
+	lastVenue       time.Time
+	lastFull        time.Time
+	lastReconcile   time.Time
+	venueRefreshGap = 3 * time.Second
+	fullPassGap     = 15 * time.Second
 )
 
 func hedgeIntervalMs() int64 {
@@ -35,35 +42,79 @@ func hedgeIntervalMs() int64 {
 	return 1000
 }
 
-func hedgeTick(ctx context.Context) error {
+func reconcileIntervalMs() int64 {
+	if config.E != nil && config.E.HedgeReconcileIntervalMs > 0 {
+		return config.E.HedgeReconcileIntervalMs
+	}
+	return 60_000
+}
+
+// hedgeableAssets lists active assets with a venue symbol.
+func hedgeableAssets(ctx context.Context) (map[string]string, error) {
+	docs, err := assets.ListAssetDocs(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, a := range docs {
+		if sym := config.E.HedgeVenueSymbol(a.Symbol); sym != "" {
+			out[a.ID.Hex()] = sym
+			rememberVenueSymbol(sym, a.ID.Hex())
+		}
+	}
+	return out, nil
+}
+
+func refreshVenues(ctx context.Context, symbols map[string]string) {
+	v := venue()
+	done := map[string]bool{}
+	for _, sym := range symbols {
+		if done[sym] {
+			continue
+		}
+		done[sym] = true
+		if snap := RefreshVenueSnapshot(ctx, v, sym); !snap.OK {
+			logx.Warn("hedge venue snapshot failed", "symbol", sym, "err", snap.Error)
+		}
+	}
+	lastVenue = time.Now()
+}
+
+// RunOnce is one worker tick (exported for tests).
+func RunOnce(ctx context.Context) error {
+	if _, err := RefreshWorkingOrders(ctx); err != nil {
+		return err
+	}
+	hedgeable, err := hedgeableAssets(ctx)
+	if err != nil {
+		return err
+	}
+	if time.Since(lastVenue) >= venueRefreshGap {
+		refreshVenues(ctx, hedgeable)
+	}
 	dirty, order, err := drainDirtyAssets(ctx, 200)
 	if err != nil {
 		return err
 	}
 	for _, assetID := range order {
-		evaluateSafely(ctx, assetID)
+		if _, ok := hedgeable[assetID]; ok {
+			evaluateSafely(ctx, assetID)
+		}
 	}
-
-	ticksSinceFull++
-	if ticksSinceFull >= fullPassEveryTick {
-		ticksSinceFull = 0
-		docs, err := assets.ListAssetDocs(ctx, true)
-		if err != nil {
-			return err
-		}
-		for _, a := range docs {
-			if !a.HedgeEnabled {
-				continue
+	if time.Since(lastFull) >= fullPassGap {
+		lastFull = time.Now()
+		for assetID := range hedgeable {
+			if _, seen := dirty[assetID]; !seen {
+				evaluateSafely(ctx, assetID)
 			}
-			if _, seen := dirty[a.ID.Hex()]; seen {
-				continue
-			}
-			evaluateSafely(ctx, a.ID.Hex())
-		}
-		if _, err := ReconcilePendingHedgeOrders(ctx); err != nil {
-			return err
 		}
 		if err := MarkHedgePositions(ctx); err != nil {
+			return err
+		}
+	}
+	if time.Since(lastReconcile) >= time.Duration(reconcileIntervalMs())*time.Millisecond {
+		lastReconcile = time.Now()
+		if _, err := ReconcilePositions(ctx); err != nil {
 			return err
 		}
 	}
@@ -102,10 +153,28 @@ func evaluateSafely(ctx context.Context, assetID string) {
 		logx.Error("hedge evaluation failed", "err", err.Error(), "assetId", assetID)
 		return
 	}
-	if ev.Order != nil {
-		logx.Info("hedge evaluated", "symbol", ev.Symbol, "status", string(ev.Order.Status),
-			"requested", ev.Order.RequestedNotional, "filled", ev.Order.FilledNotional)
+	if ev.Order != nil && ev.SkippedReason == "" {
+		logx.Info("hedge evaluated", "symbol", ev.Symbol, "status", string(ev.Order.Status))
 	}
+}
+
+// RecoverOnBoot resolves every order left working by a previous process
+// (queried by client order id, never re-sent) and refreshes the venue
+// snapshots.
+func RecoverOnBoot(ctx context.Context) error {
+	n, err := RefreshWorkingOrders(ctx)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		logx.Info("hedge orders recovered", "orders", n)
+	}
+	hedgeable, err := hedgeableAssets(ctx)
+	if err != nil {
+		return err
+	}
+	refreshVenues(ctx, hedgeable)
+	return nil
 }
 
 // Start runs the hedge worker leader loop (no-op when WORKERS_ENABLED=false).
@@ -116,12 +185,11 @@ func Start() {
 	workerMu.Lock()
 	defer workerMu.Unlock()
 	if hedgeLoop == nil {
-		interval := hedgeIntervalMs()
-		fullPassEveryTick = max(1, int64(util.RoundHalfUp(15_000/float64(max(1, interval)))))
 		hedgeLoop = leader.New(leader.Options{
-			Name:     "hedge",
-			Interval: time.Duration(interval) * time.Millisecond,
-			OnTick:   hedgeTick,
+			Name:      "hedge",
+			Interval:  time.Duration(hedgeIntervalMs()) * time.Millisecond,
+			OnTick:    RunOnce,
+			OnAcquire: RecoverOnBoot,
 		})
 	}
 	hedgeLoop.Start()

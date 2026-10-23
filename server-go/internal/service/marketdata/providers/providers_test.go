@@ -14,18 +14,61 @@ func collect(b *Base) *[]Tick {
 	return &got
 }
 
-func TestBinanceParsesTradeMessages(t *testing.T) {
+// TestBinanceBookTicker: best bid/ask updates are coalesced into ticks
+// priced at the mid, stamped with their arrival, strictly increasing; an
+// unchanged book is re-sent only while the socket is demonstrably alive.
+func TestBinanceBookTicker(t *testing.T) {
 	b := NewBinance()
+	now := int64(1_730_000_000_000)
+	b.now = func() int64 { return now }
 	got := collect(&b.Base)
-	b.handleMessage([]byte(`{"stream":"btcusdt@trade","data":{"e":"trade","E":1730000000001,"T":1730000000000,"s":"BTCUSDT","t":12345,"p":"104250.50","q":"0.01"}}`))
-	b.handleMessage([]byte(`{"data":{"e":"aggTrade","s":"BTCUSDT","p":"1"}}`))
+	b.handleMessage([]byte(`{"stream":"btcusdt@bookTicker","data":{"u":101,"s":"BTCUSDT","b":"104250.00","B":"1.5","a":"104250.02","A":"2"}}`))
+	now += 10
+	b.handleMessage([]byte(`{"stream":"btcusdt@bookTicker","data":{"u":102,"s":"BTCUSDT","b":"104250.10","B":"1","a":"104250.12","A":"1"}}`))
+	b.handleMessage([]byte(`{"data":{"e":"trade","s":"BTCUSDT","p":"1"}}`))
 	b.handleMessage([]byte(`not json`))
+	b.flush()
 	if len(*got) != 1 {
-		t.Fatalf("want 1 tick, got %d", len(*got))
+		t.Fatalf("coalesced: want 1 tick, got %d", len(*got))
 	}
 	tk := (*got)[0]
-	if tk.Symbol != "btcusdt" || tk.Price != 104250.5 || *tk.ProviderTimestamp != 1730000000000 || *tk.Sequence != 12345 {
+	if tk.Symbol != "btcusdt" || *tk.Bid != 104250.10 || *tk.Ask != 104250.12 || tk.Price != (104250.10+104250.12)/2 ||
+		*tk.ProviderTimestamp != now || *tk.Sequence != 102 {
 		t.Fatalf("bad tick %+v", tk)
+	}
+	// Unchanged and the socket alive: a heartbeat after 250 ms, not before.
+	now += 100
+	b.flush()
+	if len(*got) != 1 {
+		t.Fatal("heartbeat too early")
+	}
+	now += 200
+	b.handleMessage([]byte(`{"stream":"ethusdt@bookTicker","data":{"u":7,"s":"ETHUSDT","b":"3280.00","B":"1","a":"3280.01","A":"1"}}`))
+	b.flush()
+	if len(*got) != 3 || (*got)[1].Symbol == (*got)[2].Symbol {
+		t.Fatalf("heartbeat + eth: %d ticks", len(*got))
+	}
+	// A stalled socket (no message for over a second): nothing re-sent, so
+	// the feed goes stale.
+	now += 2000
+	b.flush()
+	if len(*got) != 3 {
+		t.Fatal("a stalled stream must not heartbeat")
+	}
+	// Garbage numbers reach the normaliser as NaN (it rejects and counts them).
+	b.handleMessage([]byte(`{"data":{"u":103,"s":"BTCUSDT","b":"x","a":"1"}}`))
+	b.flush()
+	var garbage *Tick
+	for i := 3; i < len(*got); i++ {
+		if (*got)[i].Symbol == "btcusdt" {
+			garbage = &(*got)[i]
+		}
+	}
+	if garbage == nil || !math.IsNaN(*garbage.Bid) {
+		t.Fatalf("garbage %+v", garbage)
+	}
+	if b.streamURL() != binanceBaseURL || len(withSuffix([]string{"btcusdt"})) != 1 || withSuffix([]string{"btcusdt"})[0] != "btcusdt@bookTicker" {
+		t.Fatal("stream names")
 	}
 }
 

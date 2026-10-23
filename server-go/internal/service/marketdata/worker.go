@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"binarytrading/internal/config"
@@ -19,6 +20,24 @@ import (
 // Exactly one instance owns the provider connection: running two would double
 // every tick and distort the latency statistics. The loop keeps the provider's
 // subscription list in step with the active assets.
+//
+// Failover. The feed leadership is short-lived on purpose: it is renewed
+// every feedLeaderInterval and lapses feedLeaderTTL after the last renewal,
+// and followers try to take it every feedLeaderInterval, connecting and
+// subscribing in the same step. A crashed leader therefore leaves the feed
+// silent for about feedLeaderTTL + feedLeaderInterval (about 3 s), instead of
+// the 25 s a 5 s interval gave - and trades expiring in a gap are voided when
+// no price lies within the settlement tolerance (2 s) of their expiry.
+//
+// One consistent tick history, one writer: a batch is ingested only while
+// this process holds a valid lease on the feed (feedLeaseValid, a local check
+// against the lease the loop last renewed, which ends before the Redis lock
+// can be taken by anyone else), so a paused or partitioned former leader
+// stops writing before a new leader can start. A new leader also drops its
+// in-process normaliser state on taking over, so it continues from the last
+// accepted quote and volatility state in Redis (written by the previous
+// leader): the out-of-order check rejects anything not newer than the last
+// stored quote, and no EWMA observation is counted twice.
 
 type queuedTick struct {
 	tick       providers.Tick
@@ -42,19 +61,43 @@ var (
 	ingestStarted sync.Once
 )
 
+// Feed leadership timing (see the package comment above).
+const (
+	feedLeaderInterval = 500 * time.Millisecond
+	feedLeaderTTL      = 2500 * time.Millisecond
+)
+
 var marketLoop = leader.New(leader.Options{
 	Name:      "market-feed",
-	Interval:  5 * time.Second,
+	Interval:  feedLeaderInterval,
+	LockTTL:   feedLeaderTTL,
 	OnAcquire: onAcquire,
 	OnRelease: onRelease,
 	OnTick:    onTick,
 })
+
+// feedLeaseUntil is the end (epoch ms) of the feed lease this process last
+// renewed, 0 when it does not lead. Kept here rather than read from
+// marketLoop, which would be an initialisation cycle.
+var feedLeaseUntil atomic.Int64
+
+func noteFeedLease(ctx context.Context) {
+	if f := leader.FenceFromContext(ctx); f != nil {
+		feedLeaseUntil.Store(f.LeaseUntil.UnixMilli())
+	}
+}
+
+// feedLeaseValid: this process leads the feed and its lease has not run out.
+func feedLeaseValid() bool {
+	return feedLeader.Load() && util.NowMs() < feedLeaseUntil.Load()
+}
 
 // maxIngestBatch bounds one batch: a backlog drains in a few round trips
 // without one pipeline growing without limit.
 const maxIngestBatch = 512
 
 func startIngestion() {
+	startFeedQuality()
 	ingestStarted.Do(func() {
 		go func() {
 			batch := make([]queuedTick, 0, maxIngestBatch)
@@ -71,6 +114,12 @@ func startIngestion() {
 						break drain
 					}
 				}
+				if !feedLeaseValid() {
+					// Not (or no longer surely) the feed leader: another process may
+					// lead now, and a second writer would fork the tick history.
+					logx.Warn("dropping ticks received without a valid feed lease", "ticks", len(batch))
+					continue
+				}
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				ingestTicks(ctx, batch)
 				cancel()
@@ -79,15 +128,30 @@ func startIngestion() {
 	})
 }
 
-func enqueueTick(t providers.Tick) {
+func enqueueTick(t providers.Tick) { enqueueInto(tickQueue, t) }
+
+// enqueueInto hands a tick to the ingestion goroutine. A full buffer drops
+// the tick: the provider's reader must never block. Every drop is counted
+// (feed data rules: the asset's feed is STALE for feedSaturationHoldMs after
+// it, and an alert is raised).
+func enqueueInto(q chan queuedTick, t providers.Tick) {
+	now := util.NowMs()
 	select {
-	case tickQueue <- queuedTick{tick: t, receivedAt: util.NowMs()}:
+	case q <- queuedTick{tick: t, receivedAt: now}:
+		if depth := len(q); depth > cap(q)/2 {
+			noteQueueDepth(depth)
+		}
 	default:
+		recordDrop(t.Symbol, now, len(q))
 		logx.Warn("tick ingestion queue full - dropping tick", "symbol", t.Symbol)
 	}
 }
 
 func onAcquire(ctx context.Context) error {
+	noteFeedLease(ctx)
+	// Continue from the state the previous leader left in Redis, never from
+	// what this process held the last time it led.
+	ResetNormalizationState()
 	provider, err := providers.GetMarketDataProvider()
 	if err != nil {
 		return err
@@ -101,6 +165,8 @@ func onAcquire(ctx context.Context) error {
 		provider.OnTick(enqueueTick)
 	}
 	workerMu.Unlock()
+	// Leader from here on: the first ticks after the connection are ingested.
+	feedLeader.Store(true)
 	if err := provider.Connect(ctx); err != nil {
 		return err
 	}
@@ -112,6 +178,8 @@ func onAcquire(ctx context.Context) error {
 }
 
 func onRelease(ctx context.Context) error {
+	feedLeader.Store(false)
+	feedLeaseUntil.Store(0)
 	provider, err := providers.GetMarketDataProvider()
 	if err != nil {
 		return err
@@ -128,6 +196,7 @@ func onRelease(ctx context.Context) error {
 }
 
 func onTick(ctx context.Context) error {
+	noteFeedLease(ctx)
 	provider, err := providers.GetMarketDataProvider()
 	if err != nil {
 		return err

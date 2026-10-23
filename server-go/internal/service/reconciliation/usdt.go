@@ -250,3 +250,47 @@ func checkUsdtCompletedWithdrawalsSettled(ctx context.Context) (models.Reconcili
 		Details:    map[string]any{"completed": len(completed), "mismatches": capped(missing), "mismatchCount": len(missing), "unit": "micro-USDT"},
 	}, nil
 }
+
+// checkUsdtProviderAlerts: the USDT provider reconciliation (BeeX vs our
+// records vs the ledger) found nothing critical that is still open. Its
+// alerts live in usdt_alerts; this check makes them part of every run.
+func checkUsdtProviderAlerts(ctx context.Context) (models.ReconciliationCheck, error) {
+	c := mongox.C(models.CollUsdtAlerts)
+	open, err := c.CountDocuments(ctx, bson.M{"status": models.AlertOpen})
+	if err != nil {
+		return models.ReconciliationCheck{}, err
+	}
+	critical := bson.M{"status": models.AlertOpen, "severity": models.AlertCritical}
+	n, err := c.CountDocuments(ctx, critical)
+	if err != nil {
+		return models.ReconciliationCheck{}, err
+	}
+	items := []map[string]any{}
+	if n > 0 {
+		cur, err := c.Find(ctx, critical, options.Find().SetSort(bson.D{{Key: "lastSeenAt", Value: -1}}).SetLimit(20).
+			SetProjection(bson.M{"code": 1, "key": 1, "message": 1}))
+		if err != nil {
+			return models.ReconciliationCheck{}, err
+		}
+		var rows []struct {
+			ID      bson.ObjectID `bson:"_id"`
+			Code    string        `bson:"code"`
+			Key     string        `bson:"key"`
+			Message string        `bson:"message"`
+		}
+		if err := cur.All(ctx, &rows); err != nil {
+			return models.ReconciliationCheck{}, err
+		}
+		for _, r := range rows {
+			items = append(items, map[string]any{"alertId": r.ID.Hex(), "code": r.Code, "key": r.Key, "message": r.Message})
+		}
+	}
+	return models.ReconciliationCheck{
+		Name:       "usdt_provider_alerts",
+		Passed:     n == 0,
+		Expected:   0,
+		Actual:     n,
+		Difference: n,
+		Details:    map[string]any{"openAlerts": open, "openCritical": n, "critical": items},
+	}, nil
+}

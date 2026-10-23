@@ -214,10 +214,21 @@ type UpsertPayoutInput struct {
 	MinStake      *int64
 	MaxStake      *int64
 	Note          *string
+	// Pricing-engine bounds (models.PayoutConfig); nil = default.
+	MinPayoutPercent *float64
+	MaxPayoutPercent *float64
+	MarginPercent    *float64
+	// When the change takes effect; nil or not in the future = now. A future
+	// instant schedules it (schedule.go).
+	EffectiveFrom *time.Time
 }
 
 // MaxPayoutPercent is the highest payout a version may offer.
 const MaxPayoutPercent = 500
+
+// PayoutStepPercent is the pricing engine's payout step (0.5 points): clamp
+// bounds must sit on it.
+const PayoutStepPercent = 0.5
 
 func expiryLabel(s int64) string { return strconv.FormatInt(s, 10) + "s" }
 
@@ -250,6 +261,26 @@ func ValidatePayoutInput(asset *models.Asset, in UpsertPayoutInput) error {
 	if in.MaxStake != nil && *in.MaxStake < asset.MinStake {
 		return apperr.Validation("maxStake is below the minimum stake for "+asset.Symbol+
 			" ("+strconv.FormatInt(asset.MinStake, 10)+"), so no stake could be accepted", nil)
+	}
+	// Pricing-engine terms: the clamp bounds must be ordered and on the
+	// 0.5-point payout step (so rounding down never leaves them), and the
+	// margin a plausible deduction.
+	pctOK := func(x *float64) bool {
+		if x == nil {
+			return true
+		}
+		steps := *x / PayoutStepPercent
+		return !math.IsNaN(*x) && !math.IsInf(*x, 0) && *x > 0 && *x <= MaxPayoutPercent &&
+			math.Abs(steps-math.Round(steps)) < 1e-6
+	}
+	if !pctOK(in.MinPayoutPercent) || !pctOK(in.MaxPayoutPercent) {
+		return apperr.Validation("minPayoutPercent and maxPayoutPercent must be multiples of 0.5, greater than 0 and at most 500", nil)
+	}
+	if in.MinPayoutPercent != nil && in.MaxPayoutPercent != nil && *in.MinPayoutPercent > *in.MaxPayoutPercent {
+		return apperr.Validation("minPayoutPercent must not exceed maxPayoutPercent", nil)
+	}
+	if m := in.MarginPercent; m != nil && (math.IsNaN(*m) || *m < 0 || *m > 50) {
+		return apperr.Validation("marginPercent must be between 0 and 50", nil)
 	}
 	return nil
 }
@@ -323,18 +354,31 @@ func UpsertPayout(ctx context.Context, in UpsertPayoutInput, actorID string) (be
 	if err := ValidatePayoutInput(asset, in); err != nil {
 		return nil, after, err
 	}
+	if err := validateEffectiveFrom(in.EffectiveFrom, time.Now()); err != nil {
+		return nil, after, err
+	}
 	var createdBy *bson.ObjectID
 	if actor, ok := mongox.ParseID(actorID); ok {
 		createdBy = &actor
 	}
 
+	scheduled := isScheduled(in.EffectiveFrom, time.Now())
 	err = withSlotLock(ctx, asset.ID, in.ExpirySeconds, slotLockWait, func() error {
 		// Anything a crash left half done is resolved before another change.
 		if _, err := repairSlot(ctx, asset.ID, in.ExpirySeconds); err != nil {
 			return err
 		}
+		// One change at a time: a scheduled one must be cancelled (or take
+		// effect) before another is made.
+		if err := assertNothingScheduled(ctx, asset.ID, in.ExpirySeconds); err != nil {
+			return err
+		}
 		var err error
-		before, after, err = replacePayout(ctx, asset, in, createdBy)
+		if scheduled {
+			before, after, err = schedulePayout(ctx, asset, in, createdBy)
+		} else {
+			before, after, err = replacePayout(ctx, asset, in, createdBy)
+		}
 		return err
 	})
 	if err != nil {
@@ -378,15 +422,19 @@ func replacePayout(ctx context.Context, asset *models.Asset, in UpsertPayoutInpu
 			PayoutPercent: in.PayoutPercent,
 			MinStake:      in.MinStake,
 			MaxStake:      in.MaxStake,
-			Version:       latestVersion + 1,
-			Active:        false,
-			EffectiveFrom: now,
-			EffectiveTo:   nil,
-			CreatedBy:     createdBy,
-			Note:          in.Note,
-			Activation:    models.Str(models.PayoutActivationPending),
-			CreatedAt:     now,
-			UpdatedAt:     now,
+			// Pricing-engine bounds.
+			MinPayoutPercent: in.MinPayoutPercent,
+			MaxPayoutPercent: in.MaxPayoutPercent,
+			MarginPercent:    in.MarginPercent,
+			Version:          latestVersion + 1,
+			Active:           false,
+			EffectiveFrom:    now,
+			EffectiveTo:      nil,
+			CreatedBy:        createdBy,
+			Note:             in.Note,
+			Activation:       models.Str(models.PayoutActivationPending),
+			CreatedAt:        now,
+			UpdatedAt:        now,
 		}
 		if current != nil {
 			id := current.ID
@@ -640,12 +688,15 @@ func RepairPayoutReplacements(ctx context.Context) (PayoutRepairResult, error) {
 	return out, nil
 }
 
-// DeactivatePayout closes a payout row.
+// DeactivatePayout closes a payout row; on a scheduled change it cancels it.
 func DeactivatePayout(ctx context.Context, payoutID string) (models.PayoutView, error) {
 	notFound := apperr.NotFoundErr(apperr.NotFound, "Payout configuration not found")
 	id, ok := mongox.ParseID(payoutID)
 	if !ok {
 		return models.PayoutView{}, notFound
+	}
+	if v, done, err := cancelScheduled(ctx, id); err != nil || done {
+		return v, err
 	}
 	now := mongox.Now()
 	var row models.PayoutConfig

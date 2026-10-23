@@ -30,6 +30,7 @@ import (
 	riskapi "binarytrading/internal/api/risk"
 	supportapi "binarytrading/internal/api/support"
 	transfersapi "binarytrading/internal/api/transfers"
+	usdtapi "binarytrading/internal/api/usdt"
 	usersapi "binarytrading/internal/api/users"
 	walletapi "binarytrading/internal/api/wallet"
 	"binarytrading/internal/config"
@@ -39,9 +40,12 @@ import (
 	"binarytrading/internal/platform/mongox"
 	"binarytrading/internal/platform/redisx"
 	"binarytrading/internal/platform/ws"
+	"binarytrading/internal/service/assets"
 	"binarytrading/internal/service/hedging"
 	mdproviders "binarytrading/internal/service/marketdata/providers"
+	"binarytrading/internal/service/pricinghedge"
 	"binarytrading/internal/service/riskconfig"
+	"binarytrading/internal/service/usdt"
 	"binarytrading/internal/workers"
 )
 
@@ -79,6 +83,9 @@ func newRouter() http.Handler {
 	r.Route("/market-data", marketdataapi.Mount)
 	r.Route("/binary", binaryapi.Mount)
 	r.Route("/wallet", walletapi.Mount)
+	// The USDT wallet (BeeX) and its signed webhook, which is public.
+	r.Route("/wallet/usdt", usdtapi.Mount)
+	usdtapi.MountWebhook(r)
 	r.Route("/transfers", transfersapi.Mount)
 	r.Route("/notifications", notificationsapi.Mount)
 	r.Route("/support", supportapi.Mount)
@@ -124,10 +131,23 @@ func run(cfg *config.Env) error {
 	}
 	logx.Info("risk configuration loaded", "version", riskCfg.Version, "drawPolicy", string(riskCfg.DrawPolicy))
 
+	// USDT networks, and the BeeX provider when USDT is enabled.
+	if err := usdt.Boot(ctx); err != nil {
+		return fmt.Errorf("usdt: %w", err)
+	}
+	// Launch scope (APPLY_LAUNCH_SCOPE=true): EUR/USD, GBP/USD and XAU/USD
+	// are switched off, idempotently and audited.
+	if err := assets.ApplyLaunchScopeAtBoot(ctx, cfg.ApplyLaunchScope); err != nil {
+		return fmt.Errorf("launch scope: %w", err)
+	}
+
 	marketProvider, err := mdproviders.GetMarketDataProvider()
 	if err != nil {
 		return err
 	}
+	// Pricing reads hedge availability and cost from the hedging service, and
+	// the hedge target uses the pricing engine's volatility (audit F-10).
+	pricinghedge.Install()
 	hedgeName, liveHedging := hedging.ProviderInfo()
 	logx.Info("providers initialised",
 		"marketProvider", marketProvider.Name(),

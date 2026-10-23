@@ -14,8 +14,11 @@ import type {
   DailySeriesPoint,
   DashboardSummary,
   ExposureResponse,
+  FxRate,
+  HedgeAlert,
   HedgeMonitorRow,
   HedgeOrder,
+  HedgeStatus,
   LatencyReportEntry,
   MarketDataOverview,
   MfaChallenge,
@@ -24,6 +27,7 @@ import type {
   Paginated,
   PaymentMethod,
   PayoutConfig,
+  PricingBoard,
   PlatformPnl,
   ReconciliationRun,
   RiskAssessment,
@@ -32,6 +36,7 @@ import type {
   UserDetail,
 } from '../types/api';
 import type {
+  UsdtAlertView,
   UsdtDepositDetail,
   UsdtDepositFilters,
   UsdtDepositRow,
@@ -48,6 +53,7 @@ import type {
   WebhookEventFilters,
   WebhookEventView,
 } from '../types/usdt';
+import type { AlertFilters, AlertingStatus, OpsAlert } from '../types/alerts';
 import { toPaginated } from '../utils/paging';
 
 async function apiDelete<T>(url: string): Promise<T> {
@@ -111,7 +117,8 @@ export const api = {
     /** The key is per attempt (see utils/idempotency): a resend replays the first result. */
     adjustWallet: (
       id: string,
-      input: { amount: number; direction: 'CREDIT' | 'DEBIT'; reason: string },
+      /** amount in the wallet's minor unit: paise for LIVE/DEMO, micro-USDT for FUNDING. */
+      input: { amount: number; direction: 'CREDIT' | 'DEBIT'; reason: string; accountType?: 'LIVE' | 'DEMO' | 'FUNDING' },
       idempotencyKey: string,
     ) => apiPost('/admin/users/' + id + '/wallet/adjust', input, { 'Idempotency-Key': idempotencyKey }),
     transactions: (id: string, params: { page?: number; limit?: number }) =>
@@ -127,15 +134,38 @@ export const api = {
       apiGet<PayoutConfig[]>('/admin/assets/' + id + '/payouts', { history }),
     setPayout: (
       id: string,
-      input: { expirySeconds: number; payoutPercent: number; minStake?: number | null; maxStake?: number | null; note?: string },
+      input: {
+        expirySeconds: number;
+        payoutPercent: number;
+        minStake?: number | null;
+        maxStake?: number | null;
+        minPayoutPercent?: number | null;
+        maxPayoutPercent?: number | null;
+        marginPercent?: number | null;
+        note?: string;
+        /** ISO time; a future instant schedules the change. */
+        effectiveFrom?: string;
+      },
     ) => apiPost<PayoutConfig>('/admin/assets/' + id + '/payouts', input),
     deactivatePayout: (payoutId: string) => apiDelete<PayoutConfig>('/admin/assets/payouts/' + payoutId),
+  },
+
+  /** The pricing engine: live offer terms, the kill switch (docs/audit/pricing). */
+  pricing: {
+    board: (assetId?: string) => apiGet<PricingBoard>('/admin/pricing', assetId ? { assetId } : undefined),
+    halt: (input: { symbol?: string; reason: string }) => apiPost<RiskConfig>('/admin/pricing/halt', input),
+    resume: (input: { symbol?: string }) => apiPost<RiskConfig>('/admin/pricing/resume', input),
   },
 
   trades: {
     list: (params: Record<string, unknown>) => apiGet<Paginated<AdminTrade>>('/admin/binary/trades', params),
     detail: (id: string) => apiGet<AdminTrade>('/admin/binary/trades/' + id),
     cancel: (id: string, reason: string) => apiPost<AdminTrade>('/admin/binary/trades/' + id + '/cancel', { reason }),
+    /** Finishes cancels whose stake or exposure release did not complete. */
+    repairCancellations: () =>
+      apiPost<{ scanned: number; repaired: number; failed: number; tradeIds: string[] }>(
+        '/admin/binary/trades/cancellations/repair',
+      ),
   },
 
   risk: {
@@ -149,6 +179,15 @@ export const api = {
     monitor: () => apiGet<HedgeMonitorRow[]>('/admin/hedging'),
     orders: (params: Record<string, unknown>) => apiGet<Paginated<HedgeOrder>>('/admin/hedging/orders', params),
     cancel: (id: string) => apiPost<HedgeOrder>('/admin/hedging/orders/' + id + '/cancel'),
+    /** Venue, INR rate and reconciliation state. */
+    status: () => apiGet<HedgeStatus>('/admin/hedging/status'),
+    alerts: (status?: 'open' | 'resolved') => apiGet<HedgeAlert[]>('/admin/hedging/alerts', status ? { status } : undefined),
+    /** Needs hedge:write; the note is saved to the audit log. */
+    resolveAlert: (id: string, note: string) => apiPost<HedgeAlert>('/admin/hedging/alerts/' + id + '/resolve', { note }),
+    /** Needs hedge:write: records a new INR per USDT rate (audited). */
+    setFxRate: (input: { inrPerUsdt: number; source?: string; note?: string }) =>
+      http.put('/admin/hedging/fx-rate', input).then((r) => r.data.data as FxRate),
+    reconcile: () => apiPost<unknown[]>('/admin/hedging/reconcile'),
   },
 
   marketData: {
@@ -191,6 +230,14 @@ export const api = {
     resolve: (id: string, note: string) => apiPost('/admin/reconciliation/' + id + '/resolve', { note }),
   },
 
+  /** Operational alerts (reconciliation:read; resolving needs reconciliation:resolve and is audited). */
+  alerts: {
+    list: (filters: AlertFilters) => apiList<OpsAlert>('/admin/alerts', filters),
+    status: () => apiGet<AlertingStatus>('/admin/alerts/status'),
+    resolve: (id: string, note: string) =>
+      apiPost<OpsAlert>('/admin/alerts/' + encodeURIComponent(id) + '/resolve', { note }),
+  },
+
   /** USDT via BeeX. Every amount is integer micro-USDT. */
   usdt: {
     summary: () => apiGet<UsdtSummary>('/admin/usdt/summary'),
@@ -211,12 +258,28 @@ export const api = {
     rejectWithdrawal: (id: string, note: string) => apiPost<unknown>(usdtPath('withdrawals', id, 'reject'), { note }),
     refreshWithdrawal: (id: string) =>
       apiPost<UsdtRefreshResult<UsdtWithdrawalView>>(usdtPath('withdrawals', id, 'refresh')),
+    /**
+     * A withdrawal whose BeeX answer did not match, settled (completed) or
+     * released (failed) by hand after checking the payout with BeeX.
+     */
+    markWithdrawalCompleted: (id: string, note: string, txHash?: string) =>
+      apiPost<UsdtWithdrawalView>(usdtPath('withdrawals', id, 'mark-completed'), txHash ? { note, txHash } : { note }),
+    markWithdrawalFailed: (id: string, note: string) =>
+      apiPost<UsdtWithdrawalView>(usdtPath('withdrawals', id, 'mark-failed'), { note }),
 
     webhookEvents: (filters: WebhookEventFilters) => apiList<WebhookEventView>('/admin/usdt/webhook-events', filters),
     reprocessWebhookEvent: (id: string) => apiPost<unknown>(usdtPath('webhook-events', id, 'reprocess')),
 
     networks: () => apiGet<UsdtNetworkView[]>('/admin/usdt/networks'),
     updateNetwork: (code: string, patch: UsdtNetworkPatch) => apiPatch<UsdtNetworkView>(usdtPath('networks', code), patch),
+
+    /** Mismatches the provider reconciliation found (BeeX vs our records vs the ledger). */
+    alerts: (filters: { status?: string; severity?: string; kind?: string; page?: number; limit?: number }) =>
+      apiList<UsdtAlertView>('/admin/usdt/alerts', filters),
+    /** Needs reconciliation:resolve; the note is saved to the audit log. */
+    resolveAlert: (id: string, note: string) => apiPost<UsdtAlertView>(usdtPath('alerts', id, 'resolve'), { note }),
+    /** Compares recent invoices and payouts with BeeX now instead of at the next scheduled run. */
+    reconcile: () => apiPost<unknown>('/admin/usdt/reconcile'),
   },
 
   support: {

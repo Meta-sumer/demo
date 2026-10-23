@@ -9,7 +9,7 @@ import { useMarketStore } from '../../stores/marketStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { formatCountdown, formatDateTime, formatExpiry, formatMoney, formatPrice, formatSignedMoney } from '../../utils/format';
 import { resolveZone, zoneChip } from '../../utils/time';
-import { durationOf, isActive, statusLabel } from '../../utils/tradeStatus';
+import { durationOf, isActive, tradeLabel, voidReason } from '../../utils/tradeStatus';
 import { cn } from '../../utils/cn';
 import { Screen, ScreenHeader } from '../../components/Screen';
 import { Icon, Panel, Skeleton, Text } from '../../components/ui';
@@ -102,7 +102,8 @@ export function TradeDetailScreen({ id }: { id: string }) {
 
   const fields: FieldProps[] = [
     { label: 'Asset', value: trade.symbol },
-    { label: 'Status', value: statusLabel(trade.status) },
+    { label: 'Status', value: tradeLabel(trade) },
+    ...(voidReason(trade) ? [{ label: 'Why voided', value: voidReason(trade) }] : []),
     { label: 'Direction', value: <DirectionWord direction={trade.direction} className="text-sm" /> },
     { label: 'Investment', value: money(trade.stake) },
     { label: 'Entry price', icon: <EntrySpot />, value: formatPrice(trade.entryPrice, precision), mono: true },

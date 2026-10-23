@@ -321,10 +321,12 @@ func upsertUser(ctx context.Context, email, username, password, fullName string,
 }
 
 func seedAssetCatalogue(ctx context.Context, cfg *config.Env) error {
-	feedIsSimulated := cfg.MarketDataProvider == "simulated"
 
 	for index, def := range seedAssets {
-		active := def.category == models.AssetCategoryCrypto || feedIsSimulated
+		// Launch scope: only BTC/USD and ETH/USD trade (the pricing engine
+		// refuses the others); the rest are created switched off whatever the
+		// feed (assets.LaunchScopeOffSymbols).
+		active := def.category == models.AssetCategoryCrypto && !slices.Contains(assets.LaunchScopeOffSymbols, def.symbol)
 		now := mongox.Now()
 		doc := models.Asset{
 			Symbol:            def.symbol,

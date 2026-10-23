@@ -54,7 +54,11 @@ import type { UsdtUserSummary, UsdtWithdrawalView } from '../../types/usdt';
  */
 const EMPTY_FILTERS = { status: '', network: '', q: '', reference: '', address: '', from: '', to: '' };
 
-type Decision = { kind: 'approve' | 'reject'; withdrawal: UsdtWithdrawalView; user: UsdtUserSummary | null };
+type Decision = {
+  kind: 'approve' | 'reject' | 'mark-completed' | 'mark-failed';
+  withdrawal: UsdtWithdrawalView;
+  user: UsdtUserSummary | null;
+};
 
 export function UsdtWithdrawalsPage() {
   const [params, setParams] = useSearchParams();
@@ -332,7 +336,11 @@ export function UsdtWithdrawalsPage() {
         />
       ) : null}
 
-      {decision ? <DecisionDialog decision={decision} onClose={() => setDecision(null)} /> : null}
+      {decision?.kind === 'mark-completed' || decision?.kind === 'mark-failed' ? (
+        <ResolutionDialog decision={decision} onClose={() => setDecision(null)} />
+      ) : decision ? (
+        <DecisionDialog decision={decision} onClose={() => setDecision(null)} />
+      ) : null}
     </>
   );
 }
@@ -413,6 +421,22 @@ function WithdrawalDrawer({
                 </button>
               </>
             ) : null}
+            {withdrawal.operatorResolvable ? (
+              <>
+                <button
+                  className="btn-ghost px-3 py-1.5 text-xs"
+                  onClick={() => onDecide({ kind: 'mark-failed', withdrawal, user })}
+                >
+                  Mark failed
+                </button>
+                <button
+                  className="btn-primary px-3 py-1.5 text-xs"
+                  onClick={() => onDecide({ kind: 'mark-completed', withdrawal, user })}
+                >
+                  Mark completed
+                </button>
+              </>
+            ) : null}
           </>
         ) : undefined
       }
@@ -438,6 +462,24 @@ function WithdrawalDrawer({
               <span className="font-semibold">{refreshOutcome.changed ? 'Changed: ' : 'No change: '}</span>
               {refreshOutcome.text}
             </div>
+          ) : null}
+
+          {withdrawal.operatorResolvable ? (
+            <p className="mx-4 mt-4 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn" role="alert">
+              <span className="font-semibold">BeeX's answer does not match this withdrawal: </span>
+              {withdrawal.providerMismatch || withdrawal.lastSubmitError || 'see the alerts'}. The amount stays reserved
+              and nothing is retried. Check the payout with BeeX, then mark it completed (the amount leaves the wallet) or
+              failed (it returns to the user).
+            </p>
+          ) : null}
+
+          {withdrawal.resolution ? (
+            <p className="mx-4 mt-4 rounded-lg border border-surface-700 bg-surface-850 px-3 py-2 text-xs text-content-300">
+              <span className="font-semibold">
+                Marked {withdrawal.resolution} by an operator {fullDate(withdrawal.resolvedAt ?? null)}:{' '}
+              </span>
+              {withdrawal.resolutionNote}
+            </p>
           ) : null}
 
           {withdrawal.failureReason ? (
@@ -539,6 +581,91 @@ function WithdrawalDrawer({
         </>
       ) : null}
     </Drawer>
+  );
+}
+
+/**
+ * Settle or release a withdrawal whose BeeX answer did not match, after the
+ * operator checked the payout with BeeX. The note says what was checked.
+ */
+function ResolutionDialog({ decision, onClose }: { decision: Decision; onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const [error, setError] = useState<string | null>(null);
+  const [txHash, setTxHash] = useState('');
+  const { withdrawal, user } = decision;
+  const completing = decision.kind === 'mark-completed';
+  const who = user?.username ?? 'the user';
+
+  const mutation = useMutation({
+    mutationFn: (note: string) =>
+      completing
+        ? api.usdt.markWithdrawalCompleted(withdrawal.id, note, txHash.trim() || undefined)
+        : api.usdt.markWithdrawalFailed(withdrawal.id, note),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['usdt'] });
+      toast(
+        'success',
+        completing ? 'Withdrawal marked completed' : 'Withdrawal marked failed',
+        completing
+          ? formatUsdt(withdrawal.amount) + ' left ' + who + "'s USDT wallet"
+          : formatUsdt(withdrawal.amount) + " returned to the user's USDT wallet",
+      );
+      onClose();
+    },
+    onError: (err) => {
+      const message = errorText(err, 'The withdrawal was not changed. Try again.');
+      setError(message);
+      toast('error', 'Resolution failed', message);
+    },
+  });
+
+  return (
+    <ConfirmDialog
+      title={completing ? 'Mark withdrawal completed' : 'Mark withdrawal failed'}
+      tone={completing ? 'primary' : 'danger'}
+      confirmLabel={completing ? 'Mark completed and debit' : 'Mark failed and return funds'}
+      pending={mutation.isPending}
+      error={error}
+      note={{
+        label: 'What you checked with BeeX',
+        required: true,
+        placeholder: 'e.g. BeeX support confirmed payout OUT2026-... was sent in full',
+        hint: 'Required, 3-500 characters. Saved to the audit log.',
+      }}
+      onCancel={onClose}
+      onConfirm={(note) => mutation.mutate(note)}
+    >
+      <p>
+        <span className="font-mono text-content-200">{withdrawal.reference}</span> for{' '}
+        <strong className="font-semibold text-content-100 tnum">{formatUsdt(withdrawal.amount)}</strong>: BeeX's answer did
+        not match it ({withdrawal.providerMismatch || withdrawal.lastSubmitError || 'see the alerts'}).
+      </p>
+      {completing ? (
+        <>
+          <p>
+            The reserved <span className="tnum">{formatUsdt(withdrawal.amount)}</span> leaves{' '}
+            <strong className="font-semibold text-content-100">{who}</strong>'s USDT wallet, once. Only do this when BeeX
+            confirms the payout was sent.
+          </p>
+          <label className="block">
+            <span className="text-[11px] text-content-400">On-chain transaction hash (optional)</span>
+            <input
+              className="field mt-1 font-mono text-[11px]"
+              value={txHash}
+              maxLength={200}
+              onChange={(event) => setTxHash(event.target.value)}
+              placeholder="As shown by BeeX"
+            />
+          </label>
+        </>
+      ) : (
+        <p>
+          The reserved <span className="tnum">{formatUsdt(withdrawal.amount)}</span> returns to{' '}
+          <strong className="font-semibold text-content-100">{who}</strong>'s USDT wallet, once. Only do this when BeeX
+          confirms nothing was or will be sent.
+        </p>
+      )}
+    </ConfirmDialog>
   );
 }
 

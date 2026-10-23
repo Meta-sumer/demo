@@ -3,7 +3,7 @@ import { ArrowDown, ArrowUp } from 'lucide-react-native';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { formatClock, resolveZone } from '../../utils/time';
 import { formatSignedMoney } from '../../utils/format';
-import { statusLabel, statusTone } from '../../utils/tradeStatus';
+import { statusTone, tradeLabel } from '../../utils/tradeStatus';
 import { cn } from '../../utils/cn';
 import { Icon, Text } from '../../components/ui';
 import { accountOf } from './ticketModel';
@@ -62,11 +62,17 @@ const TONE_TEXT = {
 } as const;
 
 /** The trade's status in words, coloured by what it means for the trader. */
-export function StatusPill({ trade, className }: { trade: Pick<Trade, 'status' | 'settlementAmount'>; className?: string }) {
+export function StatusPill({
+  trade,
+  className,
+}: {
+  trade: Pick<Trade, 'status' | 'settlementAmount' | 'voided' | 'expiryPriceSource'>;
+  className?: string;
+}) {
   const tone = statusTone(trade);
   return (
     <View className={cn('self-start rounded px-1.5 py-0.5', TONE_BOX[tone], className)}>
-      <Text className={cn('text-[10px] font-bold', TONE_TEXT[tone])}>{statusLabel(trade.status)}</Text>
+      <Text className={cn('text-[10px] font-bold', TONE_TEXT[tone])}>{tradeLabel(trade)}</Text>
     </View>
   );
 }

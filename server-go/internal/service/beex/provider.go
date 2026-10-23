@@ -33,13 +33,14 @@ var (
 )
 
 // New builds the provider BEEX_PROVIDER names. The mock is refused in
-// production (config.Load refuses it too; this is the second line).
+// production unless ALLOW_BEEX_SANDBOX_IN_PRODUCTION=true (config.Load
+// refuses it too; this is the second line).
 func New(cfg *config.Env) (Provider, error) {
 	if cfg == nil {
 		return nil, errors.New("beex: configuration not loaded")
 	}
 	if cfg.BeexProvider == "mock" {
-		if cfg.NodeEnv == "production" {
+		if cfg.NodeEnv == "production" && !cfg.AllowBeexSandboxInProduction {
 			return nil, errors.New("beex: the mock provider cannot be used in production")
 		}
 		return NewMock(), nil

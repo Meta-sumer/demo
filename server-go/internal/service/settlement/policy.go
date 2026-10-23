@@ -23,12 +23,14 @@ import (
 // this far away, whatever minSecondsRemainingForEarlyClose says - closing at or
 // after expiry would let a customer sell a position whose outcome is already
 // known.
-const EarlyCloseHardFloorMs = 1000
+const EarlyCloseHardFloorMs = models.EarlyCloseHardFloorMs
 
 // DefaultPolicy is the policy when the risk configuration sets nothing.
 func DefaultPolicy() models.SettlementPolicy {
 	return models.SettlementPolicy{
-		MaxTickAgeMs:                    5000,
+		// Pricing specification 9: the reference is the last accepted mid at
+		// or before expiry and at most settle_tolerance_s (2 s) before it.
+		MaxTickAgeMs:                    2000,
 		ConfirmationWindowMs:            2000,
 		DeferWindowMs:                   60_000,
 		RetryDelayMs:                    1000,
@@ -42,8 +44,10 @@ func DefaultPolicy() models.SettlementPolicy {
 }
 
 // riskConfigPolicyFields maps risk-config fields (bson names) onto the policy.
-// The riskconfig owner adds these to models.RiskConfig, its patch and admin
-// validation; until then the defaults apply.
+// They are models.RiskConfig fields, edited with PUT /admin/settings/risk and
+// validated with hard limits in riskconfig (policy_validate.go); a stored
+// version written before they existed has none of them, and the defaults
+// apply.
 var riskConfigPolicyFields = []struct {
 	field string
 	set   func(p *models.SettlementPolicy, v any)
@@ -58,6 +62,7 @@ var riskConfigPolicyFields = []struct {
 			p.NoPriceRule = s
 		}
 	}},
+	{"earlyCloseFloorMs", func(p *models.SettlementPolicy, v any) { setInt(&p.EarlyCloseFloorMs, v) }},
 	{"earlyCloseMaxTickAgeMs", func(p *models.SettlementPolicy, v any) { setInt(&p.EarlyCloseMaxTickAgeMs, v) }},
 	{"earlyCloseQuoteMaxAgeMs", func(p *models.SettlementPolicy, v any) { setInt(&p.EarlyCloseQuoteMaxAgeMs, v) }},
 	{"earlyCloseQuoteTolerancePercent", func(p *models.SettlementPolicy, v any) { setFloat(&p.EarlyCloseQuoteTolerancePercent, v) }},

@@ -594,11 +594,14 @@ func afterFinal(ctx context.Context, trade *models.BinaryTrade, in *models.Settl
 	if err := redisx.R().ZRem(ctx, config.RedisKeys.ExpiryQueue, tradeID).Err(); err != nil {
 		logx.Warn("failed to drop settled trade from the expiry queue", "tradeId", tradeID, "err", err.Error())
 	}
-	// DEMO trades never entered the book.
+	// DEMO trades never entered the book. Released by the trade id - the key
+	// its reservation and commit used - so the release is exactly once and
+	// can never take another trade's record (a trade counted under a legacy
+	// anonymous record is released through it).
 	if live {
 		if _, err := exposure.ApplyExposureDelta(ctx, exposure.ExposureDelta{
 			AssetID: trade.AssetID.Hex(), Symbol: trade.Symbol, UserID: userID, Direction: trade.Direction,
-			Stake: trade.Stake, Profit: trade.Profit, Sign: -1,
+			Stake: trade.Stake, Profit: trade.Profit, Sign: -1, TradeID: tradeID, ExpiryTimestamp: trade.ExpiryTimestamp,
 		}); err != nil {
 			// The counters are a cache rebuilt from trades at boot.
 			logx.Error("failed to release settled trade exposure", "tradeId", tradeID, "err", err.Error())

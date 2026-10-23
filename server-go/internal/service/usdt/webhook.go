@@ -41,11 +41,15 @@ const (
 
 func eventsColl() *mongo.Collection { return mongox.C(models.CollBeexWebhookEvents) }
 
+func deliveriesColl() *mongo.Collection { return mongox.C(models.CollBeexWebhookDeliveries) }
+
 // WebhookResult is what the webhook endpoint reports.
 type WebhookResult struct {
 	EventID          string `json:"eventId"`
 	Duplicate        bool   `json:"duplicate"`
 	ProcessingStatus string `json:"processingStatus"`
+	// The identical signed request was seen before (a replay, not a retry).
+	Replay bool `json:"replay,omitempty"`
 }
 
 // EventKey is an event's identity: a redelivery of the same event produces
@@ -134,6 +138,32 @@ func ReceiveWebhook(ctx context.Context, raw []byte, header http.Header, remoteI
 		doc.Mode = strOrNil(p.Mode)
 	}
 
+	// Replay guard, independent of what the body says: every signed request
+	// is recorded under its signature (unique). BeeX signs each retry afresh,
+	// so the same signature twice is the same request sent again.
+	delivery := models.BeexWebhookDelivery{
+		ID: bson.NewObjectID(), Signature: beex.Sign(secret, ts, raw), SignatureTimestamp: ts, EventKey: doc.EventKey,
+		RemoteIP: remoteIP, ReceivedAt: now,
+	}
+	if _, err := deliveriesColl().InsertOne(ctx, delivery); err != nil {
+		if !mongox.IsDuplicateKey(err) {
+			return WebhookResult{}, err
+		}
+		var existing models.BeexWebhookEvent
+		if ferr := eventsColl().FindOne(ctx, bson.M{"eventKey": doc.EventKey}).Decode(&existing); ferr == nil {
+			logx.Warn("BEEX_WEBHOOK_REPLAY", "eventId", existing.ID.Hex(), "event", doc.Event, "remoteIp", remoteIP,
+				"signatureTimestamp", ts)
+			RaiseAlert(ctx, Alert{
+				Kind: models.AlertKindWebhook, Code: AlertWebhookReplay, Severity: models.AlertWarning, Subject: existing.ID.Hex(),
+				Message: "The same signed webhook request arrived again; it was not applied a second time.",
+				Details: map[string]any{"event": doc.Event, "eventKey": doc.EventKey, "remoteIp": remoteIP, "signatureTimestamp": ts},
+				EventID: &existing.ID,
+			})
+			return WebhookResult{EventID: existing.ID.Hex(), Duplicate: true, Replay: true, ProcessingStatus: existing.ProcessingStatus}, nil
+		}
+		// The first copy stopped before its event was stored: store it now.
+	}
+
 	if _, err := eventsColl().InsertOne(ctx, doc); err != nil {
 		if !mongox.IsDuplicateKey(err) {
 			return WebhookResult{}, err
@@ -149,7 +179,15 @@ func ReceiveWebhook(ctx context.Context, raw []byte, header http.Header, remoteI
 	logx.Info("BEEX_PAYMENT_WEBHOOK_RECEIVED", "eventId", doc.ID.Hex(), "event", doc.Event, "reference", deref(doc.Reference),
 		"orderId", deref(doc.OrderID), "clientReference", deref(doc.ClientReference), "status", deref(doc.Status),
 		"mode", deref(doc.Mode))
+	if _, err := deliveriesColl().UpdateOne(ctx, bson.M{"signature": delivery.Signature}, bson.M{"$set": bson.M{"eventId": doc.ID}}); err != nil {
+		logx.Warn("could not link a webhook delivery to its event", "eventId", doc.ID.Hex(), "err", err.Error())
+	}
 	if doc.ProcessingStatus == models.WebhookFailed {
+		RaiseAlert(ctx, Alert{
+			Kind: models.AlertKindWebhook, Code: AlertWebhookIgnored, Severity: models.AlertWarning, Subject: doc.ID.Hex(),
+			Message: "A correctly signed webhook could not be read; it is stored for review and was not applied.",
+			EventID: &doc.ID,
+		})
 		return WebhookResult{EventID: doc.ID.Hex(), ProcessingStatus: doc.ProcessingStatus}, nil
 	}
 	status, err := ProcessEvent(ctx, doc.ID, false)
@@ -208,6 +246,12 @@ func ProcessEvent(ctx context.Context, id bson.ObjectID, force bool) (string, er
 		if attempts >= maxEventAttempts {
 			set["nextAttemptAt"] = nil
 			logx.Error("BeeX webhook event gave up after repeated failures", "eventId", id.Hex(), "attempts", attempts, "err", perr.Error())
+			RaiseAlert(ctx, Alert{
+				Kind: models.AlertKindWebhook, Code: AlertWebhookFailed, Severity: models.AlertCritical, Subject: id.Hex(),
+				Message: "Webhook " + ev.Event + " failed " + itoa(attempts) + " times and is no longer retried automatically: " + perr.Error(),
+				Details: map[string]any{"event": ev.Event, "reference": deref(ev.Reference), "attempts": attempts},
+				EventID: &id, DepositID: depositID, WithdrawalID: withdrawalID,
+			})
 		} else {
 			set["nextAttemptAt"] = now.Add(eventBackoff(attempts))
 		}
@@ -219,6 +263,21 @@ func ProcessEvent(ctx context.Context, id bson.ObjectID, force bool) (string, er
 	}
 	if _, err := eventsColl().UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": set}); err != nil {
 		return status, err
+	}
+	if perr == nil && status == models.WebhookIgnored {
+		// Stored, never applied: an unknown invoice or payout, or one that does
+		// not match ours, is for an operator to look at - never credited.
+		if code, severity := classifyIgnored(note); code != "" {
+			RaiseAlert(ctx, Alert{
+				Kind: models.AlertKindWebhook, Code: code, Severity: severity, Subject: id.Hex(),
+				Message: "Webhook " + ev.Event + " was stored but not applied: " + note,
+				Details: map[string]any{
+					"event": ev.Event, "reference": deref(ev.Reference), "orderId": deref(ev.OrderID),
+					"clientReference": deref(ev.ClientReference), "status": deref(ev.Status), "mode": deref(ev.Mode),
+				},
+				EventID: &id, DepositID: depositID, WithdrawalID: withdrawalID,
+			})
+		}
 	}
 	return status, perr
 }
@@ -345,11 +404,26 @@ func RetryWebhookEvents(ctx context.Context, limit int64) (int, error) {
 		return 0, err
 	}
 	for _, r := range rows {
+		if err := stillLeader(ctx); err != nil {
+			return 0, err
+		}
 		if _, err := ProcessEvent(ctx, r.ID, false); err != nil {
 			logx.Warn("BeeX webhook retry failed", "eventId", r.ID.Hex(), "err", err.Error())
 		}
 	}
 	return len(rows), nil
+}
+
+// GetEvent returns one stored webhook event.
+func GetEvent(ctx context.Context, id bson.ObjectID) (*models.BeexWebhookEvent, error) {
+	var ev models.BeexWebhookEvent
+	if err := eventsColl().FindOne(ctx, bson.M{"_id": id}).Decode(&ev); err != nil {
+		if mongox.IsNotFound(err) {
+			return nil, apperr.NotFoundErr(apperr.NotFound, "Webhook event not found")
+		}
+		return nil, err
+	}
+	return &ev, nil
 }
 
 // ReprocessEvent is the operator's "process again" (idempotent).

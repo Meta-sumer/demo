@@ -67,9 +67,11 @@ type ExposureDelta struct {
 	Sign int64
 	// Optional. With the trade id the delta is applied exactly once per trade
 	// (a repeated release is a no-op, a release before the open is
-	// remembered). Without it a release is matched to an open trade of the
-	// user with the same asset, side, stake and profit, which moves the same
-	// counters. ExpiryTimestamp places an opening trade in its expiry bucket.
+	// remembered; a trade counted under a legacy anonymous record is released
+	// through it, see ReleaseTrade). Without it a release is matched to an
+	// open trade of the user with the same asset, side, stake and profit,
+	// which moves the same counters. ExpiryTimestamp places an opening trade
+	// in its expiry bucket (and prefers the legacy record of that bucket).
 	TradeID         string
 	ExpiryTimestamp int64
 }
@@ -92,7 +94,10 @@ func ApplyExposureDelta(ctx context.Context, delta ExposureDelta) (models.Exposu
 		})
 	case delta.Sign < 0:
 		if delta.TradeID != "" {
-			_, err = CloseTrade(ctx, delta.TradeID, delta.UserID)
+			_, err = ReleaseTrade(ctx, OpenTrade{
+				TradeID: delta.TradeID, AssetID: delta.AssetID, Symbol: delta.Symbol, UserID: delta.UserID,
+				Direction: delta.Direction, Stake: delta.Stake, Profit: delta.Profit, ExpiryTimestamp: delta.ExpiryTimestamp,
+			})
 		} else {
 			_, err = closeByMatch(ctx, delta)
 		}

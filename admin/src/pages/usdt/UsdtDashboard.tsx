@@ -1,15 +1,17 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { useQuery, type UseQueryResult } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 import clsx from 'clsx';
-import { ArrowRight } from 'lucide-react';
+import { AlertTriangle, ArrowRight } from 'lucide-react';
 import { api } from '../../services/api';
 import { useAuthStore } from '../../stores/authStore';
+import { toast } from '../../hooks/useToast';
 import { useUsdtRefetchInterval } from '../../hooks/useUsdtLive';
 import { EmptyState, Panel, PanelHeader, Skeleton } from '../../components/ui';
-import { ModeBadge, NetworkBadge, QueryError, Usdt, YesNo, fullDate } from '../../components/usdt';
+import { ConfirmDialog } from '../../components/overlay';
+import { ModeBadge, NetworkBadge, QueryError, Usdt, YesNo, errorText, fullDate } from '../../components/usdt';
 import { formatUsdt } from '../../utils/usdt';
-import type { UsdtPayoutLimits, UsdtSummary } from '../../types/usdt';
+import type { UsdtAlertView, UsdtPayoutLimits, UsdtSummary } from '../../types/usdt';
 
 /**
  * USDT overview: what has come in, what has gone out, what customers hold,
@@ -53,6 +55,18 @@ export function UsdtDashboardPage() {
           <ArrowRight className="ml-auto h-4 w-4 text-content-400" />
         </Link>
       ) : null}
+
+      {data?.sandbox ? (
+        <div className="panel flex items-start gap-3 border-warn/40 px-4 py-3 text-sm">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warn" aria-hidden="true" />
+          <span className="text-content-200">
+            <span className="font-semibold text-content-100">Sandbox.</span> BeeX runs in test mode ({data.provider.name}):
+            no real USDT moves. Live payments need a ck_live_ key on the server.
+          </span>
+        </div>
+      ) : null}
+
+      {data?.alerts ? <AlertsPanel alerts={data.alerts.latest} open={data.alerts.open} critical={data.alerts.critical} /> : null}
 
       <div className="grid gap-3 xl:grid-cols-2">
         <Panel>
@@ -162,6 +176,126 @@ export function UsdtDashboardPage() {
 
       <PayoutLimitsCard query={limits} />
     </div>
+  );
+}
+
+/**
+ * What the provider reconciliation found: BeeX, our records and the ledger
+ * disagreeing. Nothing is corrected for the operator; an alert is closed with
+ * a note once someone has looked.
+ */
+function AlertsPanel({ alerts, open, critical }: { alerts: UsdtAlertView[]; open: number; critical: number }) {
+  const can = useAuthStore((s) => s.can);
+  const queryClient = useQueryClient();
+  const [resolving, setResolving] = useState<UsdtAlertView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const reconcile = useMutation({
+    mutationFn: api.usdt.reconcile,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['usdt'] });
+      toast('success', 'Checked with BeeX', 'Recent deposits and withdrawals were compared');
+    },
+    onError: (err) => toast('error', 'Check failed', errorText(err)),
+  });
+  const resolve = useMutation({
+    mutationFn: ({ id, note }: { id: string; note: string }) => api.usdt.resolveAlert(id, note),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['usdt'] });
+      toast('success', 'Alert resolved', 'Saved to the audit log');
+      setResolving(null);
+    },
+    onError: (err) => setError(errorText(err, 'The alert was not resolved. Try again.')),
+  });
+  const linkFor = (alert: UsdtAlertView) =>
+    alert.depositId
+      ? '/admin/usdt/deposits?id=' + alert.depositId
+      : alert.withdrawalId
+        ? '/admin/usdt/withdrawals?id=' + alert.withdrawalId
+        : alert.eventId
+          ? '/admin/usdt/webhook-events'
+          : null;
+
+  return (
+    <Panel>
+      <PanelHeader
+        title="Reconciliation alerts"
+        description={
+          open === 0
+            ? 'BeeX, our records and the ledger agree'
+            : open + ' open' + (critical > 0 ? ', ' + critical + ' critical' : '') + ' - nothing is corrected automatically'
+        }
+        actions={
+          can('reconciliation:read') ? (
+            <button
+              type="button"
+              className="btn-ghost px-3 py-1.5 text-xs"
+              disabled={reconcile.isPending}
+              onClick={() => reconcile.mutate()}
+            >
+              {reconcile.isPending ? 'Checking...' : 'Check with BeeX now'}
+            </button>
+          ) : null
+        }
+      />
+      {alerts.length === 0 ? null : (
+        <ul className="divide-y divide-surface-800">
+          {alerts.map((alert) => {
+            const to = linkFor(alert);
+            return (
+              <li key={alert.id} className="flex flex-wrap items-start gap-x-3 gap-y-1 px-4 py-3 text-sm">
+                <span
+                  className={clsx(
+                    'rounded-md px-2 py-0.5 text-[10px] font-bold uppercase ring-1',
+                    alert.severity === 'critical' ? 'bg-down/15 text-down ring-down/30' : 'bg-warn/15 text-warn ring-warn/30',
+                  )}
+                >
+                  {alert.severity}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="text-content-100">{alert.message}</div>
+                  <div className="mt-0.5 text-[11px] text-content-400">
+                    <span className="font-mono">{alert.code}</span> · seen {alert.occurrences}x · last {fullDate(alert.lastSeenAt)}
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {to ? <OpenLink to={to}>Open</OpenLink> : null}
+                  {can('reconciliation:resolve') ? (
+                    <button
+                      type="button"
+                      className="btn-ghost px-2 py-1 text-xs"
+                      onClick={() => {
+                        setError(null);
+                        setResolving(alert);
+                      }}
+                    >
+                      Resolve
+                    </button>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {resolving ? (
+        <ConfirmDialog
+          title="Resolve alert"
+          confirmLabel="Resolve"
+          pending={resolve.isPending}
+          error={error}
+          note={{
+            label: 'What was found and done',
+            required: true,
+            placeholder: 'e.g. Confirmed with BeeX support; payout reversed manually',
+            hint: 'Required, 3-500 characters. Saved to the audit log.',
+          }}
+          onCancel={() => setResolving(null)}
+          onConfirm={(note) => resolve.mutate({ id: resolving.id, note })}
+        >
+          <p className="text-sm text-content-200">{resolving.message}</p>
+        </ConfirmDialog>
+      ) : null}
+    </Panel>
   );
 }
 

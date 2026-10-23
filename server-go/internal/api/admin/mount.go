@@ -16,6 +16,7 @@ import (
 
 	authapi "binarytrading/internal/api/auth"
 	supportapi "binarytrading/internal/api/support"
+	usdtapi "binarytrading/internal/api/usdt"
 	"binarytrading/internal/platform/httpx"
 )
 
@@ -35,8 +36,14 @@ func Mount(r chi.Router) {
 
 	r.Route("/users", func(r chi.Router) { r.Group(mountUsers) })
 	r.Route("/assets", func(r chi.Router) { r.Group(mountAssets) })
+	// The pricing engine: live payouts, bounds and model versions.
+	r.Route("/pricing", func(r chi.Router) { r.Group(mountPricing) })
 	r.Route("/payment-methods", func(r chi.Router) { r.Group(mountPaymentMethods) })
 	r.Route("/support", func(r chi.Router) { r.Group(supportapi.MountAdmin) })
 	// Admin two-factor authentication and forced sign-out.
 	r.Route("/security", func(r chi.Router) { r.Group(mountSecurity) })
+	// The USDT wallet (BeeX): deposits, withdrawals, webhooks, alerts.
+	r.Route("/usdt", func(r chi.Router) { r.Group(usdtapi.MountAdmin) })
+	// Operational alerts and the monitoring status.
+	r.Route("/alerts", func(r chi.Router) { r.Group(mountAlerts) })
 }

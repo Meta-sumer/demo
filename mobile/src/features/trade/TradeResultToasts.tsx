@@ -9,7 +9,7 @@ import { useTradeResultStore } from '../../stores/tradeResultStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { formatExpiry, formatMoney, formatSignedMoney } from '../../utils/format';
-import { durationOf, statusLabel } from '../../utils/tradeStatus';
+import { durationOf, tradeLabel } from '../../utils/tradeStatus';
 import { cn } from '../../utils/cn';
 import { Icon, Text } from '../../components/ui';
 import { payoutOf, settlementOf } from './settlement';
@@ -166,13 +166,13 @@ function ResultCard({ trade, onClose }: { trade: Trade; onClose: () => void }) {
       entering={FadeInDown.duration(200)}
       exiting={FadeOutDown.duration(160)}
       layout={LinearTransition}
-      accessibilityLabel={'Result: ' + statusLabel(trade.status) + ' ' + trade.symbol}
+      accessibilityLabel={'Result: ' + tradeLabel(trade) + ' ' + trade.symbol}
       className={cn('rounded-2xl border bg-surface-850 p-3', won ? 'border-brand/50' : 'border-surface-700')}
       style={SHADOW}
     >
       <View className="flex-row items-center gap-2">
         <View className={cn('rounded-md px-2 py-0.5', won ? 'bg-brand' : 'bg-content-100')}>
-          <Text className="text-xs font-bold text-surface-950">{statusLabel(trade.status)}</Text>
+          <Text className="text-xs font-bold text-surface-950">{tradeLabel(trade)}</Text>
         </View>
         <Text numberOfLines={1} className="min-w-0 flex-1 text-sm font-semibold text-content-100">
           {trade.symbol}
@@ -273,7 +273,7 @@ function OlderRow({ trade, first, onClose }: { trade: Trade; first: boolean; onC
         className="min-w-0 flex-1 flex-row items-center gap-2"
       >
         <Text numberOfLines={1} className="w-16 text-xs font-semibold text-content-300">
-          {statusLabel(trade.status)}
+          {tradeLabel(trade)}
         </Text>
         <Text numberOfLines={1} className="min-w-0 flex-1 text-xs font-semibold text-content-100">
           {trade.symbol}

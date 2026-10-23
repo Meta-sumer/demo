@@ -14,10 +14,10 @@ func TestValidateConfig(t *testing.T) {
 	}
 
 	cases := map[string]func(c *models.RiskConfig){
-		"Feed thresholds must satisfy healthy < degraded < stale": func(c *models.RiskConfig) { c.FeedDegradedMaxMs = c.FeedStaleMaxMs },
-		"minTradeAmount cannot exceed maxTradeAmount":             func(c *models.RiskConfig) { c.MinTradeAmount = c.MaxTradeAmount + 1 },
-		"hedgeThresholdPercent must be between 0 and 100":         func(c *models.RiskConfig) { c.HedgeThresholdPercent = 101 },
-		"Hedge level HIGH_HEDGE has an empty band":                func(c *models.RiskConfig) { c.HedgeLevels[2].ToPercent = 60 },
+		"Feed thresholds must satisfy healthy < degraded < tick max age": func(c *models.RiskConfig) { c.FeedDegradedMaxMs = c.FeedTickMaxAgeMs },
+		"minTradeAmount cannot exceed maxTradeAmount":                    func(c *models.RiskConfig) { c.MinTradeAmount = c.MaxTradeAmount + 1 },
+		"hedgeThresholdPercent must be between 0 and 100":                func(c *models.RiskConfig) { c.HedgeThresholdPercent = 101 },
+		"Hedge level HIGH_HEDGE has an empty band":                       func(c *models.RiskConfig) { c.HedgeLevels[2].ToPercent = 60 },
 		"Hedge levels overlap around 55%": func(c *models.RiskConfig) {
 			c.HedgeLevels[2].FromPercent = 55
 		},

@@ -9,7 +9,7 @@ import { useMarketStore } from '../stores/marketStore';
 import { useSettingsStore } from '../stores/settingsStore';
 import { formatCountdown, formatDateTime, formatExpiry, formatMoney, formatPrice, formatSignedMoney } from '../utils/format';
 import { resolveZone, zoneChip } from '../utils/time';
-import { durationOf, isActive, statusLabel } from '../utils/tradeStatus';
+import { durationOf, isActive, tradeLabel, voidReason } from '../utils/tradeStatus';
 import { Panel, Skeleton } from '../components/ui';
 import { payoutOf, settlementOf } from '../features/trade/settlement';
 import { accountOf } from '../features/trade/ticketModel';
@@ -143,7 +143,8 @@ export function TradeDetailPage() {
         <Panel className="overflow-hidden [grid-area:fields]">
           <dl className="grid grid-cols-2 gap-px bg-surface-800/60 sm:grid-cols-3 lg:grid-cols-2">
             <Field label="Asset" value={trade.symbol} />
-            <Field label="Status" value={statusLabel(trade.status)} />
+            <Field label="Status" value={tradeLabel(trade)} />
+            {voidReason(trade) ? <Field label="Why voided" value={voidReason(trade)} /> : null}
             <Field label="Direction" value={<DirectionWord direction={trade.direction} />} />
             <Field label="Investment" value={money(trade.stake)} />
             <Field label="Entry price" icon={<EntrySpot />} value={formatPrice(trade.entryPrice, precision)} mono />

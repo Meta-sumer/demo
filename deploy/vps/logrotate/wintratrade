@@ -1,0 +1,11 @@
+# Host log files of wintratrade.online (installed by deploy/vps/deploy.sh).
+# Container logs are rotated by Docker (docker-compose.prod.yml, logging).
+/var/log/wintratrade-backup.log /var/log/wintratrade-monitor.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

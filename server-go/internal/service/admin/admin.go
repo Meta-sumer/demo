@@ -47,6 +47,15 @@ type DashboardSummary struct {
 	TotalLockedBalance   float64 `json:"totalLockedBalance"`
 	PendingDeposits      int64   `json:"pendingDeposits"`
 	PendingWithdrawals   int64   `json:"pendingWithdrawals"`
+
+	// Hedge book (metric dictionary, docs/audit/operations): the policy
+	// target, the marks and reconciliation behind HedgedExposure.
+	HedgeTargetNotional  int64      `json:"hedgeTargetNotional"`
+	HedgeMarkedAt        *time.Time `json:"-"`
+	HedgeTargetAsOf      *time.Time `json:"-"`
+	HedgeReconcileStatus string     `json:"hedgeReconcileStatus"`
+	HedgeReconciledAt    *time.Time `json:"-"`
+	GeneratedAt          time.Time  `json:"-"`
 }
 
 // aggregate runs a pipeline and decodes every row into out (a slice pointer).
@@ -114,6 +123,15 @@ type DashboardView struct {
 	TotalLockedBalance   *float64 `json:"totalLockedBalance,omitempty"`
 	PendingDeposits      *int64   `json:"pendingDeposits,omitempty"`
 	PendingWithdrawals   *int64   `json:"pendingWithdrawals,omitempty"`
+	// Hedge book (exposure:read): policy target, oldest mark of an open
+	// hedge position, oldest target evaluation, reconciliation state.
+	HedgeTargetNotional  *int64    `json:"hedgeTargetNotional,omitempty"`
+	HedgeMarkedAt        *iso.Time `json:"hedgeMarkedAt,omitempty"`
+	HedgeTargetAsOf      *iso.Time `json:"hedgeTargetAsOf,omitempty"`
+	HedgeReconcileStatus *string   `json:"hedgeReconcileStatus,omitempty"`
+	HedgeReconciledAt    *iso.Time `json:"hedgeReconciledAt,omitempty"`
+	// When the server computed these figures.
+	GeneratedAt iso.Time `json:"generatedAt"`
 	// Redacted names the figure groups withheld from this caller.
 	Redacted []string `json:"redacted"`
 }
@@ -131,12 +149,15 @@ func GetDashboardFor(ctx context.Context, v Visibility) (DashboardView, error) {
 		TotalUsers: s.TotalUsers, ActiveUsers: s.ActiveUsers, OpenTrades: s.OpenTrades,
 		TodayTrades: s.TodayTrades, TodayVolume: s.TodayVolume, ActiveAssets: s.ActiveAssets,
 		FeedLatencyP50: s.FeedLatencyP50, FeedLatencyP95: s.FeedLatencyP95, FeedLatencyP99: s.FeedLatencyP99,
-		TradeAcceptanceP95: s.TradeAcceptanceP95, Redacted: []string{},
+		TradeAcceptanceP95: s.TradeAcceptanceP95, Redacted: []string{}, GeneratedAt: iso.From(s.GeneratedAt),
 	}
 	if v.Exposure {
 		out.CurrentExposure, out.CurrentNetExposure = ptr(s.CurrentExposure), ptr(s.CurrentNetExposure)
 		out.PotentialLiability = ptr(s.PotentialLiability)
 		out.HedgedExposure, out.UnhedgedExposure = ptr(s.HedgedExposure), ptr(s.UnhedgedExposure)
+		out.HedgeTargetNotional, out.HedgeReconcileStatus = ptr(s.HedgeTargetNotional), ptr(s.HedgeReconcileStatus)
+		out.HedgeMarkedAt, out.HedgeTargetAsOf = iso.Ptr(s.HedgeMarkedAt), iso.Ptr(s.HedgeTargetAsOf)
+		out.HedgeReconciledAt = iso.Ptr(s.HedgeReconciledAt)
 	} else {
 		out.Redacted = append(out.Redacted, "exposure")
 	}
@@ -180,10 +201,11 @@ func getDashboard(ctx context.Context, vis Visibility) (DashboardSummary, error)
 			Balance float64 `bson:"balance"`
 			Locked  float64 `bson:"locked"`
 		}
-		portfolio     exposure.PortfolioExposure
-		hedgedByAsset map[string]int64
-		activeAssets  []*models.Asset
+		portfolio    exposure.PortfolioExposure
+		hedgeBook    hedging.HedgeBookSummary
+		activeAssets []*models.Asset
 	)
+	s.GeneratedAt = mongox.Now()
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) {
@@ -219,9 +241,17 @@ func getDashboard(ctx context.Context, vis Visibility) (DashboardSummary, error)
 			portfolio, err = exposure.GetPortfolioExposure(gctx)
 			return
 		})
-		g.Go(func() (err error) {
-			hedgedByAsset, err = hedging.GetHedgedNotionalByAsset(gctx)
-			return
+		g.Go(func() error {
+			docs, err := assets.ListAssetDocs(gctx, false)
+			if err != nil {
+				return err
+			}
+			ids := make([]bson.ObjectID, 0, len(docs))
+			for _, a := range docs {
+				ids = append(ids, a.ID)
+			}
+			hedgeBook, err = hedging.GetHedgeBookSummary(gctx, ids)
+			return err
 		})
 	}
 	g.Go(func() (err error) {
@@ -256,10 +286,6 @@ func getDashboard(ctx context.Context, vis Visibility) (DashboardSummary, error)
 	feed := metrics.GetLatencySummary(ctx, config.LatFeedTotal)
 	acceptance := metrics.GetLatencySummary(ctx, config.LatTradeAcceptance)
 
-	var hedged int64
-	for _, v := range hedgedByAsset {
-		hedged += v
-	}
 	if len(activeUsers) > 0 {
 		s.ActiveUsers = activeUsers[0].N
 	}
@@ -269,8 +295,14 @@ func getDashboard(ctx context.Context, vis Visibility) (DashboardSummary, error)
 	s.CurrentExposure = portfolio.TotalGrossExposure
 	s.CurrentNetExposure = portfolio.TotalNetExposure
 	s.PotentialLiability = portfolio.TotalPotentialLiability
-	s.HedgedExposure = hedged
-	s.UnhedgedExposure = max(0, absInt(portfolio.TotalNetExposure)-hedged)
+	// Hedge figures are delta-equivalent INR notionals: held = filled
+	// positions at mark; unhedged = what the target still lacks (target
+	// minus held, summed over assets). Working orders count in neither.
+	s.HedgedExposure = hedgeBook.Held
+	s.UnhedgedExposure = hedgeBook.Residual
+	s.HedgeTargetNotional = hedgeBook.Target
+	s.HedgeMarkedAt, s.HedgeTargetAsOf = hedgeBook.MarkedAt, hedgeBook.TargetAsOf
+	s.HedgeReconcileStatus, s.HedgeReconciledAt = hedgeBook.ReconcileStatus, hedgeBook.ReconciledAt
 	s.ActiveAssets = int64(len(activeAssets))
 	s.FeedLatencyP50, s.FeedLatencyP95, s.FeedLatencyP99 = feed.P50, feed.P95, feed.P99
 	s.TradeAcceptanceP95 = acceptance.P95
@@ -480,6 +512,19 @@ type PlatformPnl struct {
 	Fees                    float64  `json:"fees"`
 	Adjustments             float64  `json:"adjustments"`
 	NetResult               float64  `json:"netResult"`
+
+	// Hedge realised P&L decomposed (hedgeRealisedPnl = trading - fees +
+	// funding + adjustments), from the fills ledger by execution time, and
+	// the reconciliation state it rests on. Unrealised is at the oldest mark.
+	HedgeTradingPnl      float64   `json:"hedgeTradingPnl"`
+	HedgeFees            float64   `json:"hedgeFees"`
+	HedgeFunding         float64   `json:"hedgeFunding"`
+	HedgeAdjustments     float64   `json:"hedgeAdjustments"`
+	HedgeFills           int64     `json:"hedgeFills"`
+	HedgeReconcileStatus string    `json:"hedgeReconcileStatus"`
+	HedgeReconciledAt    *iso.Time `json:"hedgeReconciledAt"`
+	HedgeMarkedAt        *iso.Time `json:"hedgeMarkedAt"`
+	GeneratedAt          iso.Time  `json:"generatedAt"`
 }
 
 func GetPlatformPnl(ctx context.Context, from, to time.Time) (PlatformPnl, error) {
@@ -521,7 +566,7 @@ func GetPlatformPnl(ctx context.Context, from, to time.Time) (PlatformPnl, error
 		}, &openLiability)
 	})
 	g.Go(func() (err error) {
-		hedge, err = hedging.GetHedgePnlSummary(gctx, &from)
+		hedge, err = hedging.GetHedgePnl(gctx, from, to)
 		return
 	})
 	g.Go(func() error {
@@ -561,6 +606,16 @@ func GetPlatformPnl(ctx context.Context, from, to time.Time) (PlatformPnl, error
 		HedgeRealisedPnl:   float64(hedge.Realised),
 		HedgeUnrealisedPnl: float64(hedge.Unrealised),
 		Adjustments:        debits - credits,
+
+		HedgeTradingPnl:      float64(hedge.TradingPnl),
+		HedgeFees:            float64(hedge.Fees),
+		HedgeFunding:         float64(hedge.Funding),
+		HedgeAdjustments:     float64(hedge.Adjustments),
+		HedgeFills:           hedge.Fills,
+		HedgeReconcileStatus: hedge.ReconcileStatus,
+		HedgeReconciledAt:    iso.Ptr(hedge.ReconciledAt),
+		HedgeMarkedAt:        iso.Ptr(hedge.MarkedAt),
+		GeneratedAt:          iso.From(mongox.Now()),
 	}
 	if len(settlementSide) > 0 {
 		p.CustomerPayout = settlementSide[0].Payout

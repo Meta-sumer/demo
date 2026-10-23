@@ -41,6 +41,39 @@ type Limits struct {
 	Stale bool `json:"stale"`
 }
 
+// LimitsView is GET /admin/usdt/payout-limits: the same figures, with the
+// fee percentage as an exact JSON number (what the console reads), plus our
+// own review threshold.
+type LimitsView struct {
+	Currencies         []string    `json:"currencies"`
+	MinWithdrawal      int64       `json:"minWithdrawal"`
+	MaxWithdrawal      int64       `json:"maxWithdrawal"`
+	DailyWithdrawalCap int64       `json:"dailyWithdrawalCap"`
+	ReviewedAbove      int64       `json:"reviewedAbove"`
+	FeePercent         json.Number `json:"feePercent"`
+	FeeFixed           int64       `json:"feeFixed"`
+	FetchedAt          *iso.Time   `json:"fetchedAt"`
+	Stale              bool        `json:"stale"`
+	// Ours (USDT_WITHDRAWAL_REVIEW_ABOVE): 0 = every withdrawal is reviewed.
+	PlatformReviewAbove int64 `json:"platformReviewAbove"`
+}
+
+func (l Limits) View() LimitsView {
+	v := LimitsView{
+		Currencies: l.Currencies, MinWithdrawal: l.MinWithdrawal, MaxWithdrawal: l.MaxWithdrawal,
+		DailyWithdrawalCap: l.DailyWithdrawalCap, ReviewedAbove: l.ReviewedAbove, FeePercent: json.Number(l.FeePercent),
+		FeeFixed: l.FeeFixed, Stale: l.Stale, PlatformReviewAbove: reviewAbove(),
+	}
+	if v.Currencies == nil {
+		v.Currencies = []string{}
+	}
+	if !l.FetchedAt.IsZero() {
+		t := l.FetchedAt
+		v.FetchedAt = &t
+	}
+	return v
+}
+
 // EstimateFee is BeeX's published fee: fixed + percent of the amount,
 // floored to the micro. BeeX's own figure on the payout is authoritative.
 func (l Limits) EstimateFee(amount int64) int64 {
@@ -63,6 +96,9 @@ func (l Limits) Supports(code string) bool {
 	}
 	return false
 }
+
+// limitsRedisKey is the shared cache key (tests point it at a key of their own).
+var limitsRedisKey = config.RedisKeys.UsdtPayoutLimits
 
 var (
 	limitsMu  sync.Mutex
@@ -193,7 +229,7 @@ func readRedisLimits(ctx context.Context) (Limits, bool) {
 	if redisx.R() == nil {
 		return Limits{}, false
 	}
-	raw, err := redisx.R().Get(ctx, config.RedisKeys.UsdtPayoutLimits).Bytes()
+	raw, err := redisx.R().Get(ctx, limitsRedisKey).Bytes()
 	if err != nil {
 		return Limits{}, false
 	}
@@ -210,7 +246,7 @@ func writeRedisLimits(ctx context.Context, l Limits) {
 		return
 	}
 	raw, _ := json.Marshal(l)
-	if err := redisx.R().Set(ctx, config.RedisKeys.UsdtPayoutLimits, raw, limitsKeepFor).Err(); err != nil {
+	if err := redisx.R().Set(ctx, limitsRedisKey, raw, limitsKeepFor).Err(); err != nil {
 		logx.Warn("could not cache BeeX payout limits", "err", err.Error())
 	}
 }

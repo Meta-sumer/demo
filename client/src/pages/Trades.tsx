@@ -11,7 +11,7 @@ import { useCountdown, useNow } from '../hooks/useCountdown';
 import { formatCountdown, formatDateTime, formatExpiry, formatMoney, formatPrice, formatSignedMoney } from '../utils/format';
 import { downloadCsv, toCsv } from '../utils/csv';
 import { groupByDay } from '../utils/dayGroups';
-import { durationOf, statusLabel } from '../utils/tradeStatus';
+import { durationOf, tradeLabel } from '../utils/tradeStatus';
 import { settlementOf } from '../features/trade/settlement';
 import { accountOf } from '../features/trade/ticketModel';
 import { amountTone, liveResult, liveTotal } from '../features/trade/liveResult';
@@ -58,7 +58,7 @@ type Tab = 'active' | 'history';
 const RESULTS: Array<{ value: TradeStatus; label: string }> = [
   { value: 'WON', label: 'Won' },
   { value: 'LOST', label: 'Lost' },
-  { value: 'DRAW', label: 'Draw' },
+  { value: 'DRAW', label: 'Draw / void' },
   { value: 'CLOSED_EARLY', label: 'Sold early' },
 ];
 
@@ -197,7 +197,7 @@ export function TradesPage() {
           { header: 'Placed at', value: (t) => new Date(t.entryTimestamp).toISOString() },
           { header: 'Expiry price', value: (t) => t.expiryPrice ?? '' },
           { header: 'Expires at', value: (t) => new Date(t.expiryTimestamp).toISOString() },
-          { header: 'Status', value: (t) => statusLabel(t.status) },
+          { header: 'Status', value: (t) => tradeLabel(t) },
           {
             // Already net of the stake: +profit on a win, -stake on a loss.
             header: 'Net',

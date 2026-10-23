@@ -141,6 +141,11 @@ export function AssetsPage() {
                   <td className="text-content-300">{asset.category}</td>
                   <td>
                     <StatusBadge status={asset.active ? 'ACTIVE' : 'DISABLED'} />
+                    {asset.priced === false ? (
+                      <span className="ml-1" title={asset.notPricedReason ?? ''}>
+                        <Badge tone="warn">Not priced</Badge>
+                      </span>
+                    ) : null}
                   </td>
                   <td className="text-right tnum text-content-300">{formatMoney(asset.minStake)}</td>
                   <td className="text-right tnum text-content-300">{formatMoney(asset.maxStake)}</td>

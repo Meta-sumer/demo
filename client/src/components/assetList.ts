@@ -13,6 +13,19 @@ import type { Asset } from '../types/api';
 export type AssetAvailability = 'open' | 'paused' | 'closed';
 
 /**
+ * Whether the platform offers the instrument at all. An asset the pricing
+ * engine cannot price (launch scope: only BTC/USD and ETH/USD are priced)
+ * is not shown anywhere; a server that predates the flag offers everything.
+ */
+export function isOfferable(asset: Pick<Asset, 'pricing'>): boolean {
+  return asset.pricing?.priced !== false;
+}
+
+export function offerableAssets<T extends Pick<Asset, 'pricing'>>(assets: T[]): T[] {
+  return assets.filter(isOfferable);
+}
+
+/**
  * Whether the instrument takes new trades, in words.
  *
  * "Market closed" is the schedule; "Paused" is the platform refusing because

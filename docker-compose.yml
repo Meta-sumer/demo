@@ -57,6 +57,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Every setting, including the USDT_* / BEEX_* ones (see .env.example).
     env_file: .env
     environment:
       MONGO_URI: mongodb://mongo:${MONGO_PORT:-27017}/binary_trading?replicaSet=rs0

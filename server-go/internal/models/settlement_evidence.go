@@ -60,6 +60,11 @@ const (
 
 var NoPriceRuleValues = []string{NoPriceRuleVoidRefund, NoPriceRuleStaleTickThenVoid}
 
+// EarlyCloseHardFloorMs: an early close is refused unless expiry is at least
+// this far away, whatever the configuration says (settlement.PolicyFor and
+// the risk-config validation both enforce it).
+const EarlyCloseHardFloorMs = 1000
+
 // SettlementPolicy is the effective settlement / early-close policy. The
 // values come from the active risk configuration (defaults where a field is
 // not configured) and a copy is stored with every outcome, so a decision can
@@ -152,7 +157,20 @@ type SettlementEvidence struct {
 
 	EarlyClose *EarlyCloseEvidence `bson:"earlyClose,omitempty"`
 	Note       string              `bson:"note,omitempty"`
+	// Why no price qualified (voids only): FEED_GAP (expiry inside a
+	// recorded market data gap, FeedGapID), HISTORY_UNAVAILABLE (the tick
+	// history no longer reaches back to expiry: retention or a Redis loss)
+	// or NO_TICK_IN_WINDOW.
+	NoPriceReason string `bson:"noPriceReason,omitempty"`
+	FeedGapID     string `bson:"feedGapId,omitempty"`
 }
+
+// No-price reasons (SettlementEvidence.NoPriceReason).
+const (
+	NoPriceReasonFeedGap            = "FEED_GAP"
+	NoPriceReasonHistoryUnavailable = "HISTORY_UNAVAILABLE"
+	NoPriceReasonNoTick             = "NO_TICK_IN_WINDOW"
+)
 
 // SettlementIntent is the immutable financial outcome of a trade, recorded
 // atomically with the claim and executed idempotently.

@@ -104,11 +104,13 @@ const (
 	HedgeOrderStatusFilled          HedgeOrderStatus = "FILLED"
 	HedgeOrderStatusFailed          HedgeOrderStatus = "FAILED"
 	HedgeOrderStatusCancelled       HedgeOrderStatus = "CANCELLED"
+	HedgeOrderStatusAccepted        HedgeOrderStatus = "ACCEPTED" // acknowledged by the venue, nothing filled yet
 )
 
 var HedgeOrderStatusValues = []string{
 	string(HedgeOrderStatusNotRequired), string(HedgeOrderStatusPending), string(HedgeOrderStatusPartiallyFilled),
 	string(HedgeOrderStatusFilled), string(HedgeOrderStatusFailed), string(HedgeOrderStatusCancelled),
+	string(HedgeOrderStatusAccepted),
 }
 
 type WalletTransactionType string
@@ -190,6 +192,9 @@ type NormalisedTick struct {
 	FeedLatencyMs       int64 `json:"feedLatencyMs"`
 	ProcessingLatencyMs int64 `json:"processingLatencyMs"`
 	TotalLatencyMs      int64 `json:"totalLatencyMs"`
+	// (ask - bid) / mid x 10^4 of the accepted quote; Price is the mid.
+	// Absent on ticks stored before normalisation.
+	SpreadBps *float64 `json:"spreadBps,omitempty"`
 }
 
 type FeedHealthSnapshot struct {
@@ -206,6 +211,10 @@ type FeedHealthSnapshot struct {
 	AgeMs               *int64     `json:"ageMs"`
 	Provider            string     `json:"provider"`
 	UpdatedAt           int64      `json:"updatedAt"`
+	// Why the feed is treated as STALE although its last tick is fresh
+	// (feed data rules: ticks dropped by a saturated ingestion buffer, the
+	// server clock drifting from the provider's). Omitted when none.
+	BlockReason string `json:"blockReason,omitempty"`
 }
 
 // ExposureSnapshot: all amounts in minor units.
@@ -261,4 +270,7 @@ type RiskAssessment struct {
 	TargetHedgeRatio    float64       `json:"targetHedgeRatio"`
 	TargetHedgeNotional int64         `json:"targetHedgeNotional"`
 	EvaluatedAt         int64         `json:"evaluatedAt"`
+	// Delta-based hedge target and every input behind it (absent when the
+	// assessment had no book data). docs/audit/hedging/hedging-spec.md.
+	HedgeTarget *HedgeTargetDetail `json:"hedgeTarget,omitempty"`
 }

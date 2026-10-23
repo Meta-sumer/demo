@@ -215,6 +215,7 @@ local b, sym, dl, now = ARGV[8], ARGV[9], ARGV[10], ARGV[11]
 local limUser, limGross, limNet, limPlat = N(ARGV[12]), N(ARGV[13]), N(ARGV[14]), N(ARGV[15])
 local concPct = N(ARGV[16])
 local limBkt, limAL, limPL = N(ARGV[17]), N(ARGV[18]), N(ARGV[19])
+local limSide = N(ARGV[20])
 
 local st = redis.call('HMGET', K_STATE, 'status', 'gross', 'liab', 'users')
 if st[1] ~= 'READY' then return {'UNCERTAIN', st[1] or 'MISSING'} end
@@ -261,6 +262,7 @@ local userAsset = userFields[a] or 0
 
 -- Live reservations.
 local pUser, pUserAsset, pAsset, pUp, pDown, pPlat = 0, 0, 0, 0, 0, 0
+local pUpP, pDownP = 0, 0
 local groups = {}
 local pend = redis.call('HGETALL', K_RSV)
 for i = 1, #pend, 2 do
@@ -273,7 +275,7 @@ for i = 1, #pend, 2 do
   end
   if pa == a then
     pAsset = pAsset + ps
-    if pd == 'UP' then pUp = pUp + ps else pDown = pDown + ps end
+    if pd == 'UP' then pUp = pUp + ps; pUpP = pUpP + pp else pDown = pDown + ps; pDownP = pDownP + pp end
   end
   local gk = pa .. '|' .. pb
   local g = groups[gk]
@@ -329,6 +331,18 @@ if limBkt > 0 or limAL > 0 or limPL > 0 then
     if limAL > 0 and cBL + assetDelta + inc > limAL then v[#v + 1] = 'ASSET_LIABILITY' end
     if limPL > 0 and stLiab + platDelta + inc > limPL then v[#v + 1] = 'PLATFORM_LIABILITY' end
   end
+end
+-- Pricing specification 7.2, final hard check, per asset and side: the
+-- platform's net loss if side d wins, L(d) = profits on d - stakes on the
+-- other side, must stay within limSide with this trade. Reservations count
+-- in their worst case (their profit on their side, their stake never
+-- credited against the other).
+if limSide > 0 then
+  local sv = redis.call('HMGET', kAsset(a), 'upProfit', 'downProfit')
+  local cUpP, cDownP = N(sv[1]), N(sv[2])
+  local lSide
+  if d == 'UP' then lSide = cUpP + pUpP - cDown else lSide = cDownP + pDownP - cUp end
+  if math.max(0, lSide + p) > limSide then v[#v + 1] = 'SIDE_LIABILITY' end
 end
 if #v > 1 then return v end
 
@@ -394,6 +408,53 @@ closeRecord(t, u, now)
 redis.call('SET', kDone(t), '1', 'EX', DONE_TTL)
 journal('X|' .. t .. '|' .. u)
 return {'closed', t}
+`)
+
+// closeID: ARGV 2 tradeId 3 userId 4 assetId 5 dir 6 stake 7 profit
+// 8 bucket 9 now. Releases a finished trade by its id, exactly once: the
+// record under the id is closed and the id is tombstoned, so a repeat (or a
+// commit that lands late) changes nothing. Backward compatibility: a trade
+// counted before records were keyed by trade id sits in the book under an
+// anonymous "anon-" record. Only when the id has no record, was never
+// released and holds no reservation is the matching legacy record (same
+// asset, side, stake and profit; the same expiry bucket first, else the
+// earliest) released in its place. Records keyed by another trade's id are
+// never touched. Returns {closed} | {legacy, recordId} | {missing} | {done}.
+var closeIDScript = script(`
+local t, u, a, d = ARGV[2], ARGV[3], ARGV[4], ARGV[5]
+local s, p, b, now = N(ARGV[6]), N(ARGV[7]), ARGV[8], ARGV[9]
+local already = redis.call('EXISTS', kDone(t)) == 1
+local hadRsv = redis.call('HDEL', K_RSV, t)
+redis.call('ZREM', K_RSVDL, t)
+local r = closeRecord(t, u, now)
+local legacy = nil
+if r == 'missing' and not already and hadRsv == 0 then
+  local all = redis.call('HGETALL', kOT(u))
+  local bestB = nil
+  for i = 1, #all, 2 do
+    local id = all[i]
+    if string.sub(id, 1, 5) == 'anon-' then
+      local f = split(all[i + 1])
+      if f[1] == a and f[2] == d and N(f[3]) == s and N(f[4]) == p then
+        local fb = N(f[5])
+        if f[5] == b then fb = -1 end
+        if legacy == nil or fb < bestB then legacy, bestB = id, fb end
+      end
+    end
+  end
+  if legacy then
+    closeRecord(legacy, u, now)
+    redis.call('SET', kDone(legacy), '1', 'EX', DONE_TTL)
+  end
+end
+redis.call('SET', kDone(t), '1', 'EX', DONE_TTL)
+journal('X|' .. t .. '|' .. u)
+if legacy then
+  journal('X|' .. legacy .. '|' .. u)
+  return {'legacy', legacy}
+end
+if r == 'missing' and already then return {'done'} end
+return {r}
 `)
 
 // snapshot: one consistent read of the whole book for the reconciler.

@@ -2,6 +2,7 @@ package usdt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -106,6 +107,45 @@ func withdrawnSince(ctx context.Context, uid *bson.ObjectID, since time.Time) (i
 	return rows[0].Sum, nil
 }
 
+// liveWithdrawable is what a customer may send out while the provider is
+// live: what live-mode deposits credited, less the live withdrawals that are
+// not failed or rejected. Sandbox (test-mode) credits stay visible in the
+// balance but can never leave through a real payout - so switching from the
+// sandbox to live keys cannot pay out money that never arrived.
+func liveWithdrawable(ctx context.Context, uid bson.ObjectID) (int64, error) {
+	sum := func(coll string, match bson.M, field string) (int64, error) {
+		cur, err := mongox.C(coll).Aggregate(ctx, bson.A{
+			bson.M{"$match": match},
+			bson.M{"$group": bson.M{"_id": nil, "sum": bson.M{"$sum": "$" + field}}},
+		})
+		if err != nil {
+			return 0, err
+		}
+		var rows []struct {
+			Sum int64 `bson:"sum"`
+		}
+		if err := cur.All(ctx, &rows); err != nil {
+			return 0, err
+		}
+		if len(rows) == 0 {
+			return 0, nil
+		}
+		return rows[0].Sum, nil
+	}
+	credited, err := sum(models.CollUsdtDeposits, bson.M{"userId": uid, "credited": true, "mode": "live"}, "amountCredited")
+	if err != nil {
+		return 0, err
+	}
+	spent, err := sum(models.CollUsdtWithdrawals, bson.M{
+		"userId": uid, "mode": bson.M{"$ne": "test"},
+		"status": bson.M{"$nin": bson.A{models.WithdrawalFailed, models.WithdrawalRejected}},
+	}, "amount")
+	if err != nil {
+		return 0, err
+	}
+	return credited - spent, nil
+}
+
 func userDailyCap(l Limits) int64 {
 	if v := env().UsdtUserDailyWithdrawalLimit; v > 0 {
 		return v
@@ -127,14 +167,18 @@ type Quote struct {
 	DailyCap  int64 `json:"dailyCap"`
 	DailyUsed int64 `json:"dailyUsed"`
 	// The platform's review threshold (0 = every withdrawal is reviewed).
-	ReviewedAbove int64  `json:"reviewedAbove"`
-	NeedsReview   bool   `json:"needsReview"`
-	FeePercent    string `json:"feePercent"`
-	FeeFixed      int64  `json:"feeFixed"`
+	ReviewedAbove int64 `json:"reviewedAbove"`
+	NeedsReview   bool  `json:"needsReview"`
+	// A percentage as an exact JSON number ("0.5" -> 0.5), as the clients read it.
+	FeePercent json.Number `json:"feePercent"`
+	FeeFixed   int64       `json:"feeFixed"`
 	// Additions to the contract.
 	AvailableBalance      int64 `json:"availableBalance"`
 	ProviderReviewedAbove int64 `json:"providerReviewedAbove"`
 	LimitsStale           bool  `json:"limitsStale"`
+	// What can actually be sent: the available balance, capped at live-mode
+	// deposits when the provider is live.
+	WithdrawableBalance int64 `json:"withdrawableBalance"`
 }
 
 // GetQuote previews a withdrawal (amount 0 = limits only).
@@ -172,13 +216,22 @@ func GetQuote(ctx context.Context, userID, networkCode string, amount int64) (Qu
 	if amount > 0 {
 		fee = limits.EstimateFee(amount)
 	}
+	withdrawable := wallet.AvailableBalance
+	if ProviderMode() == "live" {
+		backed, err := liveWithdrawable(ctx, uid)
+		if err != nil {
+			return Quote{}, err
+		}
+		withdrawable = max(0, min(withdrawable, backed))
+	}
 	return Quote{
 		Network: network.Code, Amount: amount, FeeAmount: fee, NetAmount: max(0, amount-fee), FeeIsEstimate: true,
 		MinWithdrawal: limits.MinWithdrawal, MaxWithdrawal: limits.MaxWithdrawal,
 		DailyCap: userDailyCap(limits), DailyUsed: used,
 		ReviewedAbove: reviewAbove(), NeedsReview: amount > 0 && needsReview(amount),
-		FeePercent: limits.FeePercent, FeeFixed: limits.FeeFixed,
+		FeePercent: json.Number(limits.FeePercent), FeeFixed: limits.FeeFixed,
 		AvailableBalance: wallet.AvailableBalance, ProviderReviewedAbove: limits.ReviewedAbove, LimitsStale: limits.Stale,
+		WithdrawableBalance: withdrawable,
 	}, nil
 }
 
@@ -263,6 +316,7 @@ func RequestWithdrawal(ctx context.Context, in WithdrawalRequest) (*models.UsdtW
 	if _, err := fundingWallet(ctx, in.UserID); err != nil {
 		return nil, false, err
 	}
+	mode := ProviderMode()
 
 	var created *models.UsdtWithdrawal
 	var replay *models.UsdtWithdrawal
@@ -298,12 +352,23 @@ func RequestWithdrawal(ctx context.Context, in WithdrawalRequest) (*models.UsdtW
 				return apperr.New(apperr.DailyCapExceeded, "The daily withdrawal limit has been reached. Please try again later.", 400)
 			}
 		}
+		if mode == "live" {
+			// Under the same lock, so two requests cannot both spend one deposit.
+			backed, err := liveWithdrawable(ctx, uid)
+			if err != nil {
+				return err
+			}
+			if in.Amount > backed {
+				return apperr.New(apperr.InsufficientBalance, "Only USDT received through live deposits can be withdrawn ("+
+					micro.Format(max(0, backed))+" USDT).", 400)
+			}
+		}
 
 		review := needsReview(in.Amount)
 		id := bson.NewObjectID()
 		now := mongox.Now()
 		doc := models.UsdtWithdrawal{
-			ID: id, UserID: uid, Reference: "withdrawal-" + id.Hex(), IdempotencyKey: in.IdempotencyKey,
+			ID: id, UserID: uid, Reference: "withdrawal-" + id.Hex(), Mode: strOrNil(mode), IdempotencyKey: in.IdempotencyKey,
 			RequestHash: hash, Network: network.Code, Address: address, Amount: in.Amount,
 			FeeAmount: fee, NetAmount: in.Amount - fee, FeeIsEstimate: true,
 			Status: models.WithdrawalRequested, LockedAmount: in.Amount, SubmissionPending: true, NextSubmitAt: &now,
@@ -457,8 +522,21 @@ func submitLocked(ctx context.Context, id bson.ObjectID) error {
 	recordSubmitError(ctx, id, err)
 	logx.Warn("BeeX payout submission pending", "withdrawalId", id.Hex(), "reference", w.Reference,
 		"attempt", attempt, "err", err.Error())
+	if attempt >= stuckSubmitAttempts {
+		RaiseAlert(ctx, Alert{
+			Kind: models.AlertKindWithdrawal, Code: AlertWithdrawalSubmissionStuck, Severity: models.AlertWarning, Subject: id.Hex(),
+			Message: "Payout " + w.Reference + " has not been accepted by BeeX after " + itoa(attempt) +
+				" attempts; it keeps being retried with the same reference and the funds stay reserved.",
+			Details:      map[string]any{"reference": w.Reference, "attempts": attempt, "lastError": deref(providerRaw(err))},
+			WithdrawalID: &id,
+		})
+	}
 	return nil
 }
+
+// stuckSubmitAttempts: past this many unanswered submissions an operator is
+// told (the retries go on).
+const stuckSubmitAttempts = 6
 
 // adoptPayout applies BeeX's answer to a submission.
 func adoptPayout(ctx context.Context, w *models.UsdtWithdrawal, payout *beex.Payout, source string) error {
@@ -467,11 +545,35 @@ func adoptPayout(ctx context.Context, w *models.UsdtWithdrawal, payout *beex.Pay
 		// BeeX's payout does not match ours: stop resubmitting and let an
 		// operator look at it.
 		logx.Error("BeeX payout does not match the withdrawal", "withdrawalId", w.ID.Hex(), "reason", ig.Reason)
+		RaiseAlert(ctx, Alert{
+			Kind: models.AlertKindWithdrawal, Code: AlertWithdrawalProviderMismatch, Severity: models.AlertCritical, Subject: w.ID.Hex(),
+			Message: "BeeX's payout for " + w.Reference + " does not match the withdrawal (" + ig.Reason +
+				"); resubmission stopped and the funds stay reserved.",
+			Details:      map[string]any{"reference": w.Reference, "providerReference": payout.Reference, "reason": ig.Reason},
+			WithdrawalID: &w.ID,
+		})
+		now := mongox.Now()
 		_, uerr := withdrawalsColl().UpdateOne(ctx, bson.M{"_id": w.ID, "status": models.WithdrawalRequested},
-			bson.M{"$set": bson.M{"submissionPending": false, "lastSubmitError": "provider mismatch: " + ig.Reason, "updatedAt": mongox.Now()}})
+			bson.M{"$set": bson.M{"submissionPending": false, "lastSubmitError": models.WithdrawalProviderMismatchPrefix + " " + ig.Reason,
+				"providerMismatch": ig.Reason, "providerMismatchAt": now, "updatedAt": now}})
 		return uerr
 	}
 	return err
+}
+
+// markProviderMismatch records on an open, submitted withdrawal that BeeX's
+// answer for it did not match and was not applied (refresh, reconciliation).
+// It is what makes the withdrawal resolvable by an operator.
+func markProviderMismatch(ctx context.Context, id bson.ObjectID, reason string) {
+	if containsConflict(reason) {
+		return // a completed-after-release conflict concerns a final withdrawal
+	}
+	now := mongox.Now()
+	if _, err := withdrawalsColl().UpdateOne(ctx,
+		bson.M{"_id": id, "status": bson.M{"$in": submittedStatuses}, "submissionPending": false},
+		bson.M{"$set": bson.M{"providerMismatch": reason, "providerMismatchAt": now, "updatedAt": now}}); err != nil {
+		logx.Error("could not record a provider mismatch", "withdrawalId", id.Hex(), "err", err.Error())
+	}
 }
 
 func recordSubmitError(ctx context.Context, id bson.ObjectID, err error) {
@@ -497,6 +599,9 @@ func RetryPendingSubmissions(ctx context.Context, limit int64) (int, error) {
 		return 0, err
 	}
 	for _, r := range rows {
+		if err := stillLeader(ctx); err != nil {
+			return 0, err
+		}
 		if err := SubmitPayout(ctx, r.ID); err != nil {
 			logx.Error("payout retry failed", "withdrawalId", r.ID.Hex(), "err", err.Error())
 		}
@@ -637,6 +742,13 @@ func applyPayoutUpdate(ctx context.Context, id bson.ObjectID, u payoutUpdate) (A
 			// Released here but sent by BeeX: money left without a debit.
 			logx.Error("BEEX_RECONCILIATION conflict: BeeX reports a released withdrawal as completed",
 				"withdrawalId", id.Hex(), "status", w.Status, "providerReference", u.ProviderReference)
+			RaiseAlert(ctx, Alert{
+				Kind: models.AlertKindWithdrawal, Code: AlertWithdrawalCompletedAfter, Severity: models.AlertCritical, Subject: id.Hex(),
+				Message: "BeeX reports payout " + w.Reference + " as completed, but the withdrawal is " + w.Status +
+					" and its funds were returned to the customer; the money left without a debit.",
+				Details:      map[string]any{"status": w.Status, "providerReference": u.ProviderReference, "txHash": u.TxHash, "source": u.Source},
+				WithdrawalID: &w.ID,
+			})
 			return ApplyResult{}, ignored("CONFLICT: BeeX reports completed but the withdrawal is " + w.Status + "; needs an operator")
 		}
 		gap := bson.M{"updatedAt": now, "providerStatus": u.Status}
@@ -949,6 +1061,103 @@ func RejectWithdrawal(ctx context.Context, id bson.ObjectID, adminID, note strin
 	return loadWithdrawal(ctx, id)
 }
 
+// ResolveInput is an operator's resolution of a withdrawal whose BeeX answer
+// did not match.
+type ResolveInput struct {
+	ID      bson.ObjectID
+	AdminID string
+	// models.WithdrawalResolutionCompleted (settle) or
+	// models.WithdrawalResolutionFailed (release).
+	Outcome string
+	// Required: what the operator checked with BeeX.
+	Note string
+	// Optional, completed only: the on-chain transaction BeeX shows.
+	TxHash string
+}
+
+// ResolveWithdrawal settles (completed) or releases (failed) a withdrawal the
+// automatic paths cannot finish because BeeX's answer for it did not match
+// (models.WithdrawalOperatorResolvable), after the operator has checked the
+// payout with BeeX. The money moves through the same keyed, transactional
+// steps as BeeX's own answer - usdt:withdrawal:settle:<id> or
+// usdt:withdrawal:unlock:<id>, with the status flip in the same transaction -
+// so the ledger effect happens exactly once, whatever runs concurrently.
+// Idempotent: a withdrawal already in the requested final state is returned
+// with changed false and nothing moves; one in the other final state is 409
+// WITHDRAWAL_ALREADY_PROCESSED.
+func ResolveWithdrawal(ctx context.Context, in ResolveInput) (*models.UsdtWithdrawal, bool, error) {
+	ctx = context.WithoutCancel(ctx)
+	admin, ok := mongox.ParseID(in.AdminID)
+	if !ok {
+		return nil, false, apperr.Unauth()
+	}
+	note := strings.TrimSpace(in.Note)
+	if len(note) < 3 {
+		return nil, false, apperr.Validation("A note of at least 3 characters is required", nil)
+	}
+	final := models.WithdrawalCompleted
+	if in.Outcome == models.WithdrawalResolutionFailed {
+		final = models.WithdrawalFailed
+	} else if in.Outcome != models.WithdrawalResolutionCompleted {
+		return nil, false, apperr.Validation("outcome must be completed or failed", nil)
+	}
+	changed := false
+	err := withPayoutLock(ctx, in.ID, func() error {
+		w, err := loadWithdrawal(ctx, in.ID)
+		if err != nil {
+			return err
+		}
+		if models.WithdrawalFinal(w.Status) {
+			if w.Status == final {
+				return nil // already done: replay, nothing moves
+			}
+			return apperr.ConflictErr(apperr.WithdrawalAlreadyProcessed, "This withdrawal is already "+w.Status)
+		}
+		if !models.WithdrawalOperatorResolvable(w) {
+			return apperr.ConflictErr(apperr.Conflict,
+				"Only a withdrawal whose BeeX answer did not match can be resolved by hand; refresh, approve or reject it instead")
+		}
+		now := mongox.Now()
+		set := bson.M{
+			"resolution": in.Outcome, "resolvedBy": admin, "resolvedAt": now, "resolutionNote": note,
+			"submissionPending": false, "nextSubmitAt": nil,
+		}
+		var res ApplyResult
+		if final == models.WithdrawalCompleted {
+			set["updatedAt"] = now
+			set["providerStatus"] = models.WithdrawalCompleted
+			res, err = settleWithdrawal(ctx, w, payoutUpdate{Source: "admin", TxHash: strings.TrimSpace(in.TxHash)}, set)
+		} else {
+			res, err = releaseWithdrawal(ctx, w, models.WithdrawalFailed,
+				"The withdrawal could not be completed by the payment provider. The full amount has been returned to your wallet.",
+				set, "admin")
+		}
+		if err != nil {
+			return err
+		}
+		if !res.Changed {
+			// Finished concurrently by another path: report what it became.
+			current, lerr := loadWithdrawal(ctx, in.ID)
+			if lerr != nil {
+				return lerr
+			}
+			if current.Status != final {
+				return apperr.ConflictErr(apperr.WithdrawalAlreadyProcessed, "This withdrawal is already "+current.Status)
+			}
+			return nil
+		}
+		changed = true
+		logx.Warn("USDT withdrawal resolved by an operator", "withdrawalId", in.ID.Hex(), "reference", w.Reference,
+			"outcome", in.Outcome, "adminId", in.AdminID, "mismatch", deref(w.ProviderMismatch))
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	w, err := loadWithdrawal(ctx, in.ID)
+	return w, changed, err
+}
+
 // RefreshWithdrawal asks BeeX for the payout (by our reference) and applies
 // the answer.
 func RefreshWithdrawal(ctx context.Context, id bson.ObjectID, source string) (ApplyResult, *models.UsdtWithdrawal, error) {
@@ -983,6 +1192,7 @@ func RefreshWithdrawal(ctx context.Context, id bson.ObjectID, source string) (Ap
 	if ig, ok := AsIgnored(err); ok {
 		res, err = ApplyResult{Note: "not applied: " + ig.Reason}, nil
 		_, _ = withdrawalsColl().UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": touch})
+		markProviderMismatch(ctx, id, ig.Reason)
 	}
 	if err != nil {
 		return ApplyResult{}, w, err

@@ -13,31 +13,8 @@
     />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Binary Trading</title>
-    <script>
-      /*
-       * Applies the stored theme before first paint.
-       *
-       * Without this the page renders with the default theme and then swaps,
-       * which is a visible white flash for a dark-mode user on every load.
-       * Kept inline and dependency-free for that reason. The storage key must
-       * match THEME_STORAGE_KEY in stores/themeStore.ts.
-       */
-      (function () {
-        try {
-          var stored = localStorage.getItem('bt.theme');
-          var resolved =
-            stored === 'light' || stored === 'dark' || stored === 'twilight'
-              ? stored
-              : window.matchMedia('(prefers-color-scheme: dark)').matches
-                ? 'dark'
-                : 'light';
-          document.documentElement.dataset.theme = resolved;
-          document.documentElement.style.colorScheme = resolved;
-        } catch (e) {
-          document.documentElement.dataset.theme = 'dark';
-        }
-      })();
-    </script>
+    <!-- Applies the stored theme before first paint (a file, not inline: CSP script-src 'self'). -->
+    <script src="/theme-init.js"></script>
   </head>
   <body>
     <div id="root"></div>

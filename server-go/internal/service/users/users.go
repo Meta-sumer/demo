@@ -190,6 +190,9 @@ type UserDetail struct {
 	Wallets      []models.WalletView `json:"wallets"`
 	OpenExposure int64               `json:"openExposure"`
 	Stats        UserStats           `json:"stats"`
+	// Addition: the USDT FUNDING wallet (micro-USDT); null when the customer
+	// has none.
+	FundingWallet *models.WalletView `json:"fundingWallet"`
 }
 
 func GetUserDetail(ctx context.Context, userID string) (UserDetail, error) {
@@ -210,7 +213,15 @@ func GetUserDetail(ctx context.Context, userID string) (UserDetail, error) {
 	if err != nil {
 		return UserDetail{}, err
 	}
-	return UserDetail{User: user, Wallet: wallet, Wallets: accounts, OpenExposure: exp.Total, Stats: stats}, nil
+	detail := UserDetail{User: user, Wallet: wallet, Wallets: accounts, OpenExposure: exp.Total, Stats: stats}
+	funding, err := wallets.GetWallet(ctx, userID, models.AccountFunding, models.CurrencyUSDT)
+	switch {
+	case err == nil:
+		detail.FundingWallet = &funding
+	case !apperr.HasCode(err, apperr.WalletNotFound):
+		return UserDetail{}, err
+	}
+	return detail, nil
 }
 
 func aggregateUserStats(ctx context.Context, userID string) (UserStats, error) {

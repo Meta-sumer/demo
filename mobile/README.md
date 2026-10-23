@@ -28,7 +28,7 @@ EXPO_PUBLIC_API_URL=http://192.168.x.x:4000
 and start the backend from the repo root (`npm run infra:up`, `npm run seed`,
 `npm run dev:server`). Restart Metro with `npx expo start -c` after changing env.
 
-Demo sign-in (seeded): `trader@binary.local` / `Trader@12345`.
+Demo sign-in (seeded): `trader@binary.local`, with the password from `SEED_TRADER_PASSWORD` or the one `npm run seed` printed (see the root README).
 
 ## Build an installable app
 

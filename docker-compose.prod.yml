@@ -2,7 +2,7 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile full up -d --build
 #
-# Three differences from the development file:
+# Differences from the development file:
 #
 # - MongoDB and Redis publish no ports. Docker writes its own firewall rules,
 #   so a published port is reachable from the internet even when ufw says it
@@ -11,9 +11,59 @@
 #   containers reach it by. The development file advertises `localhost`, which
 #   from inside the API container would point at the API container itself.
 # - The API listens on 127.0.0.1 only; Nginx on the host is its front door.
+# - Both datastores require credentials. Redis: requirepass REDIS_PASSWORD.
+#   MongoDB: access control (--auth) with a root user and an application user
+#   (readWrite on binary_trading); a replica set with access control needs a
+#   keyFile. The passwords live in .env (chmod 600), generated once by
+#   deploy/vps/first-setup.sh or deploy/vps/deploy.sh, which also migrates an
+#   existing database that has no users yet (deploy/vps/mongo-auth.sh).
+# - Container logs rotate (json-file, 5 x 20 MB per container) and every
+#   container has a memory limit sized for the 16 GB / 4 vCPU VPS: MongoDB
+#   5 GB (WiredTiger cache 2.5 GB), Redis 1 GB (maxmemory 768 MB, noeviction:
+#   the exposure book and queues must never be evicted), API 2 GB. That
+#   leaves about 8 GB for the host, nginx and the web build during a deploy.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   mongo:
     ports: !reset []
+    logging: *logging
+    mem_limit: 5g
+    # A fresh random keyFile at every start: with a single member it only
+    # has to exist (a replica set with --auth requires one). Written by root,
+    # readable by the mongodb user only, outside the data volume. A second
+    # member would need one shared, persistent keyFile instead.
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        umask 077
+        head -c 756 /dev/urandom | base64 -w0 > /etc/mongo-keyfile
+        chown mongodb:mongodb /etc/mongo-keyfile
+        chmod 400 /etc/mongo-keyfile
+        exec docker-entrypoint.sh "$$@"
+      - mongo-entrypoint
+    command:
+      - mongod
+      - --replSet
+      - rs0
+      - --bind_ip_all
+      - --port
+      - "${MONGO_PORT:-27017}"
+      - --auth
+      - --keyFile
+      - /etc/mongo-keyfile
+      - --wiredTigerCacheSizeGB
+      - "2.5"
+    # hello needs no credentials, so this works with access control on.
+    # Before the replica set exists it initiates it (on a fresh volume this
+    # runs through the localhost exception, before any user exists).
     healthcheck:
       test:
         [
@@ -23,15 +73,35 @@ services:
           "--port",
           "${MONGO_PORT:-27017}",
           "--eval",
-          "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:${MONGO_PORT:-27017}'}]}).ok }",
+          "const h = db.hello(); if (!h.setName) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:${MONGO_PORT:-27017}'}]}); quit(1) } else if (!h.isWritablePrimary) { quit(1) }",
         ]
 
   redis:
     ports: !reset []
+    logging: *logging
+    mem_limit: 1g
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set in .env - run deploy/vps/deploy.sh}
+    # The password goes into a config file inside the container, never on the
+    # command line; then the image's own entrypoint drops to the redis user.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        umask 077
+        printf 'requirepass "%s"\n' "$$REDIS_PASSWORD" > /tmp/redis-auth.conf
+        chown redis:redis /tmp/redis-auth.conf
+        exec docker-entrypoint.sh redis-server /tmp/redis-auth.conf --appendonly yes --maxmemory 768mb --maxmemory-policy noeviction
+    command: !reset []
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
 
   server:
     ports: !override
       - "127.0.0.1:4000:4000"
+    logging: *logging
+    mem_limit: 2g
     environment:
       # Nginx on the host reaches the API through Docker's bridge, so the peer
       # the API sees is the bridge gateway (172.16.0.0/12), not 127.0.0.1.
@@ -39,3 +109,9 @@ services:
       # Safe because the port above is bound to 127.0.0.1: only the host
       # (Nginx) can connect, and Nginx overwrites X-Forwarded-For.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.16.0.0/12}
+      # The application user (readWrite on binary_trading only), defined in
+      # the admin database.
+      MONGO_URI: mongodb://${MONGO_APP_USERNAME:-wintratrade}:${MONGO_APP_PASSWORD:?MONGO_APP_PASSWORD is not set in .env - run deploy/vps/deploy.sh}@mongo:${MONGO_PORT:-27017}/binary_trading?replicaSet=rs0&authSource=admin
+      REDIS_URL: redis://default:${REDIS_PASSWORD:?REDIS_PASSWORD is not set in .env - run deploy/vps/deploy.sh}@redis:6379
+      # Lets the Go garbage collector work harder before the 2 GB limit.
+      GOMEMLIMIT: ${GOMEMLIMIT:-1600MiB}

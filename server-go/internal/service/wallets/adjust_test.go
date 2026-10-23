@@ -273,3 +273,63 @@ func TestAdminAdjustWalletRequiresAKey(t *testing.T) {
 		t.Fatalf("%d rows", len(rows))
 	}
 }
+
+// TestAdminAdjustFundingWallet: the USDT FUNDING wallet takes the same
+// audited adjustment, in micro-USDT, with the same Idempotency-Key rules; it
+// never touches the INR wallets, and the account is part of the request, so
+// a key reused for another account is refused.
+func TestAdminAdjustFundingWallet(t *testing.T) {
+	forModes(t, func(t *testing.T) {
+		ctx := context.Background()
+		uid, actor := newUser(t), bson.NewObjectID().Hex()
+		if _, err := GetOrCreateWallet(ctx, uid, models.AccountFunding, models.CurrencyUSDT); err != nil {
+			t.Fatal(err)
+		}
+		credit := AdminAdjustmentInput{UserID: uid, AccountType: models.AccountFunding, Direction: "CREDIT", Amount: 2_500_000,
+			Reason: "BeeX settled payout later failed: refund", ActorID: actor, IdempotencyKey: "usdt-fix-0001"}
+		first, err := AdminAdjustWallet(ctx, credit)
+		if err != nil || first.Replayed || first.Wallet.Currency != models.CurrencyUSDT || first.Wallet.AccountType != models.AccountFunding ||
+			first.Wallet.Balance != 2_500_000 {
+			t.Fatalf("credit %+v %v", first, err)
+		}
+		again, err := AdminAdjustWallet(ctx, credit)
+		if err != nil || !again.Replayed || again.TransactionID != first.TransactionID || again.Wallet.Currency != models.CurrencyUSDT {
+			t.Fatalf("replay %+v %v", again, err)
+		}
+		other := credit
+		other.AccountType = models.AccountLive
+		if _, err := AdminAdjustWallet(ctx, other); errCode(err) != apperr.IdempotencyPayloadMismatch {
+			t.Fatalf("same key, another account: %v", err)
+		}
+		debit := AdminAdjustmentInput{UserID: uid, AccountType: models.AccountFunding, Direction: "DEBIT", Amount: 3_000_000,
+			Reason: "duplicate credit", ActorID: actor, IdempotencyKey: "usdt-fix-0002"}
+		if _, err := AdminAdjustWallet(ctx, debit); errCode(err) != apperr.InsufficientBalance {
+			t.Fatalf("over-debit %v", err)
+		}
+		debit.Amount = 1_000_000
+		if r, err := AdminAdjustWallet(ctx, debit); err != nil || r.Wallet.Balance != 1_500_000 {
+			t.Fatalf("debit %+v %v", r, err)
+		}
+		bad := credit
+		bad.AccountType, bad.IdempotencyKey = "SPOT", "usdt-fix-0003"
+		if _, err := AdminAdjustWallet(ctx, bad); errCode(err) != apperr.ValidationError {
+			t.Fatalf("unknown account: %v", err)
+		}
+
+		// The INR wallet is untouched; the FUNDING ledger adds up to its balance.
+		if w, _ := GetWallet(ctx, uid, models.AccountLive, ""); w.Balance != 0 {
+			t.Fatalf("INR wallet moved: %+v", w)
+		}
+		rows := adjustmentRows(t, uid)
+		var sum int64
+		for _, r := range rows {
+			if r.Currency != models.CurrencyUSDT || r.AccountType != models.AccountFunding {
+				t.Fatalf("row %+v", r)
+			}
+			sum += r.BalanceAfter - r.BalanceBefore
+		}
+		if len(rows) != 2 || sum != 1_500_000 {
+			t.Fatalf("%d rows summing to %d", len(rows), sum)
+		}
+	})
+}

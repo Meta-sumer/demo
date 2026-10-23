@@ -8,6 +8,7 @@ package riskconfig
 
 import (
 	"context"
+	"math"
 	"sort"
 	"strconv"
 	"sync"
@@ -48,6 +49,10 @@ func InvalidateRiskConfigCache() {
 func clone(c *models.RiskConfig) *models.RiskConfig {
 	out := *c
 	out.HedgeLevels = append([]models.HedgeLevel(nil), c.HedgeLevels...)
+	out.PricingExpiryFactors = append([]models.PricingExpiryFactor(nil), c.PricingExpiryFactors...)
+	out.PricingSymbolRules = append([]models.PricingSymbolRule(nil), c.PricingSymbolRules...)
+	out.PricingHalts = append([]models.PricingHalt(nil), c.PricingHalts...)
+	out.EarlyCloseCalibration = append([]models.EarlyCloseCalibrationRow(nil), c.EarlyCloseCalibration...)
 	return &out
 }
 
@@ -105,7 +110,9 @@ func loadRiskConfig(ctx context.Context) (*models.RiskConfig, error) {
 }
 
 // bootstrapDefaultConfig creates version 1 from the environment defaults on
-// first boot. Two processes can reach this at the same moment on a fresh
+// first boot. The FEED_*_MS variables only seed this first version: from then
+// on the active risk configuration is the one authority for the feed
+// thresholds (PUT /admin/settings/risk), whatever the environment says. Two processes can reach this at the same moment on a fresh
 // database; the unique index on the active row makes one of them lose, and the
 // loser reads what the winner wrote rather than failing the request.
 func bootstrapDefaultConfig(ctx context.Context) (*models.RiskConfig, error) {
@@ -113,7 +120,6 @@ func bootstrapDefaultConfig(ctx context.Context) (*models.RiskConfig, error) {
 	if config.E != nil {
 		doc.FeedHealthyMaxMs = config.E.FeedHealthyMaxMs
 		doc.FeedDegradedMaxMs = config.E.FeedDegradedMaxMs
-		doc.FeedStaleMaxMs = config.E.FeedStaleMaxMs
 		doc.FeedTickMaxAgeMs = config.E.FeedTickMaxAgeMs
 	}
 	doc.Note = models.Str("Bootstrapped from environment defaults")
@@ -162,11 +168,65 @@ type RiskConfigPatch struct {
 	DrawPolicy                       *models.DrawPolicy  `json:"drawPolicy"`
 	FeedHealthyMaxMs                 *int64              `json:"feedHealthyMaxMs"`
 	FeedDegradedMaxMs                *int64              `json:"feedDegradedMaxMs"`
-	FeedStaleMaxMs                   *int64              `json:"feedStaleMaxMs"`
 	FeedTickMaxAgeMs                 *int64              `json:"feedTickMaxAgeMs"`
 	HaltTradingOnStaleFeed           *bool               `json:"haltTradingOnStaleFeed"`
 	HaltTradingOnDegradedFeed        *bool               `json:"haltTradingOnDegradedFeed"`
 	TradingHalted                    *bool               `json:"tradingHalted"`
+
+	// Feed data rules and the settlement policy (models.RiskConfig).
+	FeedTickHistoryRetentionMs      *int64   `json:"feedTickHistoryRetentionMs"`
+	FeedGapMinMs                    *int64   `json:"feedGapMinMs"`
+	FeedGapIntervalMultiple         *float64 `json:"feedGapIntervalMultiple"`
+	FeedSaturationHoldMs            *int64   `json:"feedSaturationHoldMs"`
+	FeedMaxClockDriftMs             *int64   `json:"feedMaxClockDriftMs"`
+	FeedClockCheckIntervalMs        *int64   `json:"feedClockCheckIntervalMs"`
+	SettlementMaxTickAgeMs          *int64   `json:"settlementMaxTickAgeMs"`
+	SettlementConfirmationWindowMs  *int64   `json:"settlementConfirmationWindowMs"`
+	SettlementDeferWindowMs         *int64   `json:"settlementDeferWindowMs"`
+	SettlementRetryDelayMs          *int64   `json:"settlementRetryDelayMs"`
+	SettlementMaxClockSkewMs        *int64   `json:"settlementMaxClockSkewMs"`
+	SettlementNoPriceRule           *string  `json:"settlementNoPriceRule"`
+	EarlyCloseFloorMs               *int64   `json:"earlyCloseFloorMs"`
+	EarlyCloseMaxTickAgeMs          *int64   `json:"earlyCloseMaxTickAgeMs"`
+	EarlyCloseQuoteMaxAgeMs         *int64   `json:"earlyCloseQuoteMaxAgeMs"`
+	EarlyCloseQuoteTolerancePercent *float64 `json:"earlyCloseQuoteTolerancePercent"`
+	// Calibrated Sell-now correction (audit F-12): nil = unchanged, [] =
+	// the uncorrected formula.
+	EarlyCloseCalibration           []models.EarlyCloseCalibrationRow `json:"earlyCloseCalibration"`
+	EarlyCloseMinProbabilityPercent *float64                          `json:"earlyCloseMinProbabilityPercent"`
+
+	TradingHaltReason              *string                      `json:"tradingHaltReason"`
+	PricingMode                    *string                      `json:"pricingMode"`
+	PricingRuleLabel               *string                      `json:"pricingRuleLabel"`
+	PricingStaleAfterMs            *int64                       `json:"pricingStaleAfterMs"`
+	PricingMaxSpreadBps            *float64                     `json:"pricingMaxSpreadBps"`
+	PricingMaxJumpBps              *float64                     `json:"pricingMaxJumpBps"`
+	PricingJumpConfirmations       *int64                       `json:"pricingJumpConfirmations"`
+	PricingPendingOutlierMaxAgeMs  *int64                       `json:"pricingPendingOutlierMaxAgeMs"`
+	PricingEwmaLambda              *float64                     `json:"pricingEwmaLambda"`
+	PricingVolSampleIntervalMs     *int64                       `json:"pricingVolSampleIntervalMs"`
+	PricingKVol                    *float64                     `json:"pricingKVol"`
+	PricingMaxVolAdj               *float64                     `json:"pricingMaxVolAdj"`
+	PricingVolBlockRatio           *float64                     `json:"pricingVolBlockRatio"`
+	PricingKSpread                 *float64                     `json:"pricingKSpread"`
+	PricingMaxSpreadAdj            *float64                     `json:"pricingMaxSpreadAdj"`
+	PricingKExposure               *float64                     `json:"pricingKExposure"`
+	PricingMaxExposureAdj          *float64                     `json:"pricingMaxExposureAdj"`
+	PricingExpiryFactors           []models.PricingExpiryFactor `json:"pricingExpiryFactors"` // nil = unchanged
+	PricingPayoutStep              *float64                     `json:"pricingPayoutStep"`
+	PricingOfferTTLMs              *int64                       `json:"pricingOfferTtlMs"`
+	PricingMaxSlippageBps          *float64                     `json:"pricingMaxSlippageBps"`
+	PricingDisplayTolerancePercent *float64                     `json:"pricingDisplayTolerancePercent"`
+	PricingGuardEnabled            *bool                        `json:"pricingGuardEnabled"`
+	PricingGuardMinEdgePercent     *float64                     `json:"pricingGuardMinEdgePercent"`
+	PricingGuardConservative       *bool                        `json:"pricingGuardConservative"`
+	PricingHedgeUnavailableAction  *string                      `json:"pricingHedgeUnavailableAction"`
+	PricingHedgeUnavailableAdj     *float64                     `json:"pricingHedgeUnavailableAdj"`
+	PricingHedgeTakerFeeBps        *float64                     `json:"pricingHedgeTakerFeeBps"`
+	PricingHedgeSpreadBps          *float64                     `json:"pricingHedgeSpreadBps"`
+	PricingHedgeSlippageBps        *float64                     `json:"pricingHedgeSlippageBps"`
+	PricingSymbolRules             []models.PricingSymbolRule   `json:"pricingSymbolRules"` // nil = unchanged
+	PricingHalts                   []models.PricingHalt         `json:"pricingHalts"`       // nil = unchanged
 }
 
 func setIf[T any](dst *T, v *T) {
@@ -201,11 +261,68 @@ func (p *RiskConfigPatch) Apply(c *models.RiskConfig) {
 	setIf(&c.DrawPolicy, p.DrawPolicy)
 	setIf(&c.FeedHealthyMaxMs, p.FeedHealthyMaxMs)
 	setIf(&c.FeedDegradedMaxMs, p.FeedDegradedMaxMs)
-	setIf(&c.FeedStaleMaxMs, p.FeedStaleMaxMs)
 	setIf(&c.FeedTickMaxAgeMs, p.FeedTickMaxAgeMs)
 	setIf(&c.HaltTradingOnStaleFeed, p.HaltTradingOnStaleFeed)
 	setIf(&c.HaltTradingOnDegradedFeed, p.HaltTradingOnDegradedFeed)
 	setIf(&c.TradingHalted, p.TradingHalted)
+	setIf(&c.FeedTickHistoryRetentionMs, p.FeedTickHistoryRetentionMs)
+	setIf(&c.FeedGapMinMs, p.FeedGapMinMs)
+	setIf(&c.FeedGapIntervalMultiple, p.FeedGapIntervalMultiple)
+	setIf(&c.FeedSaturationHoldMs, p.FeedSaturationHoldMs)
+	setIf(&c.FeedMaxClockDriftMs, p.FeedMaxClockDriftMs)
+	setIf(&c.FeedClockCheckIntervalMs, p.FeedClockCheckIntervalMs)
+	setIf(&c.SettlementMaxTickAgeMs, p.SettlementMaxTickAgeMs)
+	setIf(&c.SettlementConfirmationWindowMs, p.SettlementConfirmationWindowMs)
+	setIf(&c.SettlementDeferWindowMs, p.SettlementDeferWindowMs)
+	setIf(&c.SettlementRetryDelayMs, p.SettlementRetryDelayMs)
+	setIf(&c.SettlementMaxClockSkewMs, p.SettlementMaxClockSkewMs)
+	setIf(&c.SettlementNoPriceRule, p.SettlementNoPriceRule)
+	setIf(&c.EarlyCloseFloorMs, p.EarlyCloseFloorMs)
+	setIf(&c.EarlyCloseMaxTickAgeMs, p.EarlyCloseMaxTickAgeMs)
+	setIf(&c.EarlyCloseQuoteMaxAgeMs, p.EarlyCloseQuoteMaxAgeMs)
+	setIf(&c.EarlyCloseQuoteTolerancePercent, p.EarlyCloseQuoteTolerancePercent)
+	setIf(&c.TradingHaltReason, p.TradingHaltReason)
+	setIf(&c.PricingMode, p.PricingMode)
+	setIf(&c.PricingRuleLabel, p.PricingRuleLabel)
+	setIf(&c.PricingStaleAfterMs, p.PricingStaleAfterMs)
+	setIf(&c.PricingMaxSpreadBps, p.PricingMaxSpreadBps)
+	setIf(&c.PricingMaxJumpBps, p.PricingMaxJumpBps)
+	setIf(&c.PricingJumpConfirmations, p.PricingJumpConfirmations)
+	setIf(&c.PricingPendingOutlierMaxAgeMs, p.PricingPendingOutlierMaxAgeMs)
+	setIf(&c.PricingEwmaLambda, p.PricingEwmaLambda)
+	setIf(&c.PricingVolSampleIntervalMs, p.PricingVolSampleIntervalMs)
+	setIf(&c.PricingKVol, p.PricingKVol)
+	setIf(&c.PricingMaxVolAdj, p.PricingMaxVolAdj)
+	setIf(&c.PricingVolBlockRatio, p.PricingVolBlockRatio)
+	setIf(&c.PricingKSpread, p.PricingKSpread)
+	setIf(&c.PricingMaxSpreadAdj, p.PricingMaxSpreadAdj)
+	setIf(&c.PricingKExposure, p.PricingKExposure)
+	setIf(&c.PricingMaxExposureAdj, p.PricingMaxExposureAdj)
+	if p.PricingExpiryFactors != nil {
+		c.PricingExpiryFactors = append([]models.PricingExpiryFactor(nil), p.PricingExpiryFactors...)
+	}
+	setIf(&c.PricingPayoutStep, p.PricingPayoutStep)
+	setIf(&c.PricingOfferTTLMs, p.PricingOfferTTLMs)
+	setIf(&c.PricingMaxSlippageBps, p.PricingMaxSlippageBps)
+	setIf(&c.PricingDisplayTolerancePercent, p.PricingDisplayTolerancePercent)
+	setIf(&c.PricingGuardEnabled, p.PricingGuardEnabled)
+	setIf(&c.PricingGuardMinEdgePercent, p.PricingGuardMinEdgePercent)
+	setIf(&c.PricingGuardConservative, p.PricingGuardConservative)
+	setIf(&c.PricingHedgeUnavailableAction, p.PricingHedgeUnavailableAction)
+	setIf(&c.PricingHedgeUnavailableAdj, p.PricingHedgeUnavailableAdj)
+	setIf(&c.PricingHedgeTakerFeeBps, p.PricingHedgeTakerFeeBps)
+	setIf(&c.PricingHedgeSpreadBps, p.PricingHedgeSpreadBps)
+	setIf(&c.PricingHedgeSlippageBps, p.PricingHedgeSlippageBps)
+	if p.PricingSymbolRules != nil {
+		c.PricingSymbolRules = append([]models.PricingSymbolRule(nil), p.PricingSymbolRules...)
+	}
+	if p.PricingHalts != nil {
+		c.PricingHalts = append([]models.PricingHalt(nil), p.PricingHalts...)
+	}
+	if p.EarlyCloseCalibration != nil {
+		c.EarlyCloseCalibration = append([]models.EarlyCloseCalibrationRow{}, p.EarlyCloseCalibration...)
+	}
+	setIf(&c.EarlyCloseMinProbabilityPercent, p.EarlyCloseMinProbabilityPercent)
 }
 
 // UpdateRiskConfig publishes the next version and returns (before, after).
@@ -260,8 +377,14 @@ func UpdateRiskConfig(ctx context.Context, patch RiskConfigPatch, actorID string
 // ValidateConfig checks the cross-field rules a patched configuration must
 // satisfy (the TS validatePatch).
 func ValidateConfig(c *models.RiskConfig) error {
-	if !(c.FeedHealthyMaxMs < c.FeedDegradedMaxMs && c.FeedDegradedMaxMs < c.FeedStaleMaxMs) {
-		return apperr.Validation("Feed thresholds must satisfy healthy < degraded < stale", nil)
+	if !(c.FeedHealthyMaxMs < c.FeedDegradedMaxMs && c.FeedDegradedMaxMs < c.FeedTickMaxAgeMs) {
+		return apperr.Validation("Feed thresholds must satisfy healthy < degraded < tick max age", nil)
+	}
+	if err := validateSettlement(c); err != nil {
+		return err
+	}
+	if err := validateFeedRules(c); err != nil {
+		return err
 	}
 	if c.MinTradeAmount > c.MaxTradeAmount {
 		return apperr.Validation("minTradeAmount cannot exceed maxTradeAmount", nil)
@@ -273,6 +396,9 @@ func ValidateConfig(c *models.RiskConfig) error {
 	if c.HedgeThresholdPercent < 0 || c.HedgeThresholdPercent > 100 {
 		return apperr.Validation("hedgeThresholdPercent must be between 0 and 100", nil)
 	}
+	if err := validatePricing(c); err != nil {
+		return err
+	}
 	sorted := append([]models.HedgeLevel(nil), c.HedgeLevels...)
 	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].FromPercent < sorted[j].FromPercent })
 	for i, level := range sorted {
@@ -281,6 +407,64 @@ func ValidateConfig(c *models.RiskConfig) error {
 		}
 		if i > 0 && level.FromPercent < sorted[i-1].ToPercent {
 			return apperr.Validation("Hedge levels overlap around "+strconv.FormatFloat(level.FromPercent, 'f', -1, 64)+"%", nil)
+		}
+	}
+	return nil
+}
+
+// validatePricing checks the pricing-engine fields (the admin API bounds them
+// one by one; these are the cross-field rules).
+func validatePricing(c *models.RiskConfig) error {
+	if c.PricingMode != models.PricingModeDynamic && c.PricingMode != models.PricingModeFixed {
+		return apperr.Validation("pricingMode must be DYNAMIC or FIXED", nil)
+	}
+	if c.PricingHedgeUnavailableAction != models.PricingActionWiden && c.PricingHedgeUnavailableAction != models.PricingActionRefuse {
+		return apperr.Validation("pricingHedgeUnavailableAction must be WIDEN or REFUSE", nil)
+	}
+	if !(c.PricingEwmaLambda > 0 && c.PricingEwmaLambda < 1) {
+		return apperr.Validation("pricingEwmaLambda must be between 0 and 1", nil)
+	}
+	step := c.PricingPayoutStep
+	if !(step > 0 && step <= 0.1) {
+		return apperr.Validation("pricingPayoutStep must be greater than 0 and at most 0.1", nil)
+	}
+	if c.PricingVolBlockRatio <= 1 {
+		return apperr.Validation("pricingVolBlockRatio must be above 1", nil)
+	}
+	if c.PricingJumpConfirmations < 1 || c.PricingStaleAfterMs < 100 || c.PricingOfferTTLMs < 500 {
+		return apperr.Validation("pricingJumpConfirmations must be at least 1, pricingStaleAfterMs at least 100 and pricingOfferTtlMs at least 500", nil)
+	}
+	seenExpiry := map[int64]bool{}
+	for _, f := range c.PricingExpiryFactors {
+		if f.ExpirySeconds <= 0 || !(f.Factor > 0) || seenExpiry[f.ExpirySeconds] {
+			return apperr.Validation("pricingExpiryFactors: each expiry once, with expirySeconds and factor above 0", nil)
+		}
+		seenExpiry[f.ExpirySeconds] = true
+	}
+	onStep := func(x float64) bool {
+		n := x / step
+		return math.Abs(n-math.Round(n)) < 1e-6
+	}
+	seenSym := map[string]bool{}
+	for _, r := range c.PricingSymbolRules {
+		if r.Symbol == "" || seenSym[r.Symbol] {
+			return apperr.Validation("pricingSymbolRules: each symbol once", nil)
+		}
+		seenSym[r.Symbol] = true
+		if !(r.MinPayout > 0 && r.MinPayout <= r.MaxPayout && r.MaxPayout <= 5) || !(r.BasePayout > 0 && r.BasePayout <= 5) {
+			return apperr.Validation("pricingSymbolRules "+r.Symbol+": need 0 < minPayout <= maxPayout <= 5 and 0 < basePayout <= 5", nil)
+		}
+		// On the step grid, so rounding down can never leave the bounds.
+		if !onStep(r.MinPayout) || !onStep(r.MaxPayout) {
+			return apperr.Validation("pricingSymbolRules "+r.Symbol+": minPayout and maxPayout must be multiples of pricingPayoutStep", nil)
+		}
+		if !(r.BaselineVol > 0) || r.HedgeCost < 0 || r.Margin < 0 || r.MaxExposure <= 0 {
+			return apperr.Validation("pricingSymbolRules "+r.Symbol+": need baselineVol > 0, hedgeCost >= 0, margin >= 0, maxExposure > 0", nil)
+		}
+	}
+	for _, h := range c.PricingHalts {
+		if h.Symbol == "" || h.Reason == "" {
+			return apperr.Validation("pricingHalts: each halt needs a symbol and a reason", nil)
 		}
 	}
 	return nil

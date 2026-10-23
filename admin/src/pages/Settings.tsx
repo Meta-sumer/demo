@@ -73,6 +73,8 @@ export function SettingsPage() {
             const data = new FormData(event.currentTarget);
             const number = (key: string) => Number(data.get(key));
             const money = (key: string) => toMinor(Number(data.get(key)));
+            // Fields an older server does not send are not rendered, and not sent.
+            const optional = (key: string) => (data.has(key) ? Number(data.get(key)) : undefined);
 
             mutation.mutate({
               maxAssetExposure: money('maxAssetExposure'),
@@ -82,6 +84,9 @@ export function SettingsPage() {
               maxTradeAmount: money('maxTradeAmount'),
               maxOpenTradesPerUser: number('maxOpenTradesPerUser'),
               maxUserAssetConcentrationPercent: number('maxUserAssetConcentrationPercent'),
+              maxExpiryLiability: data.has('maxExpiryLiability') ? money('maxExpiryLiability') : undefined,
+              maxAssetLiability: data.has('maxAssetLiability') ? money('maxAssetLiability') : undefined,
+              maxPlatformLiability: data.has('maxPlatformLiability') ? money('maxPlatformLiability') : undefined,
               hedgeThresholdPercent: number('hedgeThresholdPercent'),
               criticalExposurePercent: number('criticalExposurePercent'),
               minSecondsToExpiryForHedge: number('minSecondsToExpiryForHedge'),
@@ -93,8 +98,23 @@ export function SettingsPage() {
               minSecondsRemainingForEarlyClose: number('minSecondsRemainingForEarlyClose'),
               feedHealthyMaxMs: number('feedHealthyMaxMs'),
               feedDegradedMaxMs: number('feedDegradedMaxMs'),
-              feedStaleMaxMs: number('feedStaleMaxMs'),
               feedTickMaxAgeMs: number('feedTickMaxAgeMs'),
+              feedTickHistoryRetentionMs: optional('feedTickHistoryRetentionMs'),
+              feedGapMinMs: optional('feedGapMinMs'),
+              feedGapIntervalMultiple: optional('feedGapIntervalMultiple'),
+              feedSaturationHoldMs: optional('feedSaturationHoldMs'),
+              feedMaxClockDriftMs: optional('feedMaxClockDriftMs'),
+              feedClockCheckIntervalMs: optional('feedClockCheckIntervalMs'),
+              settlementMaxTickAgeMs: optional('settlementMaxTickAgeMs'),
+              settlementConfirmationWindowMs: optional('settlementConfirmationWindowMs'),
+              settlementDeferWindowMs: optional('settlementDeferWindowMs'),
+              settlementRetryDelayMs: optional('settlementRetryDelayMs'),
+              settlementMaxClockSkewMs: optional('settlementMaxClockSkewMs'),
+              settlementNoPriceRule: data.has('settlementNoPriceRule') ? String(data.get('settlementNoPriceRule')) : undefined,
+              earlyCloseFloorMs: optional('earlyCloseFloorMs'),
+              earlyCloseMaxTickAgeMs: optional('earlyCloseMaxTickAgeMs'),
+              earlyCloseQuoteMaxAgeMs: optional('earlyCloseQuoteMaxAgeMs'),
+              earlyCloseQuoteTolerancePercent: optional('earlyCloseQuoteTolerancePercent'),
               haltTradingOnStaleFeed: data.get('haltTradingOnStaleFeed') === 'on',
               haltTradingOnDegradedFeed: data.get('haltTradingOnDegradedFeed') === 'on',
               tradingHalted: data.get('tradingHalted') === 'on',
@@ -127,6 +147,28 @@ export function SettingsPage() {
               value={config.maxUserAssetConcentrationPercent}
               disabled={!writable}
             />
+            {config.maxExpiryLiability !== undefined ? (
+              <>
+                <Money
+                  name="maxExpiryLiability"
+                  label="Max liability per expiry (0 = off)"
+                  value={config.maxExpiryLiability}
+                  disabled={!writable}
+                />
+                <Money
+                  name="maxAssetLiability"
+                  label="Max liability per asset (0 = off)"
+                  value={config.maxAssetLiability ?? 0}
+                  disabled={!writable}
+                />
+                <Money
+                  name="maxPlatformLiability"
+                  label="Max platform liability (0 = off)"
+                  value={config.maxPlatformLiability ?? 0}
+                  disabled={!writable}
+                />
+              </>
+            ) : null}
           </Section>
 
           <Section title="Trade limits">
@@ -223,6 +265,31 @@ export function SettingsPage() {
               value={config.minSecondsRemainingForEarlyClose}
               disabled={!writable}
             />
+            <OptNum
+              name="earlyCloseFloorMs"
+              label="Hard floor before expiry (ms, min 1000)"
+              value={config.earlyCloseFloorMs}
+              disabled={!writable}
+            />
+            <OptNum
+              name="earlyCloseMaxTickAgeMs"
+              label="Max price age for a close (ms)"
+              value={config.earlyCloseMaxTickAgeMs}
+              disabled={!writable}
+            />
+            <OptNum
+              name="earlyCloseQuoteMaxAgeMs"
+              label="Quote valid for (ms)"
+              value={config.earlyCloseQuoteMaxAgeMs}
+              disabled={!writable}
+            />
+            <OptNum
+              name="earlyCloseQuoteTolerancePercent"
+              label="Requote limit below the quote (%)"
+              step="0.5"
+              value={config.earlyCloseQuoteTolerancePercent}
+              disabled={!writable}
+            />
             <div className="sm:col-span-2">
               <Toggle
                 name="earlyCloseEnabled"
@@ -232,6 +299,61 @@ export function SettingsPage() {
               />
             </div>
           </Section>
+
+          {config.settlementMaxTickAgeMs !== undefined ? (
+            <Section title="Settlement policy">
+              <OptNum
+                name="settlementMaxTickAgeMs"
+                label="Expiry price max age (ms)"
+                value={config.settlementMaxTickAgeMs}
+                disabled={!writable}
+              />
+              <OptNum
+                name="settlementConfirmationWindowMs"
+                label="Confirmation wait after expiry (ms)"
+                value={config.settlementConfirmationWindowMs}
+                disabled={!writable}
+              />
+              <OptNum
+                name="settlementDeferWindowMs"
+                label="Keep looking for a price (ms)"
+                value={config.settlementDeferWindowMs}
+                disabled={!writable}
+              />
+              <OptNum
+                name="settlementRetryDelayMs"
+                label="Retry every (ms)"
+                value={config.settlementRetryDelayMs}
+                disabled={!writable}
+              />
+              <OptNum
+                name="settlementMaxClockSkewMs"
+                label="Ignore ticks stamped ahead by (ms)"
+                value={config.settlementMaxClockSkewMs}
+                disabled={!writable}
+              />
+              <div>
+                <label className="label" htmlFor="settlementNoPriceRule">
+                  No valid price
+                </label>
+                <select
+                  id="settlementNoPriceRule"
+                  name="settlementNoPriceRule"
+                  className="field"
+                  defaultValue={config.settlementNoPriceRule}
+                  disabled={!writable}
+                >
+                  <option value="VOID_REFUND">Void and refund the stake</option>
+                  <option value="STALE_TICK_THEN_VOID">Older pre-expiry price, else void</option>
+                </select>
+              </div>
+              <p className="sm:col-span-2 text-[11px] leading-relaxed text-content-400">
+                A price stamped after expiry is never used, whatever these say. The server refuses a clock-skew
+                guard of 0, a Sell-now floor under 1 s, and a tick history shorter than the defer window plus 5
+                minutes. Customer wording: docs/audit/customer/disclosures.md.
+              </p>
+            </Section>
+          ) : null}
 
           <Section title="Market data thresholds">
             <Num
@@ -247,18 +369,59 @@ export function SettingsPage() {
               disabled={!writable}
             />
             <Num
-              name="feedStaleMaxMs"
-              label="Stale below (ms)"
-              value={config.feedStaleMaxMs}
-              disabled={!writable}
-            />
-            <Num
               name="feedTickMaxAgeMs"
               label="Offline beyond age (ms)"
               value={config.feedTickMaxAgeMs}
               disabled={!writable}
             />
+            <p className="sm:col-span-2 text-[11px] leading-relaxed text-content-400">
+              Healthy up to the first value, degraded up to the second, stale above it, offline beyond the
+              last. These are the only feed thresholds: the FEED_* environment values only seed the first
+              version.
+            </p>
           </Section>
+
+          {config.feedTickHistoryRetentionMs !== undefined ? (
+            <Section title="Feed data rules">
+              <OptNum
+                name="feedTickHistoryRetentionMs"
+                label="Tick history kept (ms)"
+                value={config.feedTickHistoryRetentionMs}
+                disabled={!writable}
+              />
+              <OptNum
+                name="feedGapMinMs"
+                label="Gap after silence of at least (ms)"
+                value={config.feedGapMinMs}
+                disabled={!writable}
+              />
+              <OptNum
+                name="feedGapIntervalMultiple"
+                label="Gap after x expected interval"
+                step="0.5"
+                value={config.feedGapIntervalMultiple}
+                disabled={!writable}
+              />
+              <OptNum
+                name="feedSaturationHoldMs"
+                label="Stale after a dropped tick for (ms)"
+                value={config.feedSaturationHoldMs}
+                disabled={!writable}
+              />
+              <OptNum
+                name="feedMaxClockDriftMs"
+                label="Max clock drift vs provider (ms)"
+                value={config.feedMaxClockDriftMs}
+                disabled={!writable}
+              />
+              <OptNum
+                name="feedClockCheckIntervalMs"
+                label="Clock check every (ms, 0 = off)"
+                value={config.feedClockCheckIntervalMs}
+                disabled={!writable}
+              />
+            </Section>
+          ) : null}
 
           <div className="grid gap-3 sm:grid-cols-3">
             <Toggle
@@ -438,6 +601,12 @@ function Num({
       />
     </div>
   );
+}
+
+/** A number input for a field an older server may not send. */
+function OptNum(props: { name: string; label: string; value: number | undefined; step?: string; disabled?: boolean }) {
+  if (props.value === undefined) return null;
+  return <Num {...props} value={props.value} />;
 }
 
 function Toggle({

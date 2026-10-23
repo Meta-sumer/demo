@@ -48,6 +48,12 @@ type RiskInputs struct {
 	ExistingHedgeNotional      int64
 	// Platform-wide expiry liability; read only with a liability limit set.
 	PlatformLiability int64
+	// Open trades, price and volatility for the delta-based hedge target
+	// (hedgetarget.go). Nil: the target is zero.
+	HedgeBook *HedgeBook
+	// Non-empty when the hedge venue cannot take an order now (FX rate
+	// stale, venue down, ...): a non-zero target then adds a reason.
+	HedgeUnavailableReason string
 }
 
 var feedPenalty = map[models.FeedStatus]float64{
@@ -159,6 +165,14 @@ func AssessRisk(in RiskInputs) models.RiskAssessment {
 
 	level := ClassifyRiskLevel(score, cfg)
 	hedge := ComputeHedgeTarget(HedgeTargetInput{RiskInputs: in, UtilisationPercent: utilisationPercent, Level: level})
+	if hedge.Notional != 0 && in.HedgeUnavailableReason != "" {
+		reasons = append(reasons, "hedge required but unavailable: "+in.HedgeUnavailableReason)
+	}
+	var detail *models.HedgeTargetDetail
+	if in.HedgeBook != nil {
+		d := hedge.Detail
+		detail = &d
+	}
 
 	return models.RiskAssessment{
 		AssetID:             in.AssetID,
@@ -175,6 +189,7 @@ func AssessRisk(in RiskInputs) models.RiskAssessment {
 		TargetHedgeRatio:    hedge.Ratio,
 		TargetHedgeNotional: hedge.Notional,
 		EvaluatedAt:         util.NowMs(),
+		HedgeTarget:         detail,
 	}
 }
 
@@ -218,19 +233,24 @@ type HedgeTargetInput struct {
 }
 
 type HedgeTarget struct {
-	Decision  models.HedgeDecision `json:"decision"`
-	Ratio     float64              `json:"ratio"`
-	Notional  int64                `json:"notional"`
-	LevelName string               `json:"levelName"`
+	Decision models.HedgeDecision `json:"decision"`
+	// h, the fraction of the book delta hedged.
+	Ratio float64 `json:"ratio"`
+	// |target|, minor units.
+	Notional  int64                    `json:"notional"`
+	LevelName string                   `json:"levelName"`
+	Detail    models.HedgeTargetDetail `json:"detail"`
 }
 
-// ComputeHedgeTarget is dynamic hedge sizing (spec section 15):
+// ComputeHedgeTarget is the hedge sizing (docs/audit/hedging/hedging-spec.md
+// section 3; hedgetarget.go has the formulas):
 //
-//	target = |netExposure| x hedgeRatio(band)  adjusted for volatility,
-//	         remaining time to expiry and the configured size bounds.
+//	target = clamp(h x bookDelta, +-min(maxHedgeNotional, multiple x expiryLiability))
 //
-// Hedging is an aggregate, book-level action: nothing here reads or can
-// affect an individual customer's trade (rule 8).
+// The utilisation band (cfg.hedgeLevels, threshold) decides h, i.e. HOW MUCH
+// of the book's sensitivity is hedged; the delta decides the size and the
+// direction. Hedging is an aggregate, book-level action: nothing here reads
+// or can affect an individual customer's trade (rule 8).
 func ComputeHedgeTarget(in HedgeTargetInput) HedgeTarget {
 	cfg := in.Config
 	level := SelectHedgeLevel(in.UtilisationPercent, cfg.HedgeLevels)
@@ -238,36 +258,74 @@ func ComputeHedgeTarget(in HedgeTargetInput) HedgeTarget {
 	if level != nil {
 		levelName = level.Name
 	}
-	decision := toHedgeDecision(levelName)
-	none := HedgeTarget{Decision: models.HedgeDecisionNoHedge, LevelName: levelName}
+	out := HedgeTarget{Decision: models.HedgeDecisionNoHedge, LevelName: levelName}
+	d := &out.Detail
+	d.GammaWindowSeconds = cfg.MinSecondsToExpiryForHedge
+	d.MaxHedgeNotional = in.MaxHedgeNotional
+	d.ExpiryLiability = in.Exposure.ExpiryLiability
+	d.AssetCeiling = in.AssetTargetHedgeRatio
+	d.TickVolatility = in.Volatility
+	if level != nil {
+		d.BandRatio = level.HedgeRatio
+	}
+	if in.Volatility > ElevatedVolatility {
+		d.VolatilityBoost = cfg.VolatilityHedgeBoost
+	}
 
 	threshold := cfg.HedgeThresholdPercent
 	if in.AssetHedgeThresholdPercent != nil {
 		threshold = *in.AssetHedgeThresholdPercent
 	}
 
-	if !in.HedgeEnabled || level == nil || level.HedgeRatio <= 0 || in.UtilisationPercent < threshold {
-		return none
+	book := in.HedgeBook
+	if book != nil {
+		d.Sigma, d.SigmaSource, d.ReferencePrice, d.DecidedAt = book.Sigma, book.SigmaSource, book.Price, book.NowMs
+		d.LiabilityMultiple = book.LiabilityMultiple
+		delta, eligible, excluded := BookDelta(book.Legs, book.Price, book.Sigma, book.NowMs, cfg.MinSecondsToExpiryForHedge)
+		d.BookDelta = int64(util.RoundHalfUp(delta))
+		d.EligibleTrades, d.ExcludedTrades = eligible, excluded
 	}
 
-	if in.SecondsToNearestExpiry != nil && *in.SecondsToNearestExpiry < cfg.MinSecondsToExpiryForHedge {
-		// Too little time left for a hedge to be filled and carried usefully.
-		return none
+	switch {
+	case !in.HedgeEnabled:
+		d.Reason = "hedging disabled for this asset"
+	case book == nil:
+		d.Reason = "no book data"
+	case level == nil || level.HedgeRatio <= 0:
+		d.Reason = "utilisation in a band with no hedge"
+	case in.UtilisationPercent < threshold:
+		d.Reason = "utilisation below the hedge threshold"
+	case !(book.Price > 0):
+		d.Reason = "no reference price"
+	case !(book.Sigma > 0):
+		d.Reason = "no volatility estimate"
+	case d.EligibleTrades == 0:
+		d.Reason = "no open trade outside the gamma window"
+	}
+	if d.Reason != "" {
+		return out
 	}
 
-	volatilityBoost := 0.0
-	if in.Volatility > ElevatedVolatility {
-		volatilityBoost = cfg.VolatilityHedgeBoost
+	h := HedgeRatioFor(level, d.VolatilityBoost, in.AssetTargetHedgeRatio)
+	d.HedgeRatio = h
+	raw := h * float64(d.BookDelta)
+	d.RawTarget = int64(util.RoundHalfUp(raw))
+	d.TargetSigned, d.Cap, d.CappedBy = CapTarget(raw, in.MaxHedgeNotional, book.LiabilityMultiple, in.Exposure.ExpiryLiability)
+	if d.TargetSigned == 0 {
+		d.Reason = "book delta is zero after caps"
+		return out
 	}
-	ratio := math.Min(1, math.Max(0, level.HedgeRatio*in.AssetTargetHedgeRatio*2+volatilityBoost))
+	out.Ratio = roundTo(h, 4)
+	out.Notional = absInt64(d.TargetSigned)
+	out.Decision = toHedgeDecision(levelName)
+	return out
+}
 
-	net := math.Abs(float64(in.Exposure.NetExposure))
-	notional := min(int64(util.RoundHalfUp(net*ratio)), in.MaxHedgeNotional)
-
-	if notional < in.MinHedgeNotional {
-		return none
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
 	}
-	return HedgeTarget{Decision: decision, Ratio: roundTo(ratio, 4), Notional: notional, LevelName: levelName}
+	return v
 }
 
 func toHedgeDecision(levelName string) models.HedgeDecision {
@@ -281,19 +339,27 @@ func toHedgeDecision(levelName string) models.HedgeDecision {
 // AssessAsset gathers the live inputs for one asset and runs the pure
 // assessment, caching the result in Redis.
 func AssessAsset(ctx context.Context, assetID string) (models.RiskAssessment, error) {
+	a, _, err := AssessAssetDetailed(ctx, assetID)
+	return a, err
+}
+
+// AssessAssetDetailed is AssessAsset that also returns the inputs it used,
+// so a hedge decision can store them and be replayed (rule 9).
+func AssessAssetDetailed(ctx context.Context, assetID string) (models.RiskAssessment, RiskInputs, error) {
 	asset, err := assets.RequireAssetDoc(ctx, assetID)
 	if err != nil {
-		return models.RiskAssessment{}, err
+		return models.RiskAssessment{}, RiskInputs{}, err
 	}
 
 	var (
-		snap         models.ExposureSnapshot
-		cfg          *models.RiskConfig
-		portfolio    exposure.PortfolioExposure
-		volatility   float64
-		health       models.FeedHealthSnapshot
-		nearestExpry *int64
-		hedged       int64
+		snap       models.ExposureSnapshot
+		cfg        *models.RiskConfig
+		portfolio  exposure.PortfolioExposure
+		volatility float64
+		health     models.FeedHealthSnapshot
+		hedged     int64
+		legs       []models.HedgeLeg
+		tick       *models.NormalisedTick
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) { snap, err = exposure.GetExposure(gctx, assetID, asset.Symbol); return })
@@ -301,13 +367,30 @@ func AssessAsset(ctx context.Context, assetID string) (models.RiskAssessment, er
 	g.Go(func() (err error) { portfolio, err = exposure.GetPortfolioExposure(gctx); return })
 	g.Go(func() (err error) { volatility, err = marketdata.GetRealisedVolatility(gctx, assetID, 0); return })
 	g.Go(func() (err error) { health, err = marketdata.GetFeedHealth(gctx, assetID, asset.Symbol); return })
-	g.Go(func() (err error) { nearestExpry, err = getSecondsToNearestExpiry(gctx, asset.ID); return })
 	g.Go(func() (err error) { hedged, err = getHedgedNotional(gctx, asset.ID); return })
+	g.Go(func() (err error) { legs, err = loadHedgeLegs(gctx, asset.ID); return })
+	g.Go(func() (err error) { tick, err = marketdata.GetLastTick(gctx, assetID); return })
 	if err := g.Wait(); err != nil {
-		return models.RiskAssessment{}, err
+		return models.RiskAssessment{}, RiskInputs{}, err
+	}
+	now := util.NowMs()
+	nearestExpry := secondsToNearestExpiry(legs, now)
+	sigma, sigmaSource, err := hedgeSigma(ctx, assetID, volatility)
+	if err != nil {
+		return models.RiskAssessment{}, RiskInputs{}, err
+	}
+	book := &HedgeBook{Legs: legs, Sigma: sigma, SigmaSource: sigmaSource, NowMs: now, LiabilityMultiple: hedgeLiabilityMultiple()}
+	if tick != nil {
+		book.Price = tick.Price
+	}
+	unavailable := ""
+	if HedgeAvailability != nil && asset.HedgeEnabled {
+		if ok, why := HedgeAvailability(ctx, assetID); !ok {
+			unavailable = why
+		}
 	}
 
-	assessment := AssessRisk(RiskInputs{
+	in := RiskInputs{
 		AssetID:                    assetID,
 		Symbol:                     asset.Symbol,
 		Exposure:                   snap,
@@ -325,12 +408,15 @@ func AssessAsset(ctx context.Context, assetID string) (models.RiskAssessment, er
 		SecondsToNearestExpiry:     nearestExpry,
 		ExistingHedgeNotional:      hedged,
 		PlatformLiability:          portfolio.TotalExpiryLiability,
-	})
+		HedgeBook:                  book,
+		HedgeUnavailableReason:     unavailable,
+	}
+	assessment := AssessRisk(in)
 
 	if err := cacheAssessment(ctx, assessment); err != nil {
-		return models.RiskAssessment{}, err
+		return models.RiskAssessment{}, RiskInputs{}, err
 	}
-	return assessment, nil
+	return assessment, in, nil
 }
 
 // AssessAllAssets assesses every asset concurrently and broadcasts the list
@@ -356,7 +442,7 @@ func AssessAllAssets(ctx context.Context) ([]models.RiskAssessment, error) {
 }
 
 func cacheAssessment(ctx context.Context, a models.RiskAssessment) error {
-	return redisx.R().HSet(ctx, config.RedisKeys.RiskState(a.AssetID), map[string]any{
+	fields := map[string]any{
 		"level":               string(a.Level),
 		"score":               jsNumber(a.Score),
 		"utilisationPercent":  jsNumber(a.UtilisationPercent),
@@ -365,7 +451,17 @@ func cacheAssessment(ctx context.Context, a models.RiskAssessment) error {
 		"hedgeDecision":       string(a.HedgeDecision),
 		"targetHedgeNotional": strconv.FormatInt(a.TargetHedgeNotional, 10),
 		"evaluatedAt":         strconv.FormatInt(a.EvaluatedAt, 10),
-	}).Err()
+	}
+	if h := a.HedgeTarget; h != nil {
+		fields["hedgeTargetSigned"] = strconv.FormatInt(h.TargetSigned, 10)
+		fields["hedgeBookDelta"] = strconv.FormatInt(h.BookDelta, 10)
+		fields["hedgeCappedBy"] = h.CappedBy
+		fields["hedgeRatio"] = jsNumber(h.HedgeRatio)
+		fields["hedgeSigma"] = strconv.FormatFloat(h.Sigma, 'g', -1, 64)
+		fields["hedgeSigmaSource"] = h.SigmaSource
+		fields["hedgeTickVolatility"] = strconv.FormatFloat(h.TickVolatility, 'g', -1, 64)
+	}
+	return redisx.R().HSet(ctx, config.RedisKeys.RiskState(a.AssetID), fields).Err()
 }
 
 // jsNumber is JS String(n) for the 2-decimal values stored in the cache.
@@ -388,72 +484,60 @@ func GetCachedAssessment(ctx context.Context, assetID string) (*models.RiskAsses
 	return &a, nil
 }
 
-func getSecondsToNearestExpiry(ctx context.Context, assetID bson.ObjectID) (*int64, error) {
-	var next struct {
-		ExpiryTimestamp int64 `bson:"expiryTimestamp"`
+// secondsToNearestExpiry is the time to the soonest open trade's expiry
+// (rounded seconds, >= 0), nil for an empty book.
+func secondsToNearestExpiry(legs []models.HedgeLeg, nowMs int64) *int64 {
+	if len(legs) == 0 {
+		return nil
 	}
-	err := mongox.C(models.CollBinaryTrades).FindOne(ctx,
-		bson.M{"assetId": assetID, "status": string(models.TradeStatusOpen), "accountType": models.NotDemo()},
-		options.FindOne().SetSort(bson.D{{Key: "expiryTimestamp", Value: 1}}).SetProjection(bson.M{"expiryTimestamp": 1}),
-	).Decode(&next)
-	if mongox.IsNotFound(err) {
-		return nil, nil
+	next := legs[0].ExpiryMs
+	for _, l := range legs[1:] {
+		next = min(next, l.ExpiryMs)
 	}
-	if err != nil {
-		return nil, err
-	}
-	secs := max(0, int64(util.RoundHalfUp(float64(next.ExpiryTimestamp-util.NowMs())/1000)))
-	return &secs, nil
+	secs := max(0, int64(util.RoundHalfUp(float64(next-nowMs)/1000)))
+	return &secs
 }
 
-// activeHedgeStatuses mirrors ACTIVE_HEDGE_STATUSES in the hedge repository.
-var activeHedgeStatuses = bson.A{
-	string(models.HedgeOrderStatusPending),
-	string(models.HedgeOrderStatusPartiallyFilled),
-	string(models.HedgeOrderStatusFilled),
-}
-
+// getHedgedNotional is the protection actually held on an asset: the INR
+// notional of its filled hedge position at the last mark (hedge_positions,
+// written by the hedging package). Working orders do not count.
 func getHedgedNotional(ctx context.Context, assetID bson.ObjectID) (int64, error) {
-	cur, err := mongox.C(models.CollHedgeOrders).Aggregate(ctx, bson.A{
-		bson.M{"$match": bson.M{"assetId": assetID, "status": bson.M{"$in": activeHedgeStatuses}, "closedAt": nil}},
-		bson.M{"$group": bson.M{"_id": nil, "filled": bson.M{"$sum": "$filledNotional"}}},
-	})
-	if err != nil {
-		return 0, err
+	var p struct {
+		NotionalInr int64 `bson:"notionalInr"`
 	}
-	var rows []struct {
-		Filled int64 `bson:"filled"`
-	}
-	if err := cur.All(ctx, &rows); err != nil {
-		return 0, err
-	}
-	if len(rows) == 0 {
+	err := mongox.C(models.CollHedgePositions).FindOne(ctx, bson.M{"assetId": assetID},
+		options.FindOne().SetProjection(bson.M{"notionalInr": 1})).Decode(&p)
+	if mongox.IsNotFound(err) {
 		return 0, nil
 	}
-	return rows[0].Filled, nil
+	if err != nil {
+		return 0, err
+	}
+	return p.NotionalInr, nil
 }
 
-// GetHedgedNotionalByAsset is hedge.repository getHedgedNotionalByAsset,
-// placed here because the risk worker needs it and hedging imports risk.
-// The hedging package should call this rather than re-implement it.
+// GetHedgedNotionalByAsset is the filled hedge notional per asset (minor
+// units, absolute, at the last mark), placed here because the risk worker
+// needs it and hedging imports risk. The hedging package calls this rather
+// than re-implement it.
 func GetHedgedNotionalByAsset(ctx context.Context) (map[string]int64, error) {
-	cur, err := mongox.C(models.CollHedgeOrders).Aggregate(ctx, bson.A{
-		bson.M{"$match": bson.M{"status": bson.M{"$in": activeHedgeStatuses}, "closedAt": nil}},
-		bson.M{"$group": bson.M{"_id": "$assetId", "filled": bson.M{"$sum": "$filledNotional"}}},
-	})
+	cur, err := mongox.C(models.CollHedgePositions).Find(ctx, bson.M{},
+		options.Find().SetProjection(bson.M{"assetId": 1, "notionalInr": 1}))
 	if err != nil {
 		return nil, err
 	}
 	var rows []struct {
-		ID     bson.ObjectID `bson:"_id"`
-		Filled int64         `bson:"filled"`
+		AssetID     bson.ObjectID `bson:"assetId"`
+		NotionalInr int64         `bson:"notionalInr"`
 	}
 	if err := cur.All(ctx, &rows); err != nil {
 		return nil, err
 	}
 	out := make(map[string]int64, len(rows))
 	for _, r := range rows {
-		out[r.ID.Hex()] = r.Filled
+		if r.NotionalInr != 0 {
+			out[r.AssetID.Hex()] = r.NotionalInr
+		}
 	}
 	return out, nil
 }

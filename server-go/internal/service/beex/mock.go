@@ -88,6 +88,14 @@ func (m *Mock) Name() string     { return "mock" }
 func (m *Mock) Mode() string     { m.mu.Lock(); defer m.mu.Unlock(); return m.ModeValue }
 func (m *Mock) Configured() bool { return true }
 
+// SetMode changes the mode new invoices and Mode() report ("live" makes the
+// mock stand in for a live key).
+func (m *Mock) SetMode(mode string) {
+	m.mu.Lock()
+	m.ModeValue = mode
+	m.mu.Unlock()
+}
+
 // FailNext queues an outcome for the next call of op.
 func (m *Mock) FailNext(op string, f MockFailure) {
 	m.mu.Lock()

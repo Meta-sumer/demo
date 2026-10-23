@@ -5,7 +5,10 @@
 // The validation chain runs in the order the spec lays out, and every value
 // the platform is exposed on - entry price, entry time, expiry time, payout -
 // is decided here from server state. The request supplies only asset,
-// direction, amount and expiry.
+// direction, amount and expiry; the payout comes from the pricing engine
+// (service/pricing), re-priced on fresh data at acceptance. A quote id or a
+// displayed payout the app sends can only refuse a trade (for a re-quote),
+// never raise its payout.
 package binary
 
 import (
@@ -31,6 +34,7 @@ import (
 	"binarytrading/internal/service/marketdata"
 	"binarytrading/internal/service/metrics"
 	"binarytrading/internal/service/payouts"
+	"binarytrading/internal/service/pricing"
 	"binarytrading/internal/service/risk"
 	"binarytrading/internal/service/riskconfig"
 	"binarytrading/internal/service/wallets"
@@ -52,6 +56,12 @@ type CreateTradeInput struct {
 	IdempotencyKey *string
 	// LIVE or DEMO; "" means LIVE.
 	AccountType string
+	// The offer accepted (GET /binary/quotes, pricing specification 8) and
+	// the payout percent on screen; nil when not sent (apps that predate
+	// offers). The payout percent can only refuse a trade priced without an
+	// offer - never set it.
+	OfferID                *string
+	DisplayedPayoutPercent *float64
 }
 
 // TradeFingerprint hashes the fields that define a trade request, so a key
@@ -83,7 +93,26 @@ type TradeContext struct {
 type CreateTradeResult struct {
 	Trade    models.BinaryTradeView
 	Replayed bool
+	// Steps after the insert that failed (Redis) and are left to the repair
+	// paths: "exposure_commit", "expiry_queue", "idempotency_commit". The
+	// trade is accepted either way.
+	Degraded []string
 }
+
+// Post-insert steps (Redis). Variables so a test can make them fail after
+// the trade was written.
+var (
+	commitReservation = func(ctx context.Context, r *exposure.Reservation) error {
+		_, err := r.Commit(ctx)
+		return err
+	}
+	queueExpiry = func(ctx context.Context, tradeID string, expiryTimestamp int64) error {
+		return redisx.R().ZAdd(ctx, config.RedisKeys.ExpiryQueue, redis.Z{Score: float64(expiryTimestamp), Member: tradeID}).Err()
+	}
+	commitIdempotency = func(ctx context.Context, userID, key, fingerprint, tradeID string) error {
+		return redisx.R().Set(ctx, config.RedisKeys.Idempotency(userID, key), "committed:"+fingerprint+":"+tradeID, idempotencyTTL).Err()
+	}
+)
 
 func truthy(s *string) bool { return s != nil && *s != "" }
 
@@ -123,6 +152,13 @@ func CreateTrade(ctx context.Context, input CreateTradeInput, tc TradeContext) (
 			if delErr := redisx.R().Del(ctx, config.RedisKeys.Idempotency(tc.UserID, *idempotencyKey)).Err(); delErr != nil {
 				return CreateTradeResult{}, delErr
 			}
+		}
+		// An app that sent an offer and is refused for a reason that is not
+		// the customer's (a halt, market data, the book) gets a fresh quote
+		// with the refusal, wherever in the chain it was refused.
+		if truthy(input.OfferID) {
+			err = pricing.WithRequote(ctx, pricing.AcceptTerms{UserID: tc.UserID, OfferID: *input.OfferID, AssetID: input.AssetID,
+				Direction: input.Direction, ExpirySeconds: input.ExpirySeconds, Stake: input.Amount, AccountType: input.AccountType}, err)
 		}
 		return CreateTradeResult{}, err
 	}
@@ -240,8 +276,10 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 			strconv.FormatInt(input.ExpirySeconds, 10)+"s expiry is not offered on "+asset.Symbol, 400)
 	}
 
-	// 5. Feed health gate - refuses the trade when the price is not
-	//    trustworthy, and hands back the tick that will price it.
+	// 5. Feed gate - refuses the trade when the price is not trustworthy, and
+	//    hands back the tick that will price it. It applies the freshness rule
+	//    quotes are issued under (marketdata.AssessFreshness), so an offer is
+	//    re-validated at acceptance on the rule it was made on.
 	tick, err := marketdata.AssertFeedTradable(ctx, input.AssetID, asset.Symbol)
 	if err != nil {
 		return CreateTradeResult{}, err
@@ -275,15 +313,15 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 		}
 	}
 
-	// 6. Payout terms in force right now; the version is frozen onto the trade.
+	// 6. Payout terms in force right now (the engine's bounds); the version is
+	//    frozen onto the trade.
 	payout, err := payouts.RequireActivePayout(ctx, input.AssetID, input.ExpirySeconds)
 	if err != nil {
 		return CreateTradeResult{}, err
 	}
 	stake := input.Amount
-	profit := util.CalculateProfit(stake, payout.PayoutPercent)
 
-	// 7. Per-expiry stake bounds, then the full risk limit set.
+	// 7a. Per-expiry stake bounds.
 	if payout.MinStake != nil && stake < *payout.MinStake {
 		return CreateTradeResult{}, apperr.New(apperr.StakeBelowMin,
 			"Minimum stake for this expiry is "+strconv.FormatInt(*payout.MinStake, 10), 400)
@@ -293,6 +331,60 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 			"Maximum stake for this expiry is "+strconv.FormatInt(*payout.MaxStake, 10), 400)
 	}
 
+	// 6b. Pricing (docs/audit/pricing/pricing-spec.md). With an offer id the
+	//     offer is consumed (single use, removed on this first lookup) and
+	//     re-validated - still valid, symbol not halted, fresh data, the mid
+	//     within maxSlippageBps of the offer's reference, exposure holding with
+	//     the locked payout - and its payout is locked for the trade. Without
+	//     one (apps that predate offers) the trade is priced now: refused for
+	//     a re-quote only if the app says it displayed a higher payout,
+	//     otherwise accepted at the price now.
+	pricingStarted := time.Now()
+	accept := pricing.AcceptTerms{UserID: tc.UserID, AssetID: input.AssetID, Direction: input.Direction,
+		ExpirySeconds: input.ExpirySeconds, Stake: stake, AccountType: input.AccountType}
+	var offer *models.PricingOffer
+	if input.OfferID != nil {
+		accept.OfferID = *input.OfferID
+		offer, err = pricing.TakeOffer(ctx, accept, tick, util.NowMs())
+		if err != nil {
+			metrics.IncrementCounter("trades.rejected.offer", 1, 0)
+			return CreateTradeResult{}, err
+		}
+	} else {
+		decision, err := pricing.Evaluate(ctx, pricing.Request{
+			Asset: asset, Payout: payout, Direction: input.Direction, ExpirySeconds: input.ExpirySeconds,
+			Stake: stake, AccountType: input.AccountType, Tick: tick,
+		})
+		if err != nil {
+			return CreateTradeResult{}, err
+		}
+		inline := pricing.InlineOffer(decision, tc.UserID)
+		if !decision.OK {
+			pricing.AuditOffer(inline)
+			metrics.IncrementCounter("trades.rejected.pricing", 1, 0)
+			return CreateTradeResult{}, decision.RefusalError()
+		}
+		if err := pricing.CheckDisplayed(ctx, decision, input.DisplayedPayoutPercent, accept); err != nil {
+			metrics.IncrementCounter("trades.rejected.requote", 1, 0)
+			return CreateTradeResult{}, err
+		}
+		if err := pricing.RecordOffer(ctx, inline); err != nil {
+			logx.Warn("failed to record an inline offer", "offerId", inline.ID, "err", err.Error())
+		}
+		offer = &inline
+	}
+	metrics.Since(config.LatTradeAcceptance+".pricing", pricingStarted)
+	payoutPercent := offer.PayoutPercent
+	profit := util.CalculateProfit(stake, payoutPercent)
+	pricingRecord := pricing.RecordOfferRecord(offer, tick.Price)
+	pricingRecord.DisplayedPayoutPercent = input.DisplayedPayoutPercent
+	// The terms the offer was made under (a payout row replaced since keeps
+	// its own version on the trade).
+	if id, ok := mongox.ParseID(offer.PayoutCfgID); ok {
+		payout = &models.PayoutConfig{ID: id, Version: offer.PayoutCfgVer, PayoutPercent: payout.PayoutPercent}
+	}
+
+	// 7b. The full risk limit set.
 	demo := input.AccountType == models.AccountDemo
 	if err := risk.AssertTradeWithinRiskLimits(ctx, risk.TradeRiskContext{
 		UserID:             tc.UserID,
@@ -306,6 +398,18 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 		ExpirySeconds:      input.ExpirySeconds,
 	}); err != nil {
 		return CreateTradeResult{}, err
+	}
+
+	// 7c. The tie rule in force now is frozen on the trade with the payout:
+	//     it is part of the trade's terms (settlement reads it from the
+	//     trade, not from the configuration at settlement).
+	drawCfg, err := riskconfig.GetRiskConfig(ctx)
+	if err != nil {
+		return CreateTradeResult{}, err
+	}
+	drawPolicy := drawCfg.DrawPolicy
+	if drawPolicy == "" {
+		drawPolicy = models.DrawPolicyRefund
 	}
 
 	// 8. Server-authoritative timing and pricing.
@@ -323,14 +427,17 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 	var resv *exposure.Reservation
 	if !demo {
 		resv, err = risk.ReserveTradeExposure(ctx, risk.ReservationRequest{
-			TradeID:         tradeHex,
-			UserID:          tc.UserID,
-			Asset:           asset,
-			Direction:       input.Direction,
-			Stake:           stake,
-			Profit:          profit,
-			ExpiryTimestamp: expiryTimestamp,
-			UserMaxExposure: user.MaxUserExposure,
+			// Pricing specification 7.2 final hard check, atomically: the
+			// side's L(D) with this trade's locked payout.
+			SideLiabilityLimit: offer.Components.MaxExposure,
+			TradeID:            tradeHex,
+			UserID:             tc.UserID,
+			Asset:              asset,
+			Direction:          input.Direction,
+			Stake:              stake,
+			Profit:             profit,
+			ExpiryTimestamp:    expiryTimestamp,
+			UserMaxExposure:    user.MaxUserExposure,
 		})
 		if err != nil {
 			return CreateTradeResult{}, err
@@ -389,6 +496,7 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 	payoutID := payout.ID
 	payoutVersion := payout.Version
 	feedLatency := tick.TotalLatencyMs
+	offerID := offer.ID
 	now := mongox.Now()
 	doc := models.BinaryTrade{
 		ID:                     tradeID,
@@ -400,7 +508,7 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 		AccountType:            input.AccountType,
 		Stake:                  stake,
 		Currency:               models.BinaryTradeDefaultCurrency,
-		PayoutPercent:          payout.PayoutPercent,
+		PayoutPercent:          payoutPercent,
 		Profit:                 profit,
 		PayoutConfigID:         &payoutID,
 		PayoutConfigVersion:    &payoutVersion,
@@ -414,6 +522,9 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 		EntryProviderTimestamp: tick.ProviderTimestamp,
 		EntryFeedLatencyMs:     &feedLatency,
 		IP:                     tc.IP,
+		OfferID:                &offerID,
+		Pricing:                pricingRecord,
+		DrawPolicy:             &drawPolicy,
 		CreatedAt:              now,
 		UpdatedAt:              now,
 	}
@@ -440,29 +551,38 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 	}
 	metrics.Since(config.LatTradePersistence, persistStarted)
 
-	// 11. Exposure, expiry scheduling and notifications. The reservation is
-	//     committed first: the trade exists now, and its exposure must count
-	//     whatever happens next.
+	// 11. Exposure, expiry scheduling and notifications. The trade is written:
+	//     from here nothing refuses it, and the response says it was accepted
+	//     (telling the customer it failed would invite a second trade). A Redis
+	//     failure below is logged, counted and left to the repairs that work
+	//     from MongoDB: the reservation sweeper commits a lapsed reservation
+	//     whose trade is live (the reconciler counts any open trade the book
+	//     lacks); the expiry worker's database sweep queues a due OPEN trade
+	//     missing from the expiry queue for settlement (the boot rebuild
+	//     re-queues every open trade); a retry with the same idempotency key
+	//     finds the trade in MongoDB before it looks at Redis.
 	// DEMO trades are not the house's risk: no exposure, no hedge evaluation.
+	var degraded []string
 	if resv != nil {
-		if _, err := resv.Commit(ctx); err != nil {
-			// The trade is written, so it is not refused now. The reservation
-			// still holds its headroom and the sweeper commits it from MongoDB
-			// once it lapses (or a rebuild counts the trade).
+		if err := commitReservation(ctx, resv); err != nil {
 			logx.Error("failed to commit an exposure reservation", "tradeId", tradeHex, "err", err.Error())
 			metrics.IncrementCounter("exposure.commit_failed", 1, 0)
+			degraded = append(degraded, "exposure_commit")
 		} else {
 			exposure.Notify(asset.ID.Hex(), asset.Symbol)
 		}
 	}
-	if err := redisx.R().ZAdd(ctx, config.RedisKeys.ExpiryQueue, redis.Z{Score: float64(expiryTimestamp), Member: tradeHex}).Err(); err != nil {
-		return CreateTradeResult{}, err
+	if err := queueExpiry(ctx, tradeHex, expiryTimestamp); err != nil {
+		logx.Error("trade accepted but not queued for expiry; the expiry sweep settles it", "tradeId", tradeHex, "err", err.Error())
+		metrics.IncrementCounter("trades.post_insert_redis_failed", 1, 0)
+		degraded = append(degraded, "expiry_queue")
 	}
-
 	if truthy(idempotencyKey) {
-		if err := redisx.R().Set(ctx, config.RedisKeys.Idempotency(tc.UserID, *idempotencyKey),
-			"committed:"+payloadFingerprint+":"+tradeHex, idempotencyTTL).Err(); err != nil {
-			return CreateTradeResult{}, err
+		if err := commitIdempotency(ctx, tc.UserID, *idempotencyKey, payloadFingerprint, tradeHex); err != nil {
+			logx.Error("trade accepted but its idempotency key not marked committed; a retry finds it in MongoDB",
+				"tradeId", tradeHex, "err", err.Error())
+			metrics.IncrementCounter("trades.post_insert_redis_failed", 1, 0)
+			degraded = append(degraded, "idempotency_commit")
 		}
 	}
 
@@ -471,9 +591,10 @@ func acceptTrade(ctx context.Context, input CreateTradeInput, tc TradeContext, i
 
 	logx.Info("binary trade accepted",
 		"tradeId", view.ID, "userId", tc.UserID, "symbol", view.Symbol, "direction", view.Direction,
-		"stake", view.Stake, "entryPrice", view.EntryPrice, "expirySeconds", input.ExpirySeconds, "accountType", view.AccountType)
+		"stake", view.Stake, "entryPrice", view.EntryPrice, "expirySeconds", input.ExpirySeconds, "accountType", view.AccountType,
+		"payoutPercent", payoutPercent, "offerId", offerID, "ruleVersion", offer.RuleVersion)
 
-	return CreateTradeResult{Trade: view, Replayed: false}, nil
+	return CreateTradeResult{Trade: view, Replayed: false, Degraded: degraded}, nil
 }
 
 // Statuses a trade can still leave, versus those it has finished in.
@@ -621,6 +742,26 @@ func GetTrade(ctx context.Context, tradeID, requesterID string) (models.BinaryTr
 	return models.ToTradeView(t), nil
 }
 
+// AdminTradeView is a trade with its pricing decision (admin only: the
+// customer view does not carry model internals).
+type AdminTradeView struct {
+	models.BinaryTradeView
+	Pricing *models.TradePricing `json:"pricing"`
+}
+
+// GetTradeWithPricing returns any trade with its pricing record (nil for
+// trades accepted before the pricing engine).
+func GetTradeWithPricing(ctx context.Context, tradeID string) (AdminTradeView, error) {
+	t, err := findTrade(ctx, tradeID)
+	if err != nil {
+		return AdminTradeView{}, err
+	}
+	if t == nil {
+		return AdminTradeView{}, tradeNotFound()
+	}
+	return AdminTradeView{BinaryTradeView: models.ToTradeView(t), Pricing: t.Pricing}, nil
+}
+
 func GetOpenTrades(ctx context.Context, userID string) ([]models.BinaryTradeView, error) {
 	uid, err := bson.ObjectIDFromHex(userID)
 	if err != nil {
@@ -637,72 +778,6 @@ func GetOpenTrades(ctx context.Context, userID string) ([]models.BinaryTradeView
 		return nil, err
 	}
 	return toViews(docs), nil
-}
-
-// CancelTrade is administrative cancellation. Only an OPEN trade can be
-// cancelled and the stake is returned in full - a cancelled trade never
-// produces a win or a loss for either side.
-func CancelTrade(ctx context.Context, tradeID, reason string) (models.BinaryTradeView, error) {
-	ctx = context.WithoutCancel(ctx)
-	id, ok := mongox.ParseID(tradeID)
-	if !ok {
-		return models.BinaryTradeView{}, tradeNotFound()
-	}
-	now := mongox.Now()
-	var trade models.BinaryTrade
-	err := mongox.C(models.CollBinaryTrades).FindOneAndUpdate(ctx,
-		bson.M{"_id": id, "status": string(models.TradeStatusOpen)},
-		bson.M{"$set": bson.M{
-			"status":           string(models.TradeStatusCancelled),
-			"cancelReason":     reason,
-			"settledAt":        now,
-			"settlementAmount": 0,
-			"platformResult":   0,
-			"updatedAt":        now,
-		}},
-		options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&trade)
-	if err != nil {
-		if !mongox.IsNotFound(err) {
-			return models.BinaryTradeView{}, err
-		}
-		existing, err := findTrade(ctx, tradeID)
-		if err != nil {
-			return models.BinaryTradeView{}, err
-		}
-		if existing == nil {
-			return models.BinaryTradeView{}, tradeNotFound()
-		}
-		return models.BinaryTradeView{}, apperr.ConflictErr(apperr.Conflict,
-			"Only an open trade can be cancelled (status is "+string(existing.Status)+")")
-	}
-
-	userHex := trade.UserID.Hex()
-	if _, err := wallets.ReleaseTradeFunds(ctx, wallets.TradeFundsInput{
-		UserID: userHex, AccountType: trade.AccountType, Stake: trade.Stake, TradeID: tradeID,
-	}, wallets.ReleaseCancelled); err != nil {
-		return models.BinaryTradeView{}, err
-	}
-
-	if err := redisx.R().ZRem(ctx, config.RedisKeys.ExpiryQueue, tradeID).Err(); err != nil {
-		return models.BinaryTradeView{}, err
-	}
-	if models.NormAccountType(trade.AccountType) == models.AccountLive {
-		if _, err := exposure.ApplyExposureDelta(ctx, exposure.ExposureDelta{
-			AssetID:   trade.AssetID.Hex(),
-			Symbol:    trade.Symbol,
-			UserID:    userHex,
-			Direction: trade.Direction,
-			Stake:     trade.Stake,
-			Profit:    trade.Profit,
-			Sign:      -1,
-		}); err != nil {
-			return models.BinaryTradeView{}, err
-		}
-	}
-
-	view := models.ToTradeView(&trade)
-	ws.Emit([]string{config.ChUser(view.UserID), config.ChAdminOps}, config.EvTradeUpdated, view)
-	return view, nil
 }
 
 // RebuildExpiryQueue restores the expiry queue from MongoDB - run at boot and

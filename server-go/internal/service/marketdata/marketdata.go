@@ -19,7 +19,6 @@ import (
 
 	"binarytrading/internal/config"
 	"binarytrading/internal/models"
-	"binarytrading/internal/platform/apperr"
 	"binarytrading/internal/platform/logx"
 	"binarytrading/internal/platform/redisx"
 	"binarytrading/internal/platform/util"
@@ -103,6 +102,7 @@ type tickJSON struct {
 	FeedLatencyMs       int64    `json:"feedLatencyMs"`
 	ProcessingLatencyMs int64    `json:"processingLatencyMs"`
 	TotalLatencyMs      int64    `json:"totalLatencyMs"`
+	SpreadBps           *float64 `json:"spreadBps,omitempty"`
 }
 
 func toTickJSON(t *models.NormalisedTick) tickJSON {
@@ -114,7 +114,7 @@ func toTickJSON(t *models.NormalisedTick) tickJSON {
 		AssetID: t.AssetID, Asset: t.Asset, Symbol: t.Symbol, Price: t.Price, Bid: t.Bid, Ask: t.Ask,
 		Timestamp: t.Timestamp, ProviderTimestamp: pt, ReceivedAt: t.ReceivedAt, Sequence: t.Sequence,
 		ProcessedAt: t.ProcessedAt, FeedLatencyMs: t.FeedLatencyMs,
-		ProcessingLatencyMs: t.ProcessingLatencyMs, TotalLatencyMs: t.TotalLatencyMs,
+		ProcessingLatencyMs: t.ProcessingLatencyMs, TotalLatencyMs: t.TotalLatencyMs, SpreadBps: t.SpreadBps,
 	}
 }
 
@@ -125,16 +125,17 @@ func IngestTick(ctx context.Context, tick providers.Tick) (*models.NormalisedTic
 }
 
 func ingestTickAt(ctx context.Context, tick providers.Tick, receivedAt int64) (*models.NormalisedTick, error) {
-	n, err := normaliseTick(ctx, tick, receivedAt)
-	if err != nil || n == nil {
-		return nil, err
+	out := ingestTicks(ctx, []queuedTick{{tick: tick, receivedAt: receivedAt}})
+	if len(out) == 0 {
+		return nil, nil
 	}
-	writeTicks(ctx, []*models.NormalisedTick{n})
-	return n, nil
+	return out[0], nil
 }
 
 // ingestTicks processes a batch of queued ticks in arrival order. A tick that
-// fails to normalise is logged and skipped; the rest of the batch goes on.
+// fails to normalise is logged and skipped; a quote the normalisation checks
+// reject (normalize.go) is counted and dropped without touching market
+// state; the rest of the batch goes on.
 func ingestTicks(ctx context.Context, batch []queuedTick) []*models.NormalisedTick {
 	ticks := make([]*models.NormalisedTick, 0, len(batch))
 	for _, q := range batch {
@@ -147,8 +148,18 @@ func ingestTicks(ctx context.Context, batch []queuedTick) []*models.NormalisedTi
 			ticks = append(ticks, n)
 		}
 	}
-	writeTicks(ctx, ticks)
-	return ticks
+	cfg, err := riskconfig.GetRiskConfig(ctx)
+	if err != nil {
+		d := models.DefaultRiskConfig()
+		cfg = &d
+	}
+	// Every message counts for gap detection, accepted or not: a rejected
+	// quote still proves the provider alive (feedquality.go).
+	observeTicks(ctx, ticks, GapParamsFrom(cfg))
+	accepted, vols, rejects := normalizeBatch(ctx, ticks)
+	writeTicks(ctx, accepted, cfg.FeedTickHistoryRetentionMs)
+	persistNormalization(ctx, vols, rejects)
+	return accepted
 }
 
 // writeTicks makes ONE Redis round trip for a batch of ticks: the last-tick
@@ -162,9 +173,15 @@ func ingestTicks(ctx context.Context, batch []queuedTick) []*models.NormalisedTi
 // the markets read as stale. Per batch, a slower Redis makes the batches grow
 // instead of the queue. Broadcasting from the same pipeline also keeps ticks
 // in order on the wire, which separate fire-and-forget publishes did not.
-func writeTicks(ctx context.Context, ticks []*models.NormalisedTick) {
+//
+// retentionMs is how long md:hist keeps ticks (risk configuration
+// feedTickHistoryRetentionMs; <= 0 = config.TickHistoryRetentionMs).
+func writeTicks(ctx context.Context, ticks []*models.NormalisedTick, retentionMs int64) {
 	if len(ticks) == 0 {
 		return
+	}
+	if retentionMs <= 0 {
+		retentionMs = config.TickHistoryRetentionMs
 	}
 	feed := make([]float64, 0, len(ticks))
 	processing := make([]float64, 0, len(ticks))
@@ -173,7 +190,7 @@ func writeTicks(ctx context.Context, ticks []*models.NormalisedTick) {
 
 	for _, n := range ticks {
 		member, _ := json.Marshal(toTickJSON(n))
-		queuePersistTick(ctx, pipe, n, string(member))
+		queuePersistTick(ctx, pipe, n, string(member), retentionMs)
 		aggregateCandle(n.AssetID, n.Symbol, n)
 		if raw, err := ws.EnvelopeFor([]string{config.ChMarket(n.AssetID), config.ChAdminMarket}, config.EvMarketTick, member); err == nil {
 			pipe.Publish(ctx, config.PubSubBroadcast, raw)
@@ -203,6 +220,7 @@ func normaliseTick(ctx context.Context, tick providers.Tick, receivedAt int64) (
 	}
 	if math.IsNaN(tick.Price) || math.IsInf(tick.Price, 0) || tick.Price <= 0 {
 		logx.Warn("discarding tick with an invalid price", "symbol", tick.Symbol, "price", tick.Price)
+		recordInvalid(asset.ID.Hex(), asset.Symbol)
 		return nil, nil
 	}
 
@@ -237,11 +255,14 @@ func normaliseTick(ctx context.Context, tick providers.Tick, receivedAt int64) (
 }
 
 // queuePersistTick adds one tick's last-tick and history writes to pipe.
-func queuePersistTick(ctx context.Context, pipe redis.Pipeliner, t *models.NormalisedTick, member string) {
+// The history keeps retentionMs of ticks: settlement reads the expiry price
+// from it, so the risk configuration requires it to cover the settlement
+// defer window with a margin.
+func queuePersistTick(ctx context.Context, pipe redis.Pipeliner, t *models.NormalisedTick, member string, retentionMs int64) {
 	lastKey := config.RedisKeys.LastTick(t.AssetID)
 	historyKey := config.RedisKeys.TickHistory(t.AssetID)
-	cutoff := t.ReceivedAt - config.TickHistoryRetentionMs
-	retention := time.Duration(config.TickHistoryRetentionMs) * time.Millisecond
+	cutoff := t.ReceivedAt - retentionMs
+	retention := time.Duration(retentionMs) * time.Millisecond
 
 	pipe.HSet(ctx, lastKey, serialiseTick(t))
 	pipe.PExpire(ctx, lastKey, retention)
@@ -293,6 +314,7 @@ func serialiseTick(t *models.NormalisedTick) map[string]any {
 		"feedLatencyMs":       i(t.FeedLatencyMs),
 		"processingLatencyMs": i(t.ProcessingLatencyMs),
 		"totalLatencyMs":      i(t.TotalLatencyMs),
+		"spreadBps":           optString(t.SpreadBps),
 		"provider":            currentProviderName(),
 	}
 }
@@ -359,6 +381,7 @@ func deserialiseTick(raw map[string]string) *models.NormalisedTick {
 		n := jsInt(s)
 		t.Sequence = &n
 	}
+	t.SpreadBps = optional(raw["spreadBps"])
 	return t
 }
 
@@ -396,9 +419,21 @@ func GetFeedHealth(ctx context.Context, assetID, symbol string) (models.FeedHeal
 		LatencyMs:     tick.TotalLatencyMs,
 		HealthyMaxMs:  cfg.FeedHealthyMaxMs,
 		DegradedMaxMs: cfg.FeedDegradedMaxMs,
-		StaleMaxMs:    cfg.FeedStaleMaxMs,
 		TickMaxAgeMs:  cfg.FeedTickMaxAgeMs,
 	})
+	// Feed data rules: ticks dropped by a saturated buffer, or a drifting
+	// clock, make even a fresh feed STALE (feedguard.go).
+	block, err := FeedBlockFor(ctx, assetID)
+	if err != nil {
+		return models.FeedHealthSnapshot{}, err
+	}
+	blockReason := ""
+	if block != nil {
+		blockReason = block.String()
+		if status == models.FeedStatusHealthy || status == models.FeedStatusDegraded {
+			status = models.FeedStatusStale
+		}
+	}
 	if symbol == "" {
 		symbol = tick.Symbol
 	}
@@ -421,6 +456,7 @@ func GetFeedHealth(ctx context.Context, assetID, symbol string) (models.FeedHeal
 		AgeMs:               &ageMs,
 		Provider:            currentProviderName(),
 		UpdatedAt:           at,
+		BlockReason:         blockReason,
 	}, nil
 }
 
@@ -429,11 +465,13 @@ type FeedClassificationInput struct {
 	LatencyMs     int64
 	HealthyMaxMs  int64
 	DegradedMaxMs int64
-	StaleMaxMs    int64
 	TickMaxAgeMs  int64
 }
 
 // ClassifyFeed is pure, so the thresholds can be unit tested without Redis.
+// The bands: HEALTHY up to healthyMaxMs, DEGRADED up to degradedMaxMs,
+// STALE above it, OFFLINE when the last tick is older than tickMaxAgeMs.
+// (feedStaleMaxMs, once listed among them, was never read and is retired.)
 func ClassifyFeed(in FeedClassificationInput) models.FeedStatus {
 	if in.AgeMs > in.TickMaxAgeMs {
 		return models.FeedStatusOffline
@@ -473,29 +511,20 @@ func GetAllFeedHealth(ctx context.Context) ([]models.FeedHealthSnapshot, error) 
 // AssertFeedTradable is the trading gate (spec section 6 and rule 12): when
 // the authoritative feed for an asset is not usable, new trades on that asset
 // stop. Open trades continue to settle under the terms they were accepted on.
+// It applies the freshness rule (freshness.go) - the very rule quotes are
+// issued under - to the last accepted tick, and returns that tick: it is the
+// price the trade will be accepted at.
 func AssertFeedTradable(ctx context.Context, assetID, symbol string) (*models.NormalisedTick, error) {
-	health, err := GetFeedHealth(ctx, assetID, symbol)
-	if err != nil {
-		return nil, err
-	}
-	cfg, err := riskconfig.GetRiskConfig(ctx)
-	if err != nil {
-		return nil, err
-	}
-	blocked := health.Status == models.FeedStatusOffline ||
-		(cfg.HaltTradingOnStaleFeed && health.Status == models.FeedStatusStale) ||
-		(cfg.HaltTradingOnDegradedFeed && health.Status == models.FeedStatusDegraded)
-	if blocked {
-		return nil, apperr.Unavailable(apperr.FeedUnhealthy,
-			"Market data for "+symbol+" is "+string(health.Status)+". New trades are paused for this asset.")
-	}
-
 	tick, err := GetLastTick(ctx, assetID)
 	if err != nil {
 		return nil, err
 	}
-	if tick == nil {
-		return nil, apperr.Unavailable(apperr.NoPriceAvailable, "No price is available for "+symbol)
+	f, err := CheckFreshness(ctx, assetID, tick, util.NowMs())
+	if err != nil {
+		return nil, err
+	}
+	if !f.OK {
+		return nil, FreshnessError(symbol, f)
 	}
 	return tick, nil
 }

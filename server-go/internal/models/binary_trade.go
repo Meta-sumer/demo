@@ -15,6 +15,22 @@ const CollBinaryTrades = "binary_trades"
 
 const BinaryTradeDefaultCurrency = "INR"
 
+// TradeCancellation is the progress of an administrative cancel.
+type TradeCancellation struct {
+	RequestedAt time.Time `bson:"requestedAt"`
+	// The stake has been released on the wallet (ledger key
+	// trade:settle:<id>).
+	FundsReleased   bool       `bson:"fundsReleased"`
+	FundsReleasedAt *time.Time `bson:"fundsReleasedAt,omitempty"`
+	// The trade's exposure has been taken off the book (claimed before the
+	// book is changed, so it is removed at most once).
+	ExposureReleased   bool       `bson:"exposureReleased"`
+	ExposureReleasedAt *time.Time `bson:"exposureReleasedAt,omitempty"`
+	// Attempts and the last error of the release, for the repair report.
+	Attempts  int64  `bson:"attempts"`
+	LastError string `bson:"lastError,omitempty"`
+}
+
 // BinaryTrade: every field the platform used to accept the trade is frozen on
 // the document - entry price, payout percent and the payout config version.
 // Later admin changes never touch a historical trade (rule 11).
@@ -68,6 +84,18 @@ type BinaryTrade struct {
 	ExpiryProviderTimestamp *int64 `bson:"expiryProviderTimestamp"`
 	// Which tick rule produced expiryPrice.
 	ExpiryPriceSource *string `bson:"expiryPriceSource"`
+	// What an exact match of entry and expiry price settles as, frozen at
+	// acceptance: part of the trade's terms, like the payout. Absent on
+	// trades accepted before it was stored; they settle under the policy in
+	// force at settlement (settlement.DrawPolicyFor).
+	DrawPolicy *DrawPolicy `bson:"drawPolicy,omitempty"`
+
+	// The pricing offer the trade accepted (an inline offer when the app sent
+	// none) and the frozen pricing record: locked payout, rule version and
+	// every component (docs/audit/pricing/pricing-spec.md). Absent on trades
+	// accepted before the pricing engine existed.
+	OfferID *string       `bson:"offerId,omitempty"`
+	Pricing *TradePricing `bson:"pricing,omitempty"`
 
 	// Settlement state machine (models/settlement_evidence.go): who moved the
 	// trade out of OPEN, and the immutable outcome recorded with that claim.
@@ -79,10 +107,15 @@ type BinaryTrade struct {
 	SettledAt           *time.Time `bson:"settledAt"`
 	SettlementLatencyMs *int64     `bson:"settlementLatencyMs"`
 	CancelReason        *string    `bson:"cancelReason"`
-	IP                  *string    `bson:"ip"`
-	CreatedAt           time.Time  `bson:"createdAt"`
-	UpdatedAt           time.Time  `bson:"updatedAt"`
-	V                   int64      `bson:"__v"`
+	// Administrative cancellation (binary.CancelTrade): the stake release
+	// and the exposure release are recorded as they complete, so a cancel
+	// interrupted between them is finished by a retry or by
+	// binary.RepairCancelledTrades. Absent on trades cancelled before.
+	Cancellation *TradeCancellation `bson:"cancellation,omitempty"`
+	IP           *string            `bson:"ip"`
+	CreatedAt    time.Time          `bson:"createdAt"`
+	UpdatedAt    time.Time          `bson:"updatedAt"`
+	V            int64              `bson:"__v"`
 }
 
 func init() {
@@ -126,6 +159,20 @@ type BinaryTradeView struct {
 	Status           TradeStatus  `json:"status"`
 	Result           *TradeResult `json:"result"`
 	SettlementAmount *int64       `json:"settlementAmount"`
+	// The pricing offer this trade was accepted on.
+	OfferID *string `json:"offerId,omitempty"`
+	// The settlement rule behind expiryPrice (TICK_AT_OR_BEFORE_EXPIRY,
+	// NO_PRICE_VOID_REFUND, ...); omitted while open and on trades settled
+	// before it was recorded.
+	ExpiryPriceSource *string `json:"expiryPriceSource,omitempty"`
+	// True when the trade was voided and the stake returned because no valid
+	// expiry price existed (status DRAW, rule NO_PRICE_VOID_REFUND). Apps
+	// show it as "Void - refunded", not as a tie.
+	Voided     bool   `json:"voided,omitempty"`
+	VoidReason string `json:"voidReason,omitempty"`
+	// The tie rule frozen on the trade at acceptance (omitted on older
+	// trades).
+	DrawPolicy *DrawPolicy `json:"drawPolicy,omitempty"`
 	// Where the order came from. Their own data, and the way a customer spots
 	// a session they did not open.
 	IP        *string   `json:"ip"`
@@ -133,7 +180,24 @@ type BinaryTradeView struct {
 	CreatedAt iso.Time  `json:"createdAt"`
 }
 
+// VoidReasonNoPrice is the customer wording of a void for want of a price.
+const VoidReasonNoPrice = "No valid market price at expiry; stake returned"
+
+// TradeVoided reports whether a trade was voided for want of a price.
+func TradeVoided(t *BinaryTrade) bool {
+	return t.ExpiryPriceSource != nil && *t.ExpiryPriceSource == SettlementRuleNoPriceVoidRefund
+}
+
 func ToTradeView(t *BinaryTrade) BinaryTradeView {
+	v := toTradeView(t)
+	v.ExpiryPriceSource = t.ExpiryPriceSource
+	if TradeVoided(t) {
+		v.Voided, v.VoidReason = true, VoidReasonNoPrice
+	}
+	return v
+}
+
+func toTradeView(t *BinaryTrade) BinaryTradeView {
 	return BinaryTradeView{
 		ID:            t.ID.Hex(),
 		Reference:     t.Reference,
@@ -155,6 +219,8 @@ func ToTradeView(t *BinaryTrade) BinaryTradeView {
 		Status:           t.Status,
 		Result:           t.Result,
 		SettlementAmount: t.SettlementAmount,
+		OfferID:          t.OfferID,
+		DrawPolicy:       t.DrawPolicy,
 		IP:               t.IP,
 		SettledAt:        iso.Ptr(t.SettledAt),
 		CreatedAt:        iso.From(t.CreatedAt),

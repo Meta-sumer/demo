@@ -12,16 +12,46 @@ import (
 	"binarytrading/internal/platform/logx"
 )
 
-// Binance public trade stream - a real, authoritative market feed for crypto.
+// Binance public best bid/ask stream (@bookTicker) - a real, authoritative
+// market feed for crypto. No credentials are required for public market data.
 //
-// No credentials are required for public market data. Each message carries the
-// exchange's own event time, which is what the latency measurement in
-// marketdata compares against the server clock.
+// The pricing specification prices on the mid of a valid book (bid, ask), so
+// each tick carries the best bid and ask and its price is the mid. Binance
+// pushes a book update on every change of the best price or quantity - for
+// BTCUSDT many per second - so updates are coalesced: every flushInterval the
+// latest book of each symbol that changed is emitted, stamped with the time
+// it arrived. The spot @bookTicker payload has no event time, so the server's
+// receipt time is the quote's timestamp. A book that has not changed is
+// re-emitted (at most every heartbeatInterval) only while the socket is
+// demonstrably alive - another update arrived within liveWindow - so an
+// unchanged market stays fresh but a stalled connection goes stale.
 const binanceBaseURL = "wss://stream.binance.com:9443/stream"
+
+// Coalescing of book updates (see the type comment).
+const (
+	binanceFlushInterval     = 50 * time.Millisecond
+	binanceHeartbeatInterval = 250 * time.Millisecond
+	binanceLiveWindow        = time.Second
+)
+
+type binanceBook struct {
+	bid, ask  float64
+	seq       int64
+	at        int64 // receipt time of the latest update, epoch ms
+	emittedAt int64
+	changed   bool
+}
 
 type Binance struct {
 	Base
 	ws *wsClient
+
+	bookMu    sync.Mutex
+	books     map[string]*binanceBook
+	lastMsgAt int64
+	flushOnce sync.Once
+	// now is the clock (tests replace it).
+	now func() int64
 
 	reqMu         sync.Mutex
 	nextRequestID int64
@@ -31,7 +61,8 @@ type Binance struct {
 }
 
 func NewBinance() *Binance {
-	b := &Binance{Base: Base{name: "binance"}, nextRequestID: 1}
+	b := &Binance{Base: Base{name: "binance"}, nextRequestID: 1, books: map[string]*binanceBook{},
+		now: func() int64 { return time.Now().UnixMilli() }}
 	b.ws = &wsClient{
 		base:          &b.Base,
 		url:           b.streamURL,
@@ -55,7 +86,7 @@ func (b *Binance) streamURL() string {
 	}
 	streams := make([]string, len(symbols))
 	for i, s := range symbols {
-		streams[i] = s + "@trade"
+		streams[i] = s + binanceStream
 	}
 	return binanceBaseURL + "?streams=" + strings.Join(streams, "/")
 }
@@ -74,7 +105,7 @@ func (b *Binance) opened() {
 	var missing []string
 	for _, s := range b.symbolList() {
 		if !inURL[s] {
-			missing = append(missing, s+"@trade")
+			missing = append(missing, s+binanceStream)
 		}
 	}
 	if len(missing) > 0 {
@@ -82,49 +113,115 @@ func (b *Binance) opened() {
 	}
 }
 
-type binanceTradeMessage struct {
-	Stream string `json:"stream"`
-	Data   *struct {
-		E  string          `json:"e"`
-		ET *float64        `json:"E"`
-		T  *float64        `json:"T"`
-		S  string          `json:"s"`
-		P  json.RawMessage `json:"p"`
-		ID *float64        `json:"t"`
-	} `json:"data"`
+// binanceStream is the per-symbol stream: best bid/ask.
+const binanceStream = "@bookTicker"
+
+// binanceBookMessage is a combined-stream @bookTicker message:
+// {"stream":"btcusdt@bookTicker","data":{"u":400900217,"s":"BTCUSDT","b":"...","B":"...","a":"...","A":"..."}}
+// The payload is read by exact key: encoding/json matches field names
+// case-insensitively, and "B"/"A" (quantities) would overwrite "b"/"a"
+// (prices).
+type binanceBookMessage struct {
+	Stream string                     `json:"stream"`
+	Data   map[string]json.RawMessage `json:"data"`
 }
 
 func (b *Binance) handleMessage(payload []byte) {
-	var m binanceTradeMessage
-	if err := json.Unmarshal(payload, &m); err != nil {
+	var m binanceBookMessage
+	if err := json.Unmarshal(payload, &m); err != nil || m.Data == nil {
 		return
 	}
-	d := m.Data
-	if d == nil || d.E != "trade" || d.S == "" || len(d.P) == 0 {
+	var symbol string
+	if raw, ok := m.Data["s"]; !ok || json.Unmarshal(raw, &symbol) != nil || symbol == "" {
 		return
 	}
-	price, ok := jsNumber(d.P)
-	if !ok {
-		// Number() of garbage is NaN; ingestion logs and discards it.
-		price = math.NaN()
+	rawBid, okB := m.Data["b"]
+	rawAsk, okA := m.Data["a"]
+	if !okB || !okA {
+		return
 	}
-	var ts int64
-	switch {
-	case d.T != nil:
-		ts = int64(*d.T)
-	case d.ET != nil:
-		ts = int64(*d.ET)
-	default:
-		ts = time.Now().UnixMilli()
+	bid, okB := jsNumber(rawBid)
+	ask, okA := jsNumber(rawAsk)
+	if !okB || !okA {
+		// Not a number: pass it on as NaN, so the normalisation rejects it
+		// (invalid book) and counts it.
+		bid, ask = math.NaN(), math.NaN()
 	}
-	tick := Tick{Symbol: strings.ToLower(d.S), Price: price, ProviderTimestamp: &ts}
-	if d.ID != nil {
-		tick.Sequence = ptr(int64(*d.ID))
+	var seq *float64
+	if raw, ok := m.Data["u"]; ok {
+		var u float64
+		if json.Unmarshal(raw, &u) == nil {
+			seq = &u
+		}
 	}
-	b.emitTick(tick)
+	d := struct {
+		U *float64
+		S string
+	}{seq, symbol}
+	now := b.now()
+	sym := strings.ToLower(d.S)
+	b.bookMu.Lock()
+	b.lastMsgAt = now
+	bk := b.books[sym]
+	if bk == nil {
+		bk = &binanceBook{}
+		b.books[sym] = bk
+	}
+	if d.U != nil {
+		bk.seq = int64(*d.U)
+	}
+	bk.bid, bk.ask, bk.at, bk.changed = bid, ask, now, true
+	b.bookMu.Unlock()
+}
+
+// flush emits the coalesced books (see the type comment).
+func (b *Binance) flush() {
+	now := b.now()
+	var out []Tick
+	b.bookMu.Lock()
+	live := now-b.lastMsgAt <= binanceLiveWindow.Milliseconds()
+	for sym, bk := range b.books {
+		ts := bk.at
+		switch {
+		case bk.changed:
+		case live && now-bk.emittedAt >= binanceHeartbeatInterval.Milliseconds():
+			ts = now
+		default:
+			continue
+		}
+		// Strictly increasing per symbol (the ordering check rejects equal
+		// timestamps).
+		if ts <= bk.emittedAt {
+			ts = bk.emittedAt + 1
+		}
+		bk.changed, bk.emittedAt = false, ts
+		bid, ask := bk.bid, bk.ask
+		t := Tick{Symbol: sym, Price: (bid + ask) / 2, Bid: ptr(bid), Ask: ptr(ask), ProviderTimestamp: ptr(ts)}
+		if bk.seq > 0 {
+			t.Sequence = ptr(bk.seq)
+		}
+		out = append(out, t)
+	}
+	b.bookMu.Unlock()
+	for _, t := range out {
+		b.emitTick(t)
+	}
+}
+
+func (b *Binance) startFlusher() {
+	b.flushOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(binanceFlushInterval)
+			defer t.Stop()
+			for range t.C {
+				b.flush()
+			}
+		}()
+	})
 }
 
 func (b *Binance) Connect(context.Context) error {
+	b.startFlusher()
 	b.ws.connect()
 	return nil
 }
@@ -165,6 +262,11 @@ func (b *Binance) Unsubscribe(_ context.Context, symbols []string) error {
 		}
 	}
 	b.smu.Unlock()
+	b.bookMu.Lock()
+	for _, s := range removed {
+		delete(b.books, s)
+	}
+	b.bookMu.Unlock()
 	if len(removed) > 0 && b.ws.isOpen() {
 		b.send("UNSUBSCRIBE", withSuffix(removed))
 	}
@@ -174,7 +276,7 @@ func (b *Binance) Unsubscribe(_ context.Context, symbols []string) error {
 func withSuffix(symbols []string) []string {
 	out := make([]string, len(symbols))
 	for i, s := range symbols {
-		out[i] = s + "@trade"
+		out[i] = s + binanceStream
 	}
 	return out
 }

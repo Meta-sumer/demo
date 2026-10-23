@@ -2,6 +2,7 @@ package models
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -192,8 +193,13 @@ type UsdtDeposit struct {
 	LastWebhookAt     *time.Time `bson:"lastWebhookAt"`
 	LastRefreshedAt   *time.Time `bson:"lastRefreshedAt"`
 	LastUserRefreshAt *time.Time `bson:"lastUserRefreshAt"`
-	CreatedAt         time.Time  `bson:"createdAt"`
-	UpdatedAt         time.Time  `bson:"updatedAt"`
+	// When the provider reconciliation last compared it with BeeX.
+	LastReconciledAt *time.Time `bson:"lastReconciledAt"`
+	// Set when the invoice window passed while BeeX could not be reached and
+	// the deposit was closed as expired here (no money had arrived).
+	ExpiredLocallyAt *time.Time `bson:"expiredLocallyAt"`
+	CreatedAt        time.Time  `bson:"createdAt"`
+	UpdatedAt        time.Time  `bson:"updatedAt"`
 }
 
 func init() {
@@ -355,6 +361,9 @@ type UsdtWithdrawal struct {
 	// Ours: "withdrawal-<_id>", sent to BeeX as the payout reference on
 	// every attempt, so a retry can never create a second payout.
 	Reference string `bson:"reference"`
+	// The provider mode (live | test) the withdrawal was requested in. A live
+	// withdrawal may only spend USDT that live deposits brought in.
+	Mode *string `bson:"mode"`
 	// BeeX's system reference (OUT2026-...), once BeeX answered.
 	ProviderReference *string `bson:"providerReference"`
 	IdempotencyKey    string  `bson:"idempotencyKey"`
@@ -388,10 +397,48 @@ type UsdtWithdrawal struct {
 	ProviderError       *string        `bson:"providerError"`
 	LastWebhookAt       *time.Time     `bson:"lastWebhookAt"`
 	LastRefreshedAt     *time.Time     `bson:"lastRefreshedAt"`
+	LastReconciledAt    *time.Time     `bson:"lastReconciledAt"`
 	CompletedAt         *time.Time     `bson:"completedAt"`
 	WalletTransactionID *bson.ObjectID `bson:"walletTransactionId"`
 	CreatedAt           time.Time      `bson:"createdAt"`
 	UpdatedAt           time.Time      `bson:"updatedAt"`
+	// The last BeeX answer for this withdrawal that did not match it (amount,
+	// address, currency or reference) and was not applied; nil otherwise.
+	ProviderMismatch   *string    `bson:"providerMismatch,omitempty"`
+	ProviderMismatchAt *time.Time `bson:"providerMismatchAt,omitempty"`
+	// An operator's settlement of such a withdrawal after checking it with
+	// BeeX: WithdrawalResolutionCompleted or WithdrawalResolutionFailed.
+	Resolution     *string        `bson:"resolution,omitempty"`
+	ResolvedBy     *bson.ObjectID `bson:"resolvedBy,omitempty"`
+	ResolvedAt     *time.Time     `bson:"resolvedAt,omitempty"`
+	ResolutionNote *string        `bson:"resolutionNote,omitempty"`
+}
+
+// Operator resolutions of a withdrawal BeeX's answer did not match.
+const (
+	WithdrawalResolutionCompleted = "completed"
+	WithdrawalResolutionFailed    = "failed"
+)
+
+// WithdrawalProviderMismatchPrefix starts lastSubmitError when a submission
+// answer did not match (records written before providerMismatch existed).
+const WithdrawalProviderMismatchPrefix = "provider mismatch:"
+
+// WithdrawalOperatorResolvable: a withdrawal BeeX acknowledged whose answer
+// did not match it, which the automatic paths therefore cannot finish (no
+// resubmission, every refresh refused): an operator may settle or release
+// it after checking it with BeeX.
+func WithdrawalOperatorResolvable(w *UsdtWithdrawal) bool {
+	switch w.Status {
+	case WithdrawalRequested, WithdrawalAwaitingApproval, WithdrawalSending:
+	default:
+		return false
+	}
+	if w.SubmissionPending {
+		return false
+	}
+	return w.ProviderMismatch != nil ||
+		(w.LastSubmitError != nil && strings.HasPrefix(*w.LastSubmitError, WithdrawalProviderMismatchPrefix))
 }
 
 type UsdtWithdrawalView struct {
@@ -427,6 +474,7 @@ type UsdtWithdrawalAdminView struct {
 	UsdtWithdrawalView
 	UserID              string       `json:"userId"`
 	User                *UsdtUserRef `json:"user"`
+	Mode                *string      `json:"mode"`
 	ProviderStatus      *string      `json:"providerStatus"`
 	ReviewedBy          *string      `json:"reviewedBy"`
 	ReviewedAt          *iso.Time    `json:"reviewedAt"`
@@ -440,6 +488,15 @@ type UsdtWithdrawalAdminView struct {
 	LastWebhookAt       *iso.Time    `json:"lastWebhookAt"`
 	LastRefreshedAt     *iso.Time    `json:"lastRefreshedAt"`
 	WalletTransactionID *string      `json:"walletTransactionId"`
+	// Additions: a BeeX answer that did not match, and the operator's
+	// resolution of it.
+	ProviderMismatch   *string   `json:"providerMismatch"`
+	ProviderMismatchAt *iso.Time `json:"providerMismatchAt"`
+	OperatorResolvable bool      `json:"operatorResolvable"`
+	Resolution         *string   `json:"resolution"`
+	ResolvedBy         *string   `json:"resolvedBy"`
+	ResolvedAt         *iso.Time `json:"resolvedAt"`
+	ResolutionNote     *string   `json:"resolutionNote"`
 }
 
 func ToUsdtWithdrawalAdminView(w *UsdtWithdrawal, user *UsdtUserRef) UsdtWithdrawalAdminView {
@@ -447,6 +504,7 @@ func ToUsdtWithdrawalAdminView(w *UsdtWithdrawal, user *UsdtUserRef) UsdtWithdra
 		UsdtWithdrawalView: ToUsdtWithdrawalView(w),
 		UserID:             w.UserID.Hex(),
 		User:               user,
+		Mode:               w.Mode,
 		ProviderStatus:     w.ProviderStatus,
 		ReviewedAt:         iso.Ptr(w.ReviewedAt),
 		LockedAmount:       w.LockedAmount,
@@ -458,6 +516,18 @@ func ToUsdtWithdrawalAdminView(w *UsdtWithdrawal, user *UsdtUserRef) UsdtWithdra
 		ProviderError:      w.ProviderError,
 		LastWebhookAt:      iso.Ptr(w.LastWebhookAt),
 		LastRefreshedAt:    iso.Ptr(w.LastRefreshedAt),
+		ProviderMismatch:   w.ProviderMismatch,
+		ProviderMismatchAt: iso.Ptr(w.ProviderMismatchAt),
+		OperatorResolvable: WithdrawalOperatorResolvable(w),
+		Resolution:         w.Resolution,
+		ResolvedAt:         iso.Ptr(w.ResolvedAt),
+		ResolutionNote:     w.ResolutionNote,
+	}
+	if v.ProviderMismatch == nil && v.OperatorResolvable {
+		v.ProviderMismatch = w.LastSubmitError
+	}
+	if w.ResolvedBy != nil {
+		v.ResolvedBy = Str(w.ResolvedBy.Hex())
 	}
 	if w.ReviewedBy != nil {
 		v.ReviewedBy = Str(w.ReviewedBy.Hex())
