@@ -16,6 +16,10 @@ import clsx from 'clsx';
  *
  * `compact` drops the rail and the trade list for the phone frame, which is
  * what the real app does at that width too.
+ *
+ * Its figures are examples, not quotes: payouts move with the market, so the
+ * 78% here is only kept inside the range the pricing engine pays (the live
+ * figures are in the page's market list), on BTC/USD and ETH/USD.
  */
 export function WorkspaceMock({ compact = false }: { compact?: boolean }) {
   return (
@@ -57,7 +61,7 @@ function TopBar({ compact }: { compact: boolean }) {
       <span className="ml-1 flex items-center gap-1.5 rounded-md bg-[#1d1f23] px-2 py-1">
         <span className="h-1 w-1 rounded-full bg-up" />
         <span className="text-[8px] font-bold">BTC/USD</span>
-        <span className="text-[8px] font-bold text-brand">84%</span>
+        <span className="text-[8px] font-bold text-brand">78%</span>
       </span>
       {compact ? null : (
         <span className="flex items-center gap-1.5 rounded-md bg-[#1d1f23] px-2 py-1">
@@ -128,7 +132,7 @@ function Chart() {
       viewBox="0 0 400 168"
       className="h-full w-full"
       role="img"
-      aria-label="The trading chart with an open position"
+      aria-label="Illustration: the trading chart with an open position"
     >
       <rect width="400" height="168" fill="#1e2024" />
 
@@ -235,7 +239,7 @@ function Ticket({ compact }: { compact: boolean }) {
 
       <div className="flex items-baseline justify-between px-0.5">
         <span className="text-[7px] text-white/50">Earnings</span>
-        <span className="text-[8px] font-bold text-brand">+84% ₹920</span>
+        <span className="text-[8px] font-bold text-brand">+78% ₹890</span>
       </div>
 
       <div className="grid grid-cols-2 gap-1.5">

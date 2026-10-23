@@ -27,6 +27,7 @@ import (
 	healthapi "binarytrading/internal/api/health"
 	marketdataapi "binarytrading/internal/api/marketdata"
 	notificationsapi "binarytrading/internal/api/notifications"
+	publicapi "binarytrading/internal/api/public"
 	riskapi "binarytrading/internal/api/risk"
 	supportapi "binarytrading/internal/api/support"
 	transfersapi "binarytrading/internal/api/transfers"
@@ -77,6 +78,8 @@ func newRouter() http.Handler {
 	r.Use(httpx.Recoverer, httpx.RequestContext, httpx.SecurityHeaders, httpx.CORS, httpx.BodyLimit)
 
 	healthapi.Mount(r)
+	// Read-only, no session: the signed-out landing page's market list.
+	r.Route("/public", publicapi.Mount)
 	r.Route("/auth", authapi.Mount)
 	r.Route("/users", usersapi.Mount)
 	r.Route("/assets", assetsapi.Mount)

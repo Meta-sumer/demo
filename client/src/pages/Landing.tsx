@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { NavLink } from 'react-router-dom';
 import clsx from 'clsx';
 import {
@@ -19,6 +19,8 @@ import {
 import { AuthPanel, type AuthTab } from '../features/auth/AuthPanel';
 import { Devices, Faq, Funding, ProductPreview } from '../features/landing/sections';
 import { AmountDuration } from '../features/landing/AmountDuration';
+import { expiryLabel, payoutText, tickerPayout, type LandingBoard } from '../features/landing/markets';
+import { useLandingBoard } from '../features/landing/useLandingBoard';
 
 /**
  * The page a signed-out visitor lands on.
@@ -27,24 +29,17 @@ import { AmountDuration } from '../features/landing/AmountDuration';
  * the artwork is built for a black page and a marketing site that inverted
  * under a visitor would read as broken, so the colours here are fixed.
  *
- * The second is that every figure on it is read off the platform - the seeded
- * instruments, their payout tables, the stake limits, the expiries those
- * tables are keyed by. Nothing is invented. A landing page is the one place
- * where a made-up number stops being decoration and becomes a claim to a
- * customer, so where a figure would have to be marketing rather than fact,
- * the section says what the platform does instead of how many people use it.
+ * The second is that every figure on it is read off the platform - the
+ * instruments the pricing engine offers and its live payouts (`GET
+ * /public/markets`, polled), the stake limits, the expiries. Nothing is
+ * invented. A landing page is the one place where a made-up number stops
+ * being decoration and becomes a claim to a customer, so where a figure would
+ * have to be marketing rather than fact, the section says what the platform
+ * does instead of how many people use it - and while the live payouts cannot
+ * be read, the page shows none rather than a stand-in.
  */
 
-/** Straight from the seeded payout tables, in percent by expiry seconds. */
-const MARKETS: Array<{ symbol: string; name: string; kind: string; payouts: Record<number, number> }> = [
-  { symbol: 'BTC/USD', name: 'Bitcoin', kind: 'Crypto', payouts: { 30: 82, 60: 84, 300: 87 } },
-  { symbol: 'ETH/USD', name: 'Ethereum', kind: 'Crypto', payouts: { 30: 80, 60: 83, 300: 86 } },
-  { symbol: 'EUR/USD', name: 'Euro', kind: 'Forex', payouts: { 30: 78, 60: 80, 300: 84 } },
-  { symbol: 'GBP/USD', name: 'Pound Sterling', kind: 'Forex', payouts: { 60: 79, 300: 83 } },
-  { symbol: 'XAU/USD', name: 'Gold', kind: 'Metals', payouts: { 60: 77, 300: 81 } },
-];
-
-const BEST_PAYOUT = Math.max(...MARKETS.flatMap((m) => Object.values(m.payouts)));
+type Board = LandingBoard & { loading: boolean };
 
 const CHIPS = ['Live streaming prices', 'Demo funded on sign-up', 'Expiries from 30 seconds', 'Close early'];
 
@@ -55,7 +50,7 @@ const STEPS = [
   },
   {
     title: 'Pick a market',
-    body: 'Choose an instrument, a stake from ₹100 and an expiry of 30 seconds, 1 minute or 5 minutes.',
+    body: 'Choose Bitcoin or Ethereum, a stake from ₹100 and an expiry from 30 seconds. The payout is shown before you commit.',
   },
   {
     title: 'Call the direction',
@@ -118,6 +113,7 @@ export function LandingPage() {
   const [authTab, setAuthTab] = useState<AuthTab | null>(null);
   const [navOpen, setNavOpen] = useState(false);
   const closeAuth = useCallback(() => setAuthTab(null), []);
+  const board = useLandingBoard();
 
   return (
     <div className="landing min-h-screen bg-black text-white antialiased">
@@ -131,12 +127,12 @@ export function LandingPage() {
       />
 
       <main>
-        <Hero onAuth={setAuthTab} />
-        <Ticker />
+        <Hero onAuth={setAuthTab} board={board} />
+        <Ticker board={board} />
         <Preview />
         <ChooseTrade />
-        <Highlights />
-        <Markets />
+        <Highlights board={board} />
+        <Markets board={board} />
         <Steps />
         <Platform />
         <AnyDevice />
@@ -246,7 +242,7 @@ function SiteNav({
 
 /* ----------------------------------------------------------------- hero -- */
 
-function Hero({ onAuth }: { onAuth: (tab: AuthTab) => void }) {
+function Hero({ onAuth, board }: { onAuth: (tab: AuthTab) => void; board: Board }) {
   return (
     <section className="relative flex min-h-[92vh] items-center overflow-hidden px-4 pt-28 sm:px-6">
       {/* All three are backdrop, so they are painted before the copy. The bars
@@ -257,7 +253,7 @@ function Hero({ onAuth }: { onAuth: (tab: AuthTab) => void }) {
 
       <div className="relative z-10 mx-auto w-full max-w-4xl text-center">
         <p className="animate-rise text-sm font-semibold text-white/50" style={{ animationDelay: '40ms' }}>
-          Fixed-return trading on crypto, forex and gold
+          Fixed-return trading on Bitcoin and Ethereum
         </p>
 
         {/* The shadow costs nothing on a black page and is what keeps the
@@ -275,8 +271,15 @@ function Hero({ onAuth }: { onAuth: (tab: AuthTab) => void }) {
           className="animate-rise mx-auto mt-6 max-w-xl text-base leading-relaxed text-white/55 sm:text-lg"
           style={{ animationDelay: '200ms' }}
         >
-          Pick a direction and an expiry from 30 seconds. You know the payout before you commit — up to{' '}
-          <span style={{ color: 'rgb(var(--landing-accent))' }}>{BEST_PAYOUT}%</span>.
+          Pick a direction and an expiry from 30 seconds. Payouts move with the market, and you see yours before
+          you commit
+          {board.best !== null ? (
+            <>
+              {' '}— up to <span style={{ color: 'rgb(var(--landing-accent))' }}>{payoutText(board.best)}</span>{' '}
+              right now
+            </>
+          ) : null}
+          .
         </p>
 
         <div
@@ -516,11 +519,16 @@ function Backdrop() {
  * The instrument strip.
  *
  * A signed-out visitor cannot be shown live quotes - the price feed is behind
- * authentication - so this carries the one thing that is both public and
- * decided in advance: the payout each instrument pays at one minute.
+ * authentication - so this carries what the public board gives: each
+ * instrument's current payout at one minute, and no figure while there is
+ * none to read.
  */
-function Ticker() {
-  const row = [...MARKETS, ...MARKETS];
+function Ticker({ board }: { board: Board }) {
+  // Repeated so the strip is as long as the five-instrument one was and the
+  // loop never shows a gap on a wide screen; an even number of runs, because
+  // one loop moves the strip by half its length.
+  const runs = Math.ceil(10 / Math.max(1, board.markets.length));
+  const row = Array.from({ length: runs + (runs % 2) }, () => board.markets).flat();
   return (
     <section className="relative border-y border-white/10 py-5">
       <div className="flex overflow-hidden [mask-image:linear-gradient(to_right,transparent,#000_12%,#000_88%,transparent)]">
@@ -528,9 +536,7 @@ function Ticker() {
           {row.map((market, index) => (
             <span key={market.symbol + index} className="flex shrink-0 items-center gap-3 whitespace-nowrap">
               <span className="text-sm font-bold text-white/80">{market.symbol}</span>
-              <span className="text-sm font-bold tnum" style={{ color: 'rgb(var(--landing-accent))' }}>
-                {market.payouts[60] ?? market.payouts[300]}%
-              </span>
+              <TickerPayout percent={tickerPayout(market)} />
               <span className="text-xs text-white/35">{market.kind}</span>
             </span>
           ))}
@@ -539,15 +545,23 @@ function Ticker() {
           {row.map((market, index) => (
             <span key={market.symbol + index} className="flex shrink-0 items-center gap-3 whitespace-nowrap">
               <span className="text-sm font-bold text-white/80">{market.symbol}</span>
-              <span className="text-sm font-bold tnum" style={{ color: 'rgb(var(--landing-accent))' }}>
-                {market.payouts[60] ?? market.payouts[300]}%
-              </span>
+              <TickerPayout percent={tickerPayout(market)} />
               <span className="text-xs text-white/35">{market.kind}</span>
             </span>
           ))}
         </div>
       </div>
     </section>
+  );
+}
+
+/** Nothing at all when there is no live figure: the symbol stands on its own. */
+function TickerPayout({ percent }: { percent: number | undefined }) {
+  if (percent === undefined) return null;
+  return (
+    <span className="text-sm font-bold tnum" style={{ color: 'rgb(var(--landing-accent))' }}>
+      {payoutText(percent)}
+    </span>
   );
 }
 
@@ -631,7 +645,7 @@ function Questions() {
 
 /* ----------------------------------------------------------- highlights -- */
 
-function Highlights() {
+function Highlights({ board }: { board: Board }) {
   return (
     <Section id="highlights" title="Everything you need to place a trade" lead="">
       <div className="grid gap-4 md:grid-cols-2">
@@ -641,7 +655,12 @@ function Highlights() {
         <Card title="Expiries from 30 seconds" sub="30 seconds, 1 minute or 5 minutes">
           <ClockArt />
         </Card>
-        <Card title={'Payouts up to ' + BEST_PAYOUT + '%'} sub="Fixed before you commit, for the whole trade">
+        <Card
+          title={
+            board.best !== null ? 'Payouts up to ' + payoutText(board.best) + ' right now' : 'Payout shown up front'
+          }
+          sub="Moves with the market, locked once your trade is accepted"
+        >
           <ChartArt />
         </Card>
         <Card title="Your entry never moves" sub="Frozen the moment the order lands">
@@ -805,26 +824,30 @@ function OrderArt() {
 
 /* -------------------------------------------------------------- markets -- */
 
-function Markets() {
+function Markets({ board }: { board: Board }) {
+  // One column per expiry the engine offers, however many that is.
+  const columns = { '--landing-cols': board.expiries.length } as CSSProperties;
   return (
     <Section
       id="markets"
-      title="Five instruments, one rate card"
-      lead="The return is fixed before you commit and does not move while your position is open. Longer expiries pay more."
+      title="Bitcoin and Ethereum, priced live"
+      lead="Payouts move with the market and differ by expiry. The figure for your trade is on the ticket before you commit, and it does not change once your trade is accepted."
     >
       <Reveal>
-        <div className="landing-card p-2 hover:translate-y-0">
-          <div className="hidden grid-cols-[1.4fr_repeat(3,1fr)] gap-4 px-5 py-3 text-[11px] font-bold uppercase tracking-wider text-white/35 sm:grid">
+        <div className="landing-card p-2 hover:translate-y-0" style={columns}>
+          <div className="hidden grid-cols-[1.4fr_repeat(var(--landing-cols),1fr)] gap-4 px-5 py-3 text-[11px] font-bold uppercase tracking-wider text-white/35 sm:grid">
             <span>Instrument</span>
-            <span className="text-right">30 sec</span>
-            <span className="text-right">1 min</span>
-            <span className="text-right">5 min</span>
+            {board.expiries.map((expiry) => (
+              <span key={expiry} className="text-right">
+                {expiryLabel(expiry)}
+              </span>
+            ))}
           </div>
 
-          {MARKETS.map((market) => (
+          {board.markets.map((market) => (
             <div
               key={market.symbol}
-              className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-2xl px-5 py-4 transition hover:bg-white/[0.04] sm:grid-cols-[1.4fr_repeat(3,1fr)] sm:items-center sm:gap-4"
+              className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-2xl px-5 py-4 transition hover:bg-white/[0.04] sm:grid-cols-[1.4fr_repeat(var(--landing-cols),1fr)] sm:items-center sm:gap-4"
             >
               <div className="col-span-2 flex items-center gap-3 sm:col-span-1">
                 <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white/[0.07] text-[10px] font-black text-white/60">
@@ -838,7 +861,7 @@ function Markets() {
                 </span>
               </div>
 
-              {[30, 60, 300].map((expiry) => (
+              {board.expiries.map((expiry) => (
                 <Payout key={expiry} expiry={expiry} percent={market.payouts[expiry]} />
               ))}
             </div>
@@ -847,22 +870,27 @@ function Markets() {
       </Reveal>
 
       <p className="mt-4 text-xs text-white/35">
-        Rates shown are the platform defaults. A dash means that expiry is not offered on that instrument.
+        {board.best !== null
+          ? 'Live indicative payouts from the pricing engine, refreshed every few seconds: at each expiry, the lower of the UP and DOWN figures. A dash means that expiry cannot be priced right now.'
+          : board.loading
+            ? 'Reading the live payouts…'
+            : 'Live payouts cannot be shown right now. The trade ticket shows yours before you commit.'}
       </p>
     </Section>
   );
 }
 
 function Payout({ expiry, percent }: { expiry: number; percent: number | undefined }) {
-  const label = expiry === 30 ? '30 sec' : expiry === 60 ? '1 min' : '5 min';
   return (
     <span className="flex items-baseline justify-between gap-2 sm:block sm:text-right">
-      <span className="text-[11px] font-semibold uppercase tracking-wide text-white/35 sm:hidden">{label}</span>
+      <span className="text-[11px] font-semibold uppercase tracking-wide text-white/35 sm:hidden">
+        {expiryLabel(expiry)}
+      </span>
       <span
         className="text-sm font-bold tnum"
         style={{ color: percent ? 'rgb(var(--landing-accent))' : 'rgba(255,255,255,0.3)' }}
       >
-        {percent ? percent + '%' : '—'}
+        {percent ? payoutText(percent) : '—'}
       </span>
     </span>
   );
@@ -1000,7 +1028,7 @@ function SiteFooter() {
               <span className="text-lg font-black tracking-tight">BINARY</span>
             </div>
             <p className="mt-4 max-w-sm text-sm leading-relaxed text-white/40">
-              Fixed-return trading on crypto, forex and gold, with expiries from 30 seconds.
+              Fixed-return trading on Bitcoin and Ethereum, with expiries from 30 seconds.
             </p>
           </div>
 

@@ -5,7 +5,7 @@ where the admin console mirrors it:
 
 - **Web**: `client/src`, React + Vite + Tailwind, chart on `lightweight-charts`.
 - **Mobile**: `mobile/src`, Expo SDK 54 / React Native 0.81 / expo-router 6 / NativeWind 4, chart on
-  Skia + Reanimated, app version 1.0.3 (`mobile/app.json`). It is a port of the web client; the port
+  Skia + Reanimated, app version 1.0.4 (`mobile/app.json`). It is a port of the web client; the port
   contract lives in `mobile/PORTING.md` and the run/build notes in `mobile/README.md`.
 - **Admin console**: `admin/src` (section 11 covers only the parts that show what the apps show).
 
@@ -139,6 +139,8 @@ Two start-up measures for a slow or flaky first request:
 
 - `assets.list()` = `GET /assets` passed through `offerableAssets` (1.6); `assets.get(id)` is not
   filtered.
+- `public.markets()` = `GET /public/markets`, the one call that needs no session: the signed-out
+  landing page's market list and live payouts (1.7).
 - `trades.entryQuote({ assetId, expirySeconds, amount?, accountType? })` = `GET /binary/quotes`:
   one offer per direction (section 4.2).
 - `trades.create(input, idempotencyKey)` = `POST /binary/trades` with header `idempotency-key`;
@@ -164,6 +166,7 @@ Two start-up measures for a slow or flaky first request:
 |---|---|
 | `['assets']` | asset catalogue; refetched every 4 s on the trade and markets screens (`pages/Trade.tsx`, `pages/Markets.tsx`; mobile `TradeScreen.tsx`, and `MarketsScreen.tsx` while focused); also read by `useDrawPolicy` (`staleTime 60_000`) |
 | `['entry-quote', assetId, expirySeconds, stake, account]` | the ticket's live offers, refetched every second (4.2) |
+| `['public', 'markets']` | the landing page's market list (1.7), refetched every 12 s (mobile: while the welcome screen is in front) |
 | `['wallet', 'accounts']` (`ACCOUNTS_KEY`) | both INR balances; any `['wallet']` invalidation reaches it |
 | `['wallet', 'transactions', {...}]` | ledger pages |
 | `['trades', 'open']` | open trades (nav count + trade screen) |
@@ -203,6 +206,46 @@ The server applies the same scope independently: the pricing engine refuses an u
 with `NOT_PRICED` (`service/pricing/service.go`), so it cannot be quoted or traded, and
 `APPLY_LAUNCH_SCOPE=true` switches EUR/USD, GBP/USD and XAU/USD off
 (`service/assets/launchscope.go`); the app-side filter only keeps them off the screen.
+
+### 1.7 Landing page market list
+
+The signed-out landing page (web `pages/Landing.tsx`, mobile `features/landing/LandingScreen.tsx`)
+has no session, so it cannot read `GET /assets`. It reads `GET /public/markets`
+(`server-go/internal/api/public/routes.go`, `service/pricing/public.go`), which needs none:
+
+```json
+{ "markets": [ { "symbol": "BTC/USD", "name": "Bitcoin / US Dollar", "category": "CRYPTO",
+                 "payouts": [ { "expirySeconds": 30, "payoutPercent": 76.5 },
+                              { "expirySeconds": 60, "payoutPercent": 78 } ],
+                 "minPayoutPercent": 76.5, "maxPayoutPercent": 78 } ],
+  "minPayoutPercent": 76.5, "maxPayoutPercent": 78, "payoutBasis": "LOWER_OF_UP_AND_DOWN",
+  "generatedAt": "2026-10-23T10:15:02.123Z", "maxAgeSeconds": 5 }
+```
+
+Only active instruments the engine can price are listed (the same `SymbolPriced` rule as 1.6), and
+per expiry the catalogue's own indicative figure: the lower of UP and DOWN at the reference stake on
+the LIVE book (`CustomerPayouts`). An instrument with nothing priceable right now (a halt, a feed
+outage) is listed with `payouts: []` and null min/max. No ids, stakes, exposure, per-direction
+figures or reasons. The server rebuilds one snapshot at most every 5 s from the cached indicative
+board (`Cache-Control: public, max-age=5`) and limits each address to 300 requests a minute.
+
+`features/landing/useLandingBoard.ts` polls it every 12 s (`LANDING_REFRESH_MS`; mobile only while
+the screen is focused) under the key `['public', 'markets']`, and `features/landing/markets.ts`
+`landingBoard` turns it into rows (short name, kind, percent by expiry), the expiry columns (the
+union of offered expiries) and `best` (the highest figure). The page shows:
+
+- **Live**: the table, the ticker (each instrument's 1-minute figure, else its shortest expiry), "up
+  to NN% right now" in the hero and the highlights card. `payoutText` rounds down to one decimal, so
+  the page never shows more than the engine quoted.
+- **Loading, failed, or no figure at all**: `LAUNCH_MARKETS` (BTC/USD, ETH/USD) or the listed
+  instruments with dashes, the ticker without percentages, the hero without "up to", and a note that
+  live payouts cannot be shown right now. No fallback percentage exists anywhere in the page. A
+  failed refresh hides figures that were already on the page until the next success.
+
+The workspace illustrations (`WorkspaceMock.tsx`) are labelled as illustrations and use example
+figures inside the live range (78% on BTC/USD). Test: `client|mobile/tests/landing-markets.test.ts`
+(`markets.ts` is the same file in both apps); server: `internal/api/public/routes_test.go`,
+`internal/service/pricing/public_test.go`.
 
 ---
 
@@ -1237,7 +1280,7 @@ Layout and platform differences:
 
 **Test setup.** Both apps run vitest over pure-logic suites (`client/tests/*.test.ts`,
 `mobile/tests/*.test.ts`; shared suite names: active-trades, asset-list, auth-schemas, chart-colors,
-chart-geometry, csv, day-groups, duration-row, indicators, live-payout, live-result, redraw,
+chart-geometry, csv, day-groups, duration-row, indicators, landing-markets, live-payout, live-result, redraw,
 store-selectors, text-search, theme-contrast, time, trade-ticket, trade-window, usdt-model,
 usdt-money, void-and-scope; mobile adds drawings-history and time-sheet). `mobile/vitest.config.ts`
 runs in `node` and aliases native packages to in-memory stand-ins under `mobile/tests/mocks/`:
@@ -1347,6 +1390,7 @@ storage or the random-id source.
 | Live feeds, connection, open trades, trading wallet | `client/src/features/trade/use{LiveFeeds,ConnectionState,ActiveTrades,TradingWallet}.ts` | same paths | same (`useLiveFeeds`: platform) |
 | Stores | `client/src/stores/*.ts` | `mobile/src/stores/*.ts` (+ `storage.ts`) | logic same except `marketStore.applyTicks` and drawing undo/redo; storage/theme differ |
 | Catalogue, launch scope, list rules | `client/src/components/assetList.ts` | same | same |
+| Landing market list | `client/src/features/landing/{markets.ts,useLandingBoard.ts}`, `client/src/pages/Landing.tsx` | `mobile/src/features/landing/{markets.ts,useLandingBoard.ts}`, `LandingScreen.tsx` | `markets.ts`, `useLandingBoard.ts` same |
 | Ticket rules | `client/src/features/trade/ticketModel.ts`, `ticketStore.ts` | same | `ticketStore` same; `ticketModel` + `durationWords`/`expiryGroups` |
 | Live offers | `client/src/features/trade/livePayout.ts` | same | same |
 | Ticket component | `client/src/features/trade/TradeTicket.tsx`, `ContractInfo.tsx`, `ConfirmTradeSheet.tsx`, `DurationSheet.tsx` | `mobile/src/features/trade/TradeTicket.tsx`, `AmountSheet.tsx`, `TimeSheet.tsx`, ... | no |

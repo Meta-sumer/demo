@@ -15,6 +15,7 @@ import type {
   Paginated,
   PaymentMethod,
   PayoutDestination,
+  PublicMarkets,
   Trade,
   TradeSummary,
   Tick,
@@ -68,6 +69,11 @@ export const api = {
     // Unpriced instruments are never offered (components/assetList).
     list: () => apiGet<Asset[]>('/assets').then(offerableAssets),
     get: (id: string) => apiGet<Asset>('/assets/' + id),
+  },
+
+  /** Needs no session: the signed-out landing page's market list and live payouts. */
+  public: {
+    markets: () => apiGet<PublicMarkets>('/public/markets'),
   },
 
   market: {

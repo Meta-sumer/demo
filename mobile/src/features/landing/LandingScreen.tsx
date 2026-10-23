@@ -40,6 +40,8 @@ import { AuthPanel, type AuthTab } from '../auth/AuthPanel';
 import { Devices, Faq, Funding, ProductPreview } from './sections';
 import { AmountDuration } from './AmountDuration';
 import { Backdrop, ChartArt, ClockArt, CoinArt, HeroPortrait, OrderArt, RisingBars } from './artwork';
+import { expiryLabel, payoutText, tickerPayout, type LandingBoard } from './markets';
+import { useLandingBoard } from './useLandingBoard';
 import {
   BrandMark,
   LandingCard,
@@ -60,24 +62,18 @@ import {
  * the artwork is built for a black page and a marketing screen that inverted
  * under a visitor would read as broken, so the colours here are fixed.
  *
- * The second is that every figure on it is read off the platform - the seeded
- * instruments, their payout tables, the stake limits, the expiries those
- * tables are keyed by. Nothing is invented. A landing page is the one place
- * where a made-up number stops being decoration and becomes a claim to a
- * customer, so where a figure would have to be marketing rather than fact,
- * the section says what the platform does instead of how many people use it.
+ * The second is that every figure on it is read off the platform - the
+ * instruments the pricing engine offers and its live payouts (`GET
+ * /public/markets`, polled while the screen is in front), the stake limits,
+ * the expiries. Nothing is invented. A landing page is the one place where a
+ * made-up number stops being decoration and becomes a claim to a customer,
+ * so where a figure would have to be marketing rather than fact, the section
+ * says what the platform does instead of how many people use it - and while
+ * the live payouts cannot be read, the screen shows none rather than a
+ * stand-in.
  */
 
-/** Straight from the seeded payout tables, in percent by expiry seconds. */
-const MARKETS: Array<{ symbol: string; name: string; kind: string; payouts: Record<number, number> }> = [
-  { symbol: 'BTC/USD', name: 'Bitcoin', kind: 'Crypto', payouts: { 30: 82, 60: 84, 300: 87 } },
-  { symbol: 'ETH/USD', name: 'Ethereum', kind: 'Crypto', payouts: { 30: 80, 60: 83, 300: 86 } },
-  { symbol: 'EUR/USD', name: 'Euro', kind: 'Forex', payouts: { 30: 78, 60: 80, 300: 84 } },
-  { symbol: 'GBP/USD', name: 'Pound Sterling', kind: 'Forex', payouts: { 60: 79, 300: 83 } },
-  { symbol: 'XAU/USD', name: 'Gold', kind: 'Metals', payouts: { 60: 77, 300: 81 } },
-];
-
-const BEST_PAYOUT = Math.max(...MARKETS.flatMap((m) => Object.values(m.payouts)));
+type Board = LandingBoard & { loading: boolean };
 
 const CHIPS = ['Live streaming prices', 'Demo funded on sign-up', 'Expiries from 30 seconds', 'Close early'];
 
@@ -88,7 +84,7 @@ const STEPS = [
   },
   {
     title: 'Pick a market',
-    body: 'Choose an instrument, a stake from ₹100 and an expiry of 30 seconds, 1 minute or 5 minutes.',
+    body: 'Choose Bitcoin or Ethereum, a stake from ₹100 and an expiry from 30 seconds. The payout is shown before you commit.',
   },
   {
     title: 'Call the direction',
@@ -169,6 +165,7 @@ export function LandingScreen() {
   const focused = useScreenFocused();
   const reduced = useReducedMotion();
   const insets = useSafeAreaInsets();
+  const board = useLandingBoard(focused);
 
   const scrollRef = useAnimatedRef<Animated.ScrollView>();
   const scrollY = useSharedValue(0);
@@ -207,12 +204,12 @@ export function LandingScreen() {
           showsVerticalScrollIndicator={false}
           contentContainerStyle={{ paddingBottom: insets.bottom }}
         >
-          <Hero onAuth={openAuth} onLearnMore={() => goTo('how')} />
-          <Ticker />
+          <Hero onAuth={openAuth} onLearnMore={() => goTo('how')} board={board} />
+          <Ticker board={board} />
           <Preview onLayout={anchor('preview')} />
           <ChooseTrade />
-          <Highlights />
-          <Markets onLayout={anchor('markets')} />
+          <Highlights board={board} />
+          <Markets onLayout={anchor('markets')} board={board} />
           <Steps onLayout={anchor('how')} />
           <Platform />
           <AnyDevice />
@@ -344,7 +341,15 @@ function SiteNav({
 
 /* ----------------------------------------------------------------- hero -- */
 
-function Hero({ onAuth, onLearnMore }: { onAuth: (tab: AuthTab) => void; onLearnMore: () => void }) {
+function Hero({
+  onAuth,
+  onLearnMore,
+  board,
+}: {
+  onAuth: (tab: AuthTab) => void;
+  onLearnMore: () => void;
+  board: Board;
+}) {
   const insets = useSafeAreaInsets();
   const { height } = useWindowDimensions();
   const reduced = useReducedMotion();
@@ -363,7 +368,7 @@ function Hero({ onAuth, onLearnMore }: { onAuth: (tab: AuthTab) => void; onLearn
       <View className="w-full items-center">
         <Animated.View entering={rise(40)}>
           <Text className="text-center text-sm font-semibold text-white/50">
-            Fixed-return trading on crypto, forex and gold
+            Fixed-return trading on Bitcoin and Ethereum
           </Text>
         </Animated.View>
 
@@ -381,8 +386,15 @@ function Hero({ onAuth, onLearnMore }: { onAuth: (tab: AuthTab) => void; onLearn
 
         <Animated.View entering={rise(200)} className="mt-6 max-w-xl">
           <Text className="text-center text-base leading-[26px] text-white/55">
-            Pick a direction and an expiry from 30 seconds. You know the payout before you commit — up to{' '}
-            <Text className="text-base leading-[26px] text-[#f6d84a]">{BEST_PAYOUT}%</Text>.
+            Pick a direction and an expiry from 30 seconds. Payouts move with the market, and you see yours before
+            you commit
+            {board.best !== null ? (
+              <>
+                {' '}— up to <Text className="text-base leading-[26px] text-[#f6d84a]">{payoutText(board.best)}</Text>{' '}
+                right now
+              </>
+            ) : null}
+            .
           </Text>
         </Animated.View>
 
@@ -423,14 +435,15 @@ function Hero({ onAuth, onLearnMore }: { onAuth: (tab: AuthTab) => void; onLearn
  * The instrument strip.
  *
  * A signed-out visitor cannot be shown live quotes - the price feed is behind
- * authentication - so this carries the one thing that is both public and
- * decided in advance: the payout each instrument pays at one minute.
+ * authentication - so this carries what the public board gives: each
+ * instrument's current payout at one minute, and no figure while there is
+ * none to read.
  *
  * The strip sits in a scroll view that does not scroll, so the row keeps its
  * full width instead of being squeezed to the screen's; it is moved by half
  * its length per loop, which is exactly one run of the instruments.
  */
-function Ticker() {
+function Ticker({ board }: { board: Board }) {
   const motion = useLandingMotion();
   const [copyWidth, setCopyWidth] = useState(0);
   const x = useSharedValue(0);
@@ -448,7 +461,11 @@ function Ticker() {
   }, [motion, copyWidth, x]);
 
   const style = useAnimatedStyle(() => ({ transform: [{ translateX: x.value }] }));
-  const row = [...MARKETS, ...MARKETS];
+  // Repeated so the strip is as long as the five-instrument one was and the
+  // loop never shows a gap; an even number of runs, because one loop moves
+  // the strip by half its length.
+  const runs = Math.ceil(10 / Math.max(1, board.markets.length));
+  const row = Array.from({ length: runs + (runs % 2) }, () => board.markets).flat();
 
   return (
     <View className="relative border-y border-white/10 py-5">
@@ -470,9 +487,7 @@ function Ticker() {
               {row.map((market, index) => (
                 <View key={market.symbol + index} className="flex-row items-center gap-3">
                   <Text className="text-sm font-bold text-white/80">{market.symbol}</Text>
-                  <Text className="text-sm font-bold text-[#f6d84a] tnum">
-                    {(market.payouts[60] ?? market.payouts[300]) + '%'}
-                  </Text>
+                  <TickerPayout percent={tickerPayout(market)} />
                   <Text className="text-xs text-white/35">{market.kind}</Text>
                 </View>
               ))}
@@ -490,6 +505,12 @@ function Ticker() {
       />
     </View>
   );
+}
+
+/** Nothing at all when there is no live figure: the symbol stands on its own. */
+function TickerPayout({ percent }: { percent: number | undefined }) {
+  if (percent === undefined) return null;
+  return <Text className="text-sm font-bold text-[#f6d84a] tnum">{payoutText(percent)}</Text>;
 }
 
 /* -------------------------------------------------- product and devices -- */
@@ -565,7 +586,7 @@ function Questions({ onLayout }: { onLayout: (event: LayoutChangeEvent) => void 
 
 /* ----------------------------------------------------------- highlights -- */
 
-function Highlights() {
+function Highlights({ board }: { board: Board }) {
   return (
     <Section title="Everything you need to place a trade" lead="">
       <View className="gap-4">
@@ -575,7 +596,12 @@ function Highlights() {
         <Card title="Expiries from 30 seconds" sub="30 seconds, 1 minute or 5 minutes">
           <ClockArt />
         </Card>
-        <Card title={'Payouts up to ' + BEST_PAYOUT + '%'} sub="Fixed before you commit, for the whole trade">
+        <Card
+          title={
+            board.best !== null ? 'Payouts up to ' + payoutText(board.best) + ' right now' : 'Payout shown up front'
+          }
+          sub="Moves with the market, locked once your trade is accepted"
+        >
           <ChartArt />
         </Card>
         <Card title="Your entry never moves" sub="Frozen the moment the order lands">
@@ -600,16 +626,16 @@ function Card({ title, sub, children }: { title: string; sub: string; children: 
 
 /* -------------------------------------------------------------- markets -- */
 
-function Markets({ onLayout }: { onLayout: (event: LayoutChangeEvent) => void }) {
+function Markets({ onLayout, board }: { onLayout: (event: LayoutChangeEvent) => void; board: Board }) {
   return (
     <Section
       onLayout={onLayout}
-      title="Five instruments, one rate card"
-      lead="The return is fixed before you commit and does not move while your position is open. Longer expiries pay more."
+      title="Bitcoin and Ethereum, priced live"
+      lead="Payouts move with the market and differ by expiry. The figure for your trade is on the ticket before you commit, and it does not change once your trade is accepted."
     >
       <Reveal>
         <LandingCard className="p-2">
-          {MARKETS.map((market) => (
+          {board.markets.map((market) => (
             <View key={market.symbol} className="rounded-2xl px-5 py-4">
               <View className="flex-row items-center gap-3">
                 <View className="h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white/[0.07]">
@@ -626,7 +652,7 @@ function Markets({ onLayout }: { onLayout: (event: LayoutChangeEvent) => void })
               </View>
 
               <View className="-mx-2 mt-1 flex-row flex-wrap">
-                {[30, 60, 300].map((expiry) => (
+                {board.expiries.map((expiry) => (
                   <View key={expiry} className="w-1/2 px-2 py-1">
                     <Payout expiry={expiry} percent={market.payouts[expiry]} />
                   </View>
@@ -638,19 +664,22 @@ function Markets({ onLayout }: { onLayout: (event: LayoutChangeEvent) => void })
       </Reveal>
 
       <Text className="mt-4 text-xs text-white/35">
-        Rates shown are the platform defaults. A dash means that expiry is not offered on that instrument.
+        {board.best !== null
+          ? 'Live indicative payouts from the pricing engine, refreshed every few seconds: at each expiry, the lower of the UP and DOWN figures. A dash means that expiry cannot be priced right now.'
+          : board.loading
+            ? 'Reading the live payouts…'
+            : 'Live payouts cannot be shown right now. The trade ticket shows yours before you commit.'}
       </Text>
     </Section>
   );
 }
 
 function Payout({ expiry, percent }: { expiry: number; percent: number | undefined }) {
-  const label = expiry === 30 ? '30 sec' : expiry === 60 ? '1 min' : '5 min';
   return (
     <View className="flex-row items-baseline justify-between gap-2">
-      <Text className="text-[11px] font-semibold uppercase tracking-wide text-white/35">{label}</Text>
+      <Text className="text-[11px] font-semibold uppercase tracking-wide text-white/35">{expiryLabel(expiry)}</Text>
       <Text className={percent ? 'text-sm font-bold text-[#f6d84a] tnum' : 'text-sm font-bold text-white/30 tnum'}>
-        {percent ? percent + '%' : '—'}
+        {percent ? payoutText(percent) : '—'}
       </Text>
     </View>
   );
@@ -784,7 +813,7 @@ function SiteFooter({ onAnchor }: { onAnchor: (id: AnchorId) => void }) {
             <Text className="text-lg font-black tracking-tight text-white">BINARY</Text>
           </View>
           <Text className="mt-4 max-w-sm text-sm leading-[23px] text-white/40">
-            Fixed-return trading on crypto, forex and gold, with expiries from 30 seconds.
+            Fixed-return trading on Bitcoin and Ethereum, with expiries from 30 seconds.
           </Text>
         </View>
 

@@ -158,6 +158,40 @@ export interface AssetPricing {
   unavailable: { expirySeconds: number; reason: string; message: string }[];
 }
 
+/** One offered expiry on the public board: the lower of the UP and DOWN payouts, in percent. */
+export interface PublicPayout {
+  expirySeconds: number;
+  payoutPercent: number;
+}
+
+/** An instrument on the public board (no ids, no stake or exposure figures). */
+export interface PublicMarket {
+  symbol: string;
+  name: string;
+  category: string;
+  /** Shortest expiry first; empty while none can be priced (a halt, a feed outage). */
+  payouts: PublicPayout[];
+  minPayoutPercent: number | null;
+  maxPayoutPercent: number | null;
+}
+
+/**
+ * GET /public/markets, which needs no session: the active, priced instruments
+ * and the pricing engine's current indicative payout per expiry, from a
+ * snapshot the server rebuilds every few seconds. For the signed-out landing
+ * page.
+ */
+export interface PublicMarkets {
+  markets: PublicMarket[];
+  minPayoutPercent: number | null;
+  maxPayoutPercent: number | null;
+  /** 'LOWER_OF_UP_AND_DOWN' */
+  payoutBasis: string;
+  /** ISO time the snapshot was built. */
+  generatedAt: string;
+  maxAgeSeconds: number;
+}
+
 export interface FeedHealth {
   assetId: string;
   symbol: string;

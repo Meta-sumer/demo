@@ -24,13 +24,17 @@ import { cn } from '../../utils/cn';
  * It is a picture: it is laid out at a fixed size and scaled by `FitBox`, so
  * its type ignores the system font size, and a screen reader is given one
  * description of it rather than every label inside it.
+ *
+ * Its figures are examples, not quotes: payouts move with the market, so the
+ * 78% here is only kept inside the range the pricing engine pays (the live
+ * figures are in the screen's market list), on BTC/USD and ETH/USD.
  */
 export function WorkspaceMock({ compact = false }: { compact?: boolean }) {
   return (
     <View
       accessible
       accessibilityRole="image"
-      accessibilityLabel="The trading chart with an open position"
+      accessibilityLabel="Illustration: the trading chart with an open position"
       className="h-full w-full flex-col overflow-hidden bg-[#1d1f23]"
     >
       <View importantForAccessibility="no-hide-descendants" accessibilityElementsHidden className="flex-1">
@@ -81,7 +85,7 @@ function TopBar({ compact }: { compact: boolean }) {
       <View className="ml-1 flex-row items-center gap-1.5 rounded-md bg-[#1d1f23] px-2 py-1">
         <View className="h-1 w-1 rounded-full bg-up" />
         <M className="text-[8px] font-bold">BTC/USD</M>
-        <M className="text-[8px] font-bold text-brand">84%</M>
+        <M className="text-[8px] font-bold text-brand">78%</M>
       </View>
       {compact ? null : (
         <View className="flex-row items-center gap-1.5 rounded-md bg-[#1d1f23] px-2 py-1">
@@ -256,7 +260,7 @@ function Ticket({ compact }: { compact: boolean }) {
 
       <View className="flex-row items-baseline justify-between px-0.5">
         <M className="text-[7px] text-white/50">Earnings</M>
-        <M className="text-[8px] font-bold text-brand">+84% ₹920</M>
+        <M className="text-[8px] font-bold text-brand">+78% ₹890</M>
       </View>
 
       <View className="flex-row gap-1.5">

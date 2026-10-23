@@ -57,6 +57,9 @@ export function ProductPreview() {
             </View>
           ))}
         </View>
+        <Text className="mt-6 text-xs text-white/35">
+          An illustration: the figures in it are examples. Live payouts are on the ticket.
+        </Text>
       </View>
     </View>
   );
@@ -166,7 +169,7 @@ const FAQ: Array<{ q: string; a: string }> = [
   },
   {
     q: 'Which markets can I trade?',
-    a: 'Bitcoin and Ethereum against the US dollar, EUR/USD and GBP/USD, and gold. Each one has its own payout table, and longer expiries pay more than shorter ones.',
+    a: 'Bitcoin and Ethereum against the US dollar. Payouts are not a fixed table: they are priced live and move with the market and with the expiry you choose. The ticket shows the payout for each direction before you trade, and once your trade is accepted its payout is locked.',
   },
   {
     q: 'Do I need to install anything else?',

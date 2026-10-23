@@ -205,6 +205,19 @@ open positions also need an `ACTIVE` account (`RequireActiveUser`):
 Customers see only their own records; another customer's trade or transfer
 returns 404.
 
+### 4.1 Public routes (no session)
+
+These answer without a session and return no user data. Every one is rate
+limited per source address except `/health` and `/ready`.
+
+| Route | Guard | Code |
+|---|---|---|
+| `GET /health`, `GET /ready` | None. `/ready` reports store and feed state without reasons or ids | `api/health/routes.go` |
+| `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh` | `auth:register` (5/min per IP), `auth:login` (10/min per IP), `auth:refresh` (60/min per IP) | `api/auth/routes.go` |
+| `POST /admin/login`, `POST /admin/login/2fa*` | See 3.1 | `api/auth/routes.go` `MountAdminLogin` |
+| `POST /webhooks/beex/crypto` | HMAC signature over the exact body; `webhook:beex` (600/min per IP) | `api/usdt/webhook.go` |
+| `GET /public/markets` | Read-only; `public:markets` (300/min per IP). Returns only the active instruments the pricing engine can price (symbol, name, category), per expiry the engine's indicative payout (the lower of UP and DOWN), the min/max across them and `generatedAt`. No ids, stakes, exposure, per-direction figures, halt or refusal reasons. Served from a 5-second snapshot of the cached indicative board, so a request does no pricing work | `api/public/routes.go`, `service/pricing/public.go` |
+
 ## 5. Websocket channels (`platform/ws/hub.go` `canSubscribe`)
 
 | Channel | Who may subscribe |

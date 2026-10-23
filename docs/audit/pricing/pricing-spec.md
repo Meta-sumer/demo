@@ -655,6 +655,7 @@ DOWN (L(DOWN) negative) still quotes 76.5%. At util above 1 UP blocks.
 | `GET /binary/quotes` | New: per-direction offers (section 6.1). |
 | `POST /binary/trades` | New optional fields `offerId`, `displayedPayoutPercent`; trade view gains `offerId`. New errors `OFFER_INVALID`, `OFFER_EXPIRED` (409), `PAYOUT_CHANGED` (409), `PRICING_UNAVAILABLE` (503); `TRADING_HALTED`, `FEED_UNHEALTHY`, `PRICE_MOVED`, `EXPOSURE_LIMIT_EXCEEDED` reused. |
 | `GET /assets/:id` | `payouts[].payoutPercent` is now the engine's indicative payout for the reference stake (the lower of the two directions); new `pricing` object (mode, model version, expiries that cannot be priced and why, and `priced` / `notPricedReason`: whether the instrument can be priced at all - the apps do not offer an asset with `priced: false`). |
+| `GET /public/markets` | New, no session: the signed-out landing pages' market list. Active, priced instruments (symbol, name, category) and per offered expiry the same indicative payout as `GET /assets` (the lower of the two directions), with the min/max and `generatedAt`; nothing else (`service/pricing/public.go`, a 5 s snapshot of the board; 300/min per IP). |
 | `GET /admin/pricing` | Live board: every (asset, expiry), both directions, all components, guard, rule version; global and per-symbol halts; model and hedge estimator. `payouts:read`. |
 | `GET /admin/pricing/market`, `/models`, `/models/active` | Normaliser counters, volatility state and recent rejections; guard model versions. `payouts:read`. |
 | `POST /admin/pricing/halt`, `/resume` | Kill switch (section 5.3). `risk:write`, audited. |
@@ -761,7 +762,8 @@ Run from `server-go/` with `GOFLAGS=-p=1`; integration tests need MongoDB
 | `./internal/service/pricinghedge/` | `TestEstimatorMapsHedgingVerdicts`, `TestInstallWiresBothHooks`, `TestHedgeStateDrivesThePayout`, `TestHedgeSigmaIsThePricingVolatility` |
 | `./internal/service/binary/` | `TestOfferLifecycle`, `TestOfferAcceptedConcurrently`, `TestOfferExpiryAndSlippage`, `TestConfigChangeDuringAnOffer`, `TestKillSwitch`, `TestOldAppWithoutAnOffer`, `TestRefusals`, `TestExposureLimitPerSide`, `TestFixedModePaysThePayoutRow`, `TestHedgeOutageWidensOrRefuses`, `TestOneFreshnessRuleForQuotesAndAcceptance`, `TestPlatformRefusalOfAnOfferCarriesAFreshQuote`, `TestRedisFailureAfterTheInsertReturnsTheTrade`, `TestCloseEarlyRefusedWhileSymbolHalted` |
 | `./internal/service/settlement/` | the existing suite, unchanged, with the 2 s tolerance |
-| `client/`, `mobile/` | `tests/live-payout.test.ts` (offer selection, re-quote codes) |
+| `./internal/api/public/` | `TestPublicMarketsListsOnlyActivePricedAssetsWithoutASession` (and `TestPublicPayoutsAndRange` in `./internal/service/pricing/`) |
+| `client/`, `mobile/` | `tests/live-payout.test.ts` (offer selection, re-quote codes), `tests/landing-markets.test.ts` (landing market list, no figures without the server) |
 
 Spec §16 coverage: calm payout within bounds (`TestSpecWorkedExample`,
 `TestPayoutProperties`); outlier rejection and stale-feed blocking
