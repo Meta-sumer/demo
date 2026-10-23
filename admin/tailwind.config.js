@@ -39,6 +39,8 @@ export default {
           400: token('content-400'),
         },
         accent: { DEFAULT: token('accent'), soft: token('accent-soft'), solid: token('accent-solid') },
+        // Text drawn on the yellow fill (accent-solid) - near-black in every theme.
+        'on-accent': token('on-accent'),
         up: { DEFAULT: token('up'), soft: token('up-soft'), solid: token('up-solid') },
         down: { DEFAULT: token('down'), soft: token('down-soft'), solid: token('down-solid') },
         // Modal veil - dark in both themes, unlike every other surface.

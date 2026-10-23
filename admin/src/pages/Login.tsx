@@ -141,10 +141,10 @@ export function AdminLoginPage() {
   );
 
   return (
-    <div className="grid min-h-screen place-items-center bg-surface-950 px-4">
+    <div className="brand-backdrop grid min-h-screen place-items-center bg-surface-950 px-4">
       <div className="w-full max-w-sm">
         <div className="mb-6 flex items-center gap-3">
-          <span className="grid h-10 w-10 place-items-center rounded-xl bg-accent text-sm font-black text-white">
+          <span className="grid h-10 w-10 place-items-center rounded-xl bg-accent-solid text-sm font-black text-on-accent shadow-sm">
             BT
           </span>
           <div>

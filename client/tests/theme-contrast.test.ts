@@ -5,8 +5,9 @@ import { describe, expect, it } from 'vitest';
 /**
  * Theme contrast.
  *
- * The palette is defined once in index.css and read by both apps, so a colour
- * change that quietly breaks readability is easy to make and hard to see. This
+ * The palette is defined once in index.css (mobile/src/theme/tokens.ts mirrors
+ * it), so a colour change that quietly breaks readability is easy to make and
+ * hard to see. This
  * computes the real WCAG ratios from the stylesheet, so the guarantee is
  * checked rather than assumed.
  */
@@ -146,27 +147,33 @@ describe.each(THEMES)('%s theme', (_theme, palette) => {
 });
 
 /**
- * The two apps share one palette.
+ * The two apps share one brand.
  *
- * admin/src/index.css is composed from the same token blocks, so drift between
- * them would mean the console and the client slowly stopped looking like one
- * product. Comparing the raw declarations catches that immediately.
+ * The admin console keeps its own, deeper surface ramp for dense operations
+ * screens (checked in admin/tests/theme-contrast.test.ts), so the surfaces are
+ * not compared. The brand is: the brand mark in every theme, and the yellow
+ * fill of primary actions in the two dark themes. Drift there would mean the
+ * console and the client slowly stopped looking like one product.
  */
-describe('palette is shared with the admin console', () => {
+describe('brand is shared with the admin console', () => {
   const adminCss = readFileSync(path.resolve(__dirname, '../../admin/src/index.css'), 'utf8');
 
-  function declarations(source: string, startMarker: string): string[] {
+  function declaration(source: string, startMarker: string, name: string): string | undefined {
     const start = source.indexOf(startMarker);
     expect(start, 'token block not found: ' + startMarker).toBeGreaterThan(-1);
-    return [...source.slice(start, source.indexOf('}', start)).matchAll(/--([a-z0-9-]+):\s*([^;]+);/g)]
-      .map((match) => match[1] + ':' + match[2]!.trim())
-      .sort();
+    const block = source.slice(start, source.indexOf('}', start));
+    return block.match(new RegExp('--' + name + ':\\s*([^;]+);'))?.[1]?.trim();
   }
 
   it.each([[':root {'], [":root[data-theme='twilight'] {"], [":root[data-theme='light'] {"]])(
-    'matches for %s',
+    'uses the same brand mark for %s',
     (marker) => {
-      expect(declarations(adminCss, marker)).toEqual(declarations(css, marker));
+      expect(declaration(adminCss, marker, 'brand')).toBeDefined();
+      expect(declaration(adminCss, marker, 'brand')).toBe(declaration(css, marker, 'brand'));
     },
   );
+
+  it.each([[':root {'], [":root[data-theme='twilight'] {"]])('uses the same yellow fill for %s', (marker) => {
+    expect(declaration(adminCss, marker, 'accent-solid')).toBe(declaration(css, marker, 'accent-solid'));
+  });
 });

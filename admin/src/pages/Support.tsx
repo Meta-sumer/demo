@@ -100,7 +100,7 @@ export function SupportPage() {
             <Headset className="h-4 w-4 text-accent" />
             <h1 className="text-sm font-semibold text-content-100">Support inbox</h1>
             {listQuery.data?.unreadTotal ? (
-              <span className="ml-auto rounded-full bg-down px-2 py-0.5 text-[10px] font-bold text-white">
+              <span className="ml-auto rounded-full bg-down-solid px-2 py-0.5 text-[10px] font-bold text-white">
                 {listQuery.data.unreadTotal} unread
               </span>
             ) : null}
@@ -122,7 +122,7 @@ export function SupportPage() {
                 onClick={() => setFilter(f)}
                 className={clsx(
                   'rounded-md px-2.5 py-1 text-[11px] font-semibold transition',
-                  filter === f ? 'bg-accent text-surface-950' : 'text-content-400 hover:bg-surface-850 hover:text-content-100',
+                  filter === f ? 'bg-accent-solid text-on-accent' : 'text-content-400 hover:bg-surface-850 hover:text-content-100',
                 )}
               >
                 {f === 'ALL' ? 'All' : f === 'OPEN' ? 'Open' : 'Resolved'}
@@ -172,7 +172,7 @@ export function SupportPage() {
                       {c.lastMessagePreview}
                     </span>
                     {c.unreadByAgent ? (
-                      <span className="ml-auto grid h-5 min-w-5 shrink-0 place-items-center rounded-full bg-accent px-1.5 text-[10px] font-bold text-surface-950">
+                      <span className="ml-auto grid h-5 min-w-5 shrink-0 place-items-center rounded-full bg-accent-solid px-1.5 text-[10px] font-bold text-on-accent">
                         {c.unreadByAgent}
                       </span>
                     ) : null}
@@ -479,7 +479,7 @@ function ThreadView({ conversationId, onBack }: { conversationId: string; onBack
                 <div
                   className={clsx(
                     'whitespace-pre-wrap break-words rounded-2xl px-3.5 py-2 text-sm leading-relaxed',
-                    agent ? 'rounded-br-md bg-accent text-surface-950' : 'rounded-bl-md bg-surface-800 text-content-100',
+                    agent ? 'rounded-br-md bg-accent-solid text-on-accent' : 'rounded-bl-md bg-surface-800 text-content-100',
                   )}
                 >
                   {m.body}
@@ -561,7 +561,7 @@ function ThreadView({ conversationId, onBack }: { conversationId: string; onBack
             onClick={() => void send()}
             disabled={!draft.trim() || sending}
             aria-label="Send"
-            className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent text-surface-950 transition hover:brightness-110 disabled:opacity-40"
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent-solid text-on-accent transition hover:brightness-105 disabled:opacity-40"
           >
             {sending ? <Spinner /> : <SendHorizontal className="h-4 w-4" />}
           </button>

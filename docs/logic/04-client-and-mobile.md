@@ -1221,7 +1221,9 @@ OS prefers; a stored choice always wins, and a stored `system` still follows the
 `public/theme-init.js` apply the same rule, so there is no flash of another theme; `index.css` has
 no `prefers-color-scheme` fallback (an attribute-less `:root` is dark), and `index.html` has one
 dark `theme-color`. Test: `client/tests/theme-default.test.ts` (runs `theme-init.js` against the
-store). Mobile still defaults to `system`.
+store). The admin console applies the same rule - no stored choice is Full night (`dark`) - in
+`admin/src/stores/themeStore.ts` and `admin/public/theme-init.js` (test
+`admin/tests/theme-default.test.ts`). Mobile still defaults to `system`.
 
 - **Web** (`client/src/stores/themeStore.ts`): tokens are CSS custom properties in
   `client/src/index.css` (`:root` = dark, `:root[data-theme='twilight']`, `:root[data-theme='light']`).
@@ -1232,6 +1234,16 @@ store). Mobile still defaults to `system`.
   `utils/theme-colors.ts` reads tokens with `getComputedStyle` and converts to hex/`rgba(a, b, c,
   x)` because chart libraries cannot parse `rgb(1 2 3)` (lightweight-charts throws "Cannot parse
   color").
+- **Admin console** (`admin/src/index.css`, same key `bt.theme` on its own origin): the same token
+  names and the same brand yellow, but its own, deeper ramp for dense operations screens - a
+  near-black page (`surface-950` `8 9 11`) under lighter panels, inputs (`850`) set apart from
+  panels, borders (`700`) that outline. One extra token, `on-accent` (near-black), is the text on
+  the yellow fill (`accent-solid`: primary buttons, the selected nav item, the active theme
+  segment). In Light, `accent-solid` stays yellow while `accent` (text, rings) is a dark gold, so
+  all three themes are one brand. Checked by `admin/tests/theme-contrast.test.ts` (WCAG 4.5:1 for
+  text on page, panel and input, badge text on its tint, `on-accent` on `accent-solid`, focus ring
+  3:1, page/panel/input/divider/border separation); `client/tests/theme-contrast.test.ts` asserts
+  that `--brand` (all themes) and the dark themes' `--accent-solid` match the client.
 - **Mobile** (`mobile/src/theme/tokens.ts`): `THEME_TOKENS: Record<'dark'|'twilight'|'light',
   TokenTable>` with the same values; `ThemeRoot.tsx` sets them as NativeWind `vars()` on the root
   view (they cascade through context, so sheets/modals get them), sets the status-bar style and the
@@ -1303,7 +1315,8 @@ runs in `node` and aliases native packages to in-memory stand-ins under `mobile/
 `randomUUID`), `expo-constants`, `expo-file-system`, `expo-sharing` (`isAvailableAsync -> false`)
 and `react-native` (`Appearance` fixed to dark, `Platform`). Commands: `npm test` and `npm run
 typecheck` in `mobile/` (which is not part of the root npm workspace), the same in `client/`.
-The admin console has its own suites (`admin/tests/`: freshness, usdt, void-status).
+The admin console has its own suites (`admin/tests/`: adjustment, freshness, money-format,
+theme-contrast, theme-default, usdt, void-status).
 
 ---
 
@@ -1357,6 +1370,14 @@ risk settings page edits, as new versions of the risk configuration:
   `feedGapMinMs`, `feedGapIntervalMultiple`, `feedSaturationHoldMs`, `feedMaxClockDriftMs`,
   `feedClockCheckIntervalMs`.
 - The tie rule `drawPolicy` (*Trade limits*; the apps state it, 5.3).
+
+Money fields are typed in rupees and sent in paise (`toMinor`), as the API stores them; the field
+shows a `₹` prefix and, under it, the amount with Indian grouping and in lakh/crore
+(`utils/format.ts` `formatRupees`, `rupeesInWords`). Other fields carry their unit inside the
+input (`%`, `s`, `ms` - read out as s/min/h by `formatMs` - and `×`); a "0 = off" field at 0 shows
+an "Off" badge. Each group is a card with a one-line description, and a sticky bar counts the
+fields that differ from the published version (each field carries it as `data-published`), with
+**Discard** and **Publish new version**. Display only: the request body is unchanged.
 
 Fields an older server does not send are neither rendered nor sent. The server enforces hard limits
 (`server-go/internal/service/riskconfig/policy_validate.go`); see

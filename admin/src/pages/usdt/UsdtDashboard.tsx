@@ -401,8 +401,16 @@ function ProviderCard({ provider }: { provider: UsdtSummary['provider'] | undefi
  * Integers are micro-USDT; anything else is shown exactly as reported.
  */
 const LABEL_KEYS = /^(currency|code|asset|coin|symbol|network)$/i;
+const WRAPPER_KEYS = /^(balances|data|items|wallets|result)$/i;
 
-function normaliseBalances(raw: unknown): Array<{ currency: string; figures: Array<{ label: string; text: string }> }> {
+export function normaliseBalances(raw: unknown): Array<{ currency: string; figures: Array<{ label: string; text: string }> }> {
+  // A wrapper such as {balances: [...]} or {data: {...}}: read what it wraps.
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const wrapped = Object.entries(raw as Record<string, unknown>).find(
+      ([key, value]) => WRAPPER_KEYS.test(key) && !!value && typeof value === 'object',
+    );
+    if (wrapped) return normaliseBalances(wrapped[1]);
+  }
   const show = (value: unknown) =>
     typeof value === 'number' && Number.isSafeInteger(value) ? formatUsdt(value) : String(value);
   const figuresOf = (value: unknown) => {

@@ -148,12 +148,12 @@ export function AdminLayout() {
     <div className="flex min-h-screen bg-surface-950">
       <aside
         className={clsx(
-          'fixed inset-y-0 left-0 z-40 w-60 shrink-0 border-r border-surface-800 bg-surface-900 transition-transform lg:static lg:translate-x-0',
+          'fixed inset-y-0 left-0 z-40 w-60 shrink-0 border-r border-surface-800 bg-surface-900 transition-transform lg:sticky lg:top-0 lg:h-screen lg:translate-x-0',
           sidebarOpen ? 'translate-x-0' : '-translate-x-full',
         )}
       >
         <div className="flex h-14 items-center gap-2 border-b border-surface-800 px-4">
-          <span className="grid h-7 w-7 place-items-center rounded-lg bg-accent text-[11px] font-black text-white">
+          <span className="grid h-7 w-7 place-items-center rounded-lg bg-accent-solid text-[11px] font-black text-on-accent shadow-sm">
             BT
           </span>
           <span className="text-sm font-semibold tracking-tight">Admin Console</span>
@@ -183,7 +183,7 @@ export function AdminLayout() {
                       clsx(
                         'flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm font-medium transition',
                         isActive
-                          ? 'bg-accent/15 text-content-100 ring-1 ring-accent/30'
+                          ? 'bg-accent-solid font-semibold text-on-accent shadow-sm'
                           : 'text-content-300 hover:bg-surface-850 hover:text-content-100',
                       )
                     }
@@ -191,13 +191,13 @@ export function AdminLayout() {
                     <item.icon className="h-4 w-4 shrink-0" />
                     <span className="truncate">{item.label}</span>
                     {item.to === '/admin/support' && supportUnread > 0 ? (
-                      <span className="ml-auto rounded-full bg-down px-1.5 py-0.5 text-[10px] font-bold leading-none text-white">
+                      <span className="ml-auto rounded-full bg-down-solid px-1.5 py-0.5 text-[10px] font-bold leading-none text-white">
                         {supportUnread > 99 ? '99+' : supportUnread}
                       </span>
                     ) : null}
                     {item.to === '/admin/usdt/withdrawals' && usdtUnderReview > 0 ? (
                       <span
-                        className="ml-auto rounded-full bg-warn/15 px-1.5 py-0.5 text-[10px] font-bold leading-none text-warn ring-1 ring-warn/40"
+                        className="ml-auto rounded-full bg-warn px-1.5 py-0.5 text-[10px] font-bold leading-none text-surface-950"
                         title={usdtUnderReview + ' under review'}
                       >
                         {usdtUnderReview > 99 ? '99+' : usdtUnderReview}

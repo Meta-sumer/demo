@@ -206,20 +206,20 @@ function AdminAccounts() {
         <EmptyState title="No admin accounts" />
       ) : (
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="table">
             <thead>
-              <tr className="border-b border-surface-800 text-left text-[11px] text-content-400">
-                <th className="px-4 py-2 font-medium">Account</th>
-                <th className="px-4 py-2 font-medium">Role</th>
-                <th className="px-4 py-2 font-medium">Two-factor</th>
-                <th className="px-4 py-2 font-medium">Recovery codes</th>
-                <th className="px-4 py-2 font-medium">Last sign-in</th>
-                <th className="px-4 py-2" />
+              <tr>
+                <th className="px-4">Account</th>
+                <th className="px-4">Role</th>
+                <th className="px-4">Two-factor</th>
+                <th className="px-4">Recovery codes</th>
+                <th className="px-4">Last sign-in</th>
+                <th className="px-4" />
               </tr>
             </thead>
             <tbody>
               {query.data.admins.map((row) => (
-                <tr key={row.id} className="border-b border-surface-800/60">
+                <tr key={row.id}>
                   <td className="px-4 py-2">
                     <div className="text-content-100">{row.email}</div>
                     <div className="text-[11px] text-content-400">{row.fullName ?? row.username}</div>

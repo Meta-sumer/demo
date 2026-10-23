@@ -25,6 +25,43 @@ export function formatMoney(minor: number, currency = 'INR', withSymbol = true):
   });
 }
 
+/**
+ * Rupees (major units, as typed into a form) with the ₹ sign and Indian digit
+ * grouping: 5000000 -> "₹50,00,000". Paise are kept when present.
+ */
+export function formatRupees(rupees: number): string {
+  const sign = rupees < 0 ? '-' : '';
+  return sign + '₹' + Math.abs(rupees).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+}
+
+/**
+ * The size of a rupee amount the way it is said in India, so a ceiling can be
+ * read at a glance: 5000000 -> "50 lakh", 20000000 -> "2 crore". Empty below
+ * a thousand, where the figure already says it.
+ */
+export function rupeesInWords(rupees: number): string {
+  const abs = Math.abs(rupees);
+  const scaled = (value: number, unit: string) =>
+    value.toLocaleString('en-IN', { maximumFractionDigits: 2 }) + ' ' + unit;
+  if (abs >= 10_000_000) return scaled(abs / 10_000_000, 'crore');
+  if (abs >= 100_000) return scaled(abs / 100_000, 'lakh');
+  if (abs >= 1_000) return scaled(abs / 1_000, 'thousand');
+  return '';
+}
+
+/**
+ * A millisecond setting in a readable unit: 60000 -> "1 min", 1500 -> "1.5 s",
+ * 604800000 -> "7 days". Empty under a second, where "ms" already reads well.
+ */
+export function formatMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 1000) return '';
+  const scaled = (value: number, unit: string) => Number(value.toFixed(2)).toString() + ' ' + unit;
+  if (ms < 60_000) return scaled(ms / 1000, 's');
+  if (ms < 3_600_000) return scaled(ms / 60_000, 'min');
+  if (ms < 172_800_000) return scaled(ms / 3_600_000, 'h');
+  return scaled(ms / 86_400_000, 'days');
+}
+
 export function formatSignedMoney(minor: number, currency = 'INR'): string {
   const sign = minor > 0 ? '+' : '';
   return sign + formatMoney(minor, currency);

@@ -6,39 +6,55 @@
  * Theme tokens.
  *
  * Values are space-separated RGB channels so Tailwind's opacity modifiers work
- * against them. The boot script in index.html resolves the stored preference
- * (including "system") to an explicit data-theme before first paint, so there
- * is never a flash of the wrong theme.
+ * against them. The boot script (public/theme-init.js) resolves the stored
+ * preference (including "system") to an explicit data-theme before first
+ * paint, so there is never a flash of the wrong theme.
  *
- * The prefers-color-scheme block below is the no-JS fallback only; once the
- * attribute is present it always wins.
+ * `:root` without an attribute is Full night, which is also the default for
+ * an operator who has not chosen a theme - so a page whose boot script did not
+ * run still shows the brand's black and yellow rather than a theme picked by
+ * the OS.
+ *
+ * The console shares the brand yellow with the web client (client/src/
+ * index.css) but not its surfaces: dense operations screens need a deeper
+ * depth scale - page darker than panels, inputs set apart from panels, borders
+ * that actually outline - so the surface and text ramps are tuned here and
+ * checked by tests/theme-contrast.test.ts.
+ *
+ *   surface-950 page            surface-900 panels, sidebar, header
+ *   surface-850 inputs, hover   surface-800 dividers, table rows
+ *   surface-700 borders         surface-600/500 strong borders, handles
+ *   accent       yellow text, rings and indicators (dark gold in Light)
+ *   accent-solid yellow fill for primary buttons and the selected nav item
+ *   on-accent    the text drawn on accent-solid: near-black in every theme
  */
 @layer base {
   :root {
-    --surface-950: 29 31 35;
-    --surface-900: 41 44 50;
-    --surface-850: 36 39 44;
-    --surface-800: 48 52 58;
-    --surface-700: 68 74 84;
-    --surface-600: 90 96 106;
-    --surface-500: 119 125 135;
+    --surface-950: 8 9 11;
+    --surface-900: 26 28 34;
+    --surface-850: 34 37 44;
+    --surface-800: 44 48 56;
+    --surface-700: 62 67 78;
+    --surface-600: 88 94 107;
+    --surface-500: 122 129 143;
 
-    --content-100: 245 245 245;
-    --content-200: 200 204 211;
-    --content-300: 167 171 179;
-    --content-400: 146 154 165;
+    --content-100: 247 248 250;
+    --content-200: 218 221 228;
+    --content-300: 182 188 199;
+    --content-400: 150 158 172;
 
     --accent: 246 216 74;
-    --accent-soft: 58 50 16;
-    --up: 103 211 154;
-    --up-soft: 25 52 40;
-    --down: 239 107 107;
-    --down-soft: 58 32 32;
-    --warn: 246 216 74;
-    --critical: 255 107 133;
+    --accent-soft: 52 45 14;
+    --up: 64 214 142;
+    --up-soft: 18 56 38;
+    --down: 255 107 107;
+    --down-soft: 64 26 28;
+    --warn: 255 170 64;
+    --critical: 255 110 150;
     --accent-solid: 246 216 74;
-    --up-solid: 46 153 98;
-    --down-solid: 204 71 71;
+    --on-accent: 14 15 17;
+    --up-solid: 22 150 90;
+    --down-solid: 210 58 58;
     /* Modal veils must darken in BOTH themes; a light scrim over a light page
        would not read as a veil at all. */
     --scrim: 4 5 8;
@@ -46,103 +62,106 @@
     --shimmer: 255 255 255;
     --shimmer-alpha: 0.07;
 
-    --shadow-panel: 0 1px 0 0 rgb(255 255 255 / 0.04) inset, 0 8px 24px -14px rgb(0 0 0 / 0.85);
-    --shadow-raised: 0 1px 0 0 rgb(255 255 255 / 0.05) inset, 0 14px 34px -18px rgb(0 0 0 / 0.9);
-    --shadow-overlay: 0 28px 64px -24px rgb(0 0 0 / 0.9);
-    --shadow-up: 0 10px 26px -12px rgb(46 153 98 / 0.75);
-    --shadow-down: 0 10px 26px -12px rgb(204 71 71 / 0.75);
+    --shadow-panel: 0 1px 0 0 rgb(255 255 255 / 0.045) inset, 0 1px 2px 0 rgb(0 0 0 / 0.5), 0 10px 28px -16px rgb(0 0 0 / 0.9);
+    --shadow-raised: 0 1px 0 0 rgb(255 255 255 / 0.06) inset, 0 16px 36px -18px rgb(0 0 0 / 0.95);
+    --shadow-overlay: 0 28px 64px -24px rgb(0 0 0 / 0.95);
+    --shadow-up: 0 10px 26px -12px rgb(22 150 90 / 0.75);
+    --shadow-down: 0 10px 26px -12px rgb(210 58 58 / 0.75);
 
     /* Read by the charting libraries, which cannot use Tailwind classes. */
-    --chart-grid: 48 52 58;
-    --chart-axis: 146 154 165;
-    --chart-crosshair: 119 125 135;
-    /* Order overlay and candle bodies. Held apart from the semantic
-       up/down so a candle and an order accent can differ. */
+    --chart-grid: 44 48 56;
+    --chart-axis: 150 158 172;
+    --chart-crosshair: 122 129 143;
+    /* The brand mark, shared with the web client in every theme. */
     --brand: 246 216 74;
     --up-bright: 123 224 167;
     --down-bright: 242 120 120;
-    --chart-bg: 30 32 36;
-    --chart-bull: 98 200 138;
-    --chart-bear: 234 109 109;
-    --chart-price-line: 138 144 153;
+    --chart-bg: 14 15 18;
+    --chart-bull: 64 214 142;
+    --chart-bear: 255 107 107;
+    --chart-price-line: 150 158 172;
 
     color-scheme: dark;
   }
 
   :root[data-theme='twilight'] {
-    --surface-950: 26 32 48;
-    --surface-900: 38 47 69;
-    --surface-850: 48 59 85;
-    --surface-800: 60 73 103;
-    --surface-700: 80 96 132;
-    --surface-600: 105 124 164;
-    --surface-500: 136 154 190;
+    --surface-950: 11 16 30;
+    --surface-900: 22 31 52;
+    --surface-850: 30 41 67;
+    --surface-800: 40 53 84;
+    --surface-700: 58 74 112;
+    --surface-600: 82 101 145;
+    --surface-500: 118 137 180;
 
-    --content-100: 236 241 250;
-    --content-200: 201 211 229;
-    --content-300: 161 174 199;
-    --content-400: 158 171 198;
+    --content-100: 242 246 253;
+    --content-200: 212 220 236;
+    --content-300: 176 188 212;
+    --content-400: 150 164 194;
 
     --accent: 247 206 70;
-    --accent-soft: 66 57 22;
-    --up: 45 205 110;
-    --up-soft: 24 62 40;
-    --down: 252 112 112;
-    --down-soft: 71 34 38;
-    --warn: 247 170 40;
-    --critical: 252 114 142;
+    --accent-soft: 60 52 22;
+    --up: 64 214 142;
+    --up-soft: 18 60 44;
+    --down: 255 116 116;
+    --down-soft: 72 30 40;
+    --warn: 255 170 64;
+    --critical: 255 118 152;
     --accent-solid: 247 206 70;
-    --up-solid: 19 140 63;
-    --down-solid: 199 45 45;
-    --scrim: 8 11 20;
+    --on-accent: 14 15 17;
+    --up-solid: 20 140 80;
+    --down-solid: 205 50 50;
+    --scrim: 6 9 18;
     --scrim-alpha: 0.7;
     --shimmer: 255 255 255;
     --shimmer-alpha: 0.09;
 
-    --shadow-panel: 0 1px 0 0 rgb(255 255 255 / 0.05) inset, 0 10px 26px -16px rgb(0 0 0 / 0.7);
-    --shadow-raised: 0 1px 0 0 rgb(255 255 255 / 0.06) inset, 0 16px 36px -20px rgb(0 0 0 / 0.75);
-    --shadow-overlay: 0 30px 66px -26px rgb(0 0 0 / 0.8);
-    --shadow-up: 0 10px 26px -12px rgb(19 140 63 / 0.8);
-    --shadow-down: 0 10px 26px -12px rgb(199 45 45 / 0.8);
+    --shadow-panel: 0 1px 0 0 rgb(255 255 255 / 0.05) inset, 0 1px 2px 0 rgb(2 6 18 / 0.45), 0 12px 30px -18px rgb(2 6 18 / 0.85);
+    --shadow-raised: 0 1px 0 0 rgb(255 255 255 / 0.06) inset, 0 16px 36px -20px rgb(2 6 18 / 0.9);
+    --shadow-overlay: 0 30px 66px -26px rgb(2 6 18 / 0.9);
+    --shadow-up: 0 10px 26px -12px rgb(20 140 80 / 0.8);
+    --shadow-down: 0 10px 26px -12px rgb(205 50 50 / 0.8);
 
-    --chart-grid: 60 73 103;
-    --chart-axis: 158 171 198;
-    --chart-crosshair: 136 154 190;
-    /* Order overlay and candle bodies. Held apart from the semantic
-       up/down so a candle and an order accent can differ. */
+    --chart-grid: 40 53 84;
+    --chart-axis: 150 164 194;
+    --chart-crosshair: 118 137 180;
+    /* The brand mark, shared with the web client in every theme. */
     --brand: 247 206 70;
     --up-bright: 90 224 150;
     --down-bright: 255 140 140;
-    --chart-bg: 34 42 62;
-    --chart-bull: 45 205 110;
-    --chart-bear: 252 112 112;
-    --chart-price-line: 158 171 198;
+    --chart-bg: 22 31 52;
+    --chart-bull: 64 214 142;
+    --chart-bear: 255 116 116;
+    --chart-price-line: 150 164 194;
 
     color-scheme: dark;
   }
   :root[data-theme='light'] {
-    --surface-950: 233 237 244;
+    --surface-950: 232 235 240;
     --surface-900: 255 255 255;
-    --surface-850: 243 245 250;
-    --surface-800: 224 229 238;
-    --surface-700: 203 210 222;
-    --surface-600: 172 181 197;
-    --surface-500: 134 144 161;
+    --surface-850: 246 247 249;
+    --surface-800: 230 233 238;
+    --surface-700: 207 212 221;
+    --surface-600: 170 178 192;
+    --surface-500: 128 137 153;
 
-    --content-100: 15 18 28;
-    --content-200: 46 53 68;
-    --content-300: 74 82 100;
-    --content-400: 100 108 126;
+    --content-100: 13 15 20;
+    --content-200: 42 47 58;
+    --content-300: 68 75 90;
+    --content-400: 94 102 118;
 
-    --accent: 59 91 219;
-    --accent-soft: 226 232 253;
-    --up: 21 128 61;
+    /* Yellow cannot be read as text on white, so the accent used for text,
+       rings and indicators is the brand's dark gold, while buttons and the
+       selected item keep the yellow fill with near-black text. */
+    --accent: 128 88 0;
+    --accent-soft: 254 243 199;
+    --up: 21 115 54;
     --up-soft: 220 243 228;
-    --down: 200 30 30;
+    --down: 185 28 28;
     --down-soft: 253 226 226;
-    --warn: 161 98 7;
-    --critical: 190 18 60;
-    --accent-solid: 47 78 200;
+    --warn: 160 70 8;
+    --critical: 175 16 55;
+    --accent-solid: 246 208 50;
+    --on-accent: 14 15 17;
     --up-solid: 21 128 61;
     --down-solid: 200 30 30;
     --scrim: 15 23 42;
@@ -150,74 +169,25 @@
     --shimmer: 255 255 255;
     --shimmer-alpha: 0.85;
 
-    --shadow-panel: 0 1px 2px 0 rgb(15 23 42 / 0.06), 0 2px 5px -1px rgb(15 23 42 / 0.08);
+    --shadow-panel: 0 1px 2px 0 rgb(15 23 42 / 0.06), 0 2px 6px -1px rgb(15 23 42 / 0.08);
     --shadow-raised: 0 8px 20px -6px rgb(15 23 42 / 0.14), 0 2px 6px -2px rgb(15 23 42 / 0.08);
     --shadow-overlay: 0 30px 60px -18px rgb(15 23 42 / 0.28);
     --shadow-up: 0 10px 24px -12px rgb(21 128 61 / 0.5);
     --shadow-down: 0 10px 24px -12px rgb(200 30 30 / 0.5);
 
-    --chart-grid: 224 229 238;
-    --chart-axis: 100 108 126;
-    --chart-crosshair: 134 144 161;
-    /* Order overlay and candle bodies. Held apart from the semantic
-       up/down so a candle and an order accent can differ. */
+    --chart-grid: 230 233 238;
+    --chart-axis: 94 102 118;
+    --chart-crosshair: 128 137 153;
+    /* The brand mark, shared with the web client in every theme. */
     --brand: 180 130 8;
     --up-bright: 16 110 52;
     --down-bright: 180 24 24;
     --chart-bg: 255 255 255;
     --chart-bull: 21 128 61;
     --chart-bear: 200 30 30;
-    --chart-price-line: 100 108 126;
+    --chart-price-line: 94 102 118;
 
     color-scheme: light;
-  }
-
-  /* No-JS fallback; an explicit data-theme always takes precedence. */
-  @media (prefers-color-scheme: light) {
-    :root:not([data-theme]) {
-      color-scheme: light;
-      --surface-950: 233 237 244;
-      --surface-900: 255 255 255;
-      --surface-850: 243 245 250;
-      --surface-800: 224 229 238;
-      --surface-700: 203 210 222;
-      --surface-600: 172 181 197;
-      --surface-500: 134 144 161;
-      --content-100: 15 18 28;
-      --content-200: 46 53 68;
-      --content-300: 74 82 100;
-      --content-400: 100 108 126;
-      --accent: 59 91 219;
-      --accent-soft: 226 232 253;
-      --up: 21 128 61;
-      --up-soft: 220 243 228;
-      --down: 200 30 30;
-      --down-soft: 253 226 226;
-      --warn: 161 98 7;
-      --critical: 190 18 60;
-      --accent-solid: 47 78 200;
-      --up-solid: 21 128 61;
-      --down-solid: 200 30 30;
-      --scrim: 15 23 42;
-      --scrim-alpha: 0.45;
-      --shimmer: 255 255 255;
-      --shimmer-alpha: 0.85;
-      --shadow-panel: 0 1px 2px 0 rgb(15 23 42 / 0.06), 0 2px 5px -1px rgb(15 23 42 / 0.08);
-      --shadow-raised: 0 8px 20px -6px rgb(15 23 42 / 0.14), 0 2px 6px -2px rgb(15 23 42 / 0.08);
-      --shadow-overlay: 0 30px 60px -18px rgb(15 23 42 / 0.28);
-      --chart-grid: 224 229 238;
-      --chart-axis: 100 108 126;
-      --chart-crosshair: 134 144 161;
-      /* Order overlay and candle bodies. Held apart from the semantic
-         up/down so a candle and an order accent can differ. */
-      --brand: 180 130 8;
-      --up-bright: 16 110 52;
-      --down-bright: 180 24 24;
-      --chart-bg: 255 255 255;
-      --chart-bull: 21 128 61;
-      --chart-bear: 200 30 30;
-      --chart-price-line: 100 108 126;
-    }
   }
 }
 
@@ -273,9 +243,15 @@
     @apply bg-transparent;
   }
 
-  /* A visible focus ring in both themes; removing it would fail keyboard users. */
+  /* A visible focus ring in every theme; removing it would fail keyboard users. */
   :focus-visible {
-    @apply outline-none ring-2 ring-accent/60 ring-offset-2 ring-offset-surface-950;
+    @apply outline-none ring-2 ring-accent ring-offset-2 ring-offset-surface-950;
+  }
+
+  /* Native checkboxes and radios in the brand colour rather than browser blue. */
+  input[type='checkbox'],
+  input[type='radio'] {
+    accent-color: rgb(var(--accent-solid));
   }
 
   /* Tabular figures keep prices from jittering as digits change. */
@@ -293,12 +269,18 @@
     @apply inline-flex select-none items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold
            transition disabled:cursor-not-allowed disabled:opacity-45;
   }
+  /* Solid brand yellow with near-black text in every theme; the inset edge
+     keeps the fill outlined on a white page. Disabled, it turns neutral: a
+     faded yellow over a dark page reads as olive, not as "not yet". */
   .btn-primary {
-    @apply btn bg-accent-solid text-white hover:brightness-110 active:scale-[0.99];
+    @apply btn bg-accent-solid text-on-accent shadow-sm ring-1 ring-inset ring-black/10
+           hover:brightness-105 active:scale-[0.99]
+           disabled:bg-surface-800 disabled:text-content-400 disabled:opacity-100 disabled:shadow-none
+           disabled:ring-surface-700 disabled:hover:brightness-100;
   }
   .btn-ghost {
     @apply btn border border-surface-700 bg-surface-850 text-content-200
-           hover:border-surface-600 hover:text-content-100;
+           hover:border-surface-600 hover:bg-surface-800 hover:text-content-100;
   }
   .btn-danger {
     @apply btn bg-down-solid text-white hover:brightness-110;
@@ -306,11 +288,29 @@
 
   .field {
     @apply w-full rounded-lg border border-surface-700 bg-surface-850 px-3 py-2 text-sm text-content-100 outline-none
-           transition placeholder:text-content-400 focus:border-accent focus:ring-2 focus:ring-accent/25;
+           transition placeholder:text-content-400 hover:border-surface-600
+           focus:border-accent focus:ring-2 focus:ring-accent/30
+           disabled:cursor-not-allowed disabled:opacity-70 disabled:hover:border-surface-700;
   }
 
   .label {
-    @apply mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-content-400;
+    @apply mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-content-300;
+  }
+
+  /* The sign-in screen: a faint brand-yellow glow from the top of the page. */
+  .brand-backdrop {
+    background-image: radial-gradient(56rem 28rem at 50% -8rem, rgb(var(--accent-solid) / 0.14), transparent 70%);
+  }
+
+  /* A number field with its unit drawn inside: the browser's spinner would sit
+     on top of the unit. Arrow keys still step the value. */
+  .no-spin {
+    -moz-appearance: textfield;
+  }
+  .no-spin::-webkit-outer-spin-button,
+  .no-spin::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
   }
 
   .skeleton {
@@ -335,14 +335,19 @@
   .table {
     @apply w-full text-sm;
   }
+  /* A tinted header band, a divider under every row and a hover that tracks
+     the pointer, so a wide row can be followed across the screen. */
   .table thead tr {
-    @apply border-b border-surface-800 text-left text-[11px] uppercase tracking-wider text-content-400;
+    @apply border-b border-surface-700 bg-surface-850/60 text-left text-[11px] uppercase tracking-wider text-content-300;
   }
   .table th {
-    @apply px-3 py-2 font-medium;
+    @apply px-3 py-2.5 font-semibold;
   }
   .table tbody tr {
-    @apply border-b border-surface-800/60 hover:bg-surface-850;
+    @apply border-b border-surface-800 transition-colors hover:bg-surface-850;
+  }
+  .table tbody tr:last-child {
+    @apply border-b-0;
   }
   .table td {
     @apply px-3 py-2;

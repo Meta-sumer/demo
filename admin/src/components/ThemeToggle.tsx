@@ -43,7 +43,9 @@ export function ThemeToggle({ size = 'sm' }: { size?: 'sm' | 'md' }) {
             className={clsx(
               'rounded-md transition',
               pad,
-              active ? 'bg-surface-700 text-content-100 shadow-panel' : 'text-content-400 hover:text-content-200',
+              active
+                ? 'bg-accent-solid text-on-accent shadow-sm'
+                : 'text-content-300 hover:bg-surface-800 hover:text-content-100',
             )}
           >
             <option.icon className={icon} />
