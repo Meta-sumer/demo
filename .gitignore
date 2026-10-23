@@ -17,3 +17,7 @@ uploads/
 # Go backend
 server-go/bin/
 server-go/uploads/
+
+# Android signing keys (downloaded with `eas credentials`); never commit them
+*.jks
+*.keystore
