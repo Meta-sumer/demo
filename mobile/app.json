@@ -58,8 +58,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "900e6ea7-c9e8-48fd-977d-064cb0d177d7"
+        "projectId": "2ef72a49-8271-4e9a-8fdf-9e8cdaa2e31f"
       }
-    }
+    },
+    "owner": "sumer_paniyala_0080"
   }
 }
