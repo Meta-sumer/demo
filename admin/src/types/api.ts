@@ -643,8 +643,72 @@ export interface RiskConfig {
   earlyCloseMaxTickAgeMs?: number;
   earlyCloseQuoteMaxAgeMs?: number;
   earlyCloseQuoteTolerancePercent?: number;
+  /** Lower clamp of the Sell-now win probability, percent (audit F-12). */
+  earlyCloseMinProbabilityPercent?: number;
+  /**
+   * Pricing engine (docs/audit/pricing/pricing-spec.md section 11); absent
+   * from older servers. Payout terms are fractions of the stake (0.06 = 6
+   * payout points); the Settings page shows them in points and percent
+   * (utils/pricingSettings.ts).
+   */
+  tradingHaltReason?: string;
+  pricingMode?: 'DYNAMIC' | 'FIXED';
+  pricingRuleLabel?: string;
+  pricingStaleAfterMs?: number;
+  pricingMaxSpreadBps?: number;
+  pricingMaxJumpBps?: number;
+  pricingJumpConfirmations?: number;
+  pricingPendingOutlierMaxAgeMs?: number;
+  pricingEwmaLambda?: number;
+  pricingVolSampleIntervalMs?: number;
+  pricingKVol?: number;
+  pricingMaxVolAdj?: number;
+  pricingVolBlockRatio?: number;
+  pricingKSpread?: number;
+  pricingMaxSpreadAdj?: number;
+  pricingKExposure?: number;
+  pricingMaxExposureAdj?: number;
+  pricingExpiryFactors?: PricingExpiryFactor[];
+  pricingPayoutStep?: number;
+  pricingOfferTtlMs?: number;
+  pricingMaxSlippageBps?: number;
+  pricingDisplayTolerancePercent?: number;
+  pricingGuardEnabled?: boolean;
+  pricingGuardMinEdgePercent?: number;
+  pricingGuardConservative?: boolean;
+  pricingHedgeUnavailableAction?: 'WIDEN' | 'REFUSE';
+  pricingHedgeUnavailableAdj?: number;
+  pricingHedgeTakerFeeBps?: number;
+  pricingHedgeSpreadBps?: number;
+  pricingHedgeSlippageBps?: number;
+  pricingSymbolRules?: PricingSymbolRule[];
+  pricingHalts?: PricingHalt[];
   note: string | null;
   createdAt: string;
+}
+
+/** One row of the expiry-factor table: deductions scale by the factor; an expiry not listed uses 1. */
+export interface PricingExpiryFactor {
+  expirySeconds: number;
+  factor: number;
+}
+
+/** One instrument's pricing rule; payouts are fractions, money is paise. */
+export interface PricingSymbolRule {
+  symbol: string;
+  enabled: boolean;
+  disabledReason: string;
+  basePayout: number;
+  minPayout: number;
+  maxPayout: number;
+  /** Fraction per sqrt(second). */
+  baselineVol: number;
+  hedgeCost: number;
+  margin: number;
+  maxExposure: number;
+  /** Stake range of the instrument, paise; 0 = no limit of its own. Absent from older servers. */
+  minStake?: number;
+  maxStake?: number;
 }
 
 export interface PlatformPnl {

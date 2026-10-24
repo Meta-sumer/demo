@@ -544,6 +544,12 @@ type PricingSymbolRule struct {
 	HedgeCost   float64 `bson:"hedgeCost" json:"hedgeCost"`
 	Margin      float64 `bson:"margin" json:"margin"`
 	MaxExposure int64   `bson:"maxExposure" json:"maxExposure"`
+	// Stake range of the instrument, minor units; 0 = no limit of its own.
+	// It narrows the asset's, the risk configuration's and the payout row's
+	// limits (pricing.StakeBounds), never widens them. A stored rule without
+	// these fields decodes as 0.
+	MinStake int64 `bson:"minStake" json:"minStake"`
+	MaxStake int64 `bson:"maxStake" json:"maxStake"`
 }
 
 // PricingHalt is a per-symbol kill switch (spec 7.4).

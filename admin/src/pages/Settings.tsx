@@ -1,5 +1,4 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
-import clsx from 'clsx';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Activity,
@@ -13,16 +12,28 @@ import {
   SlidersHorizontal,
   Timer,
   TrendingDown,
-  type LucideIcon,
 } from 'lucide-react';
 import { api } from '../services/api';
 import { ApiRequestError } from '../services/http';
 import { useAuthStore } from '../stores/authStore';
 import { toast } from '../hooks/useToast';
-import { formatDateTime, formatMs, formatRupees, fromMinor, rupeesInWords, toMinor } from '../utils/format';
+import { formatDateTime, formatRupees, fromMinor, toMinor } from '../utils/format';
+import { buildPricingPatch, checkPricingForm, hasPricing } from '../utils/pricingSettings';
 import { Badge, Panel, PanelHeader, Skeleton } from '../components/ui';
+import {
+  MoneyField,
+  Note,
+  NumberField,
+  OptNumberField,
+  Section,
+  SelectField,
+  Toggle,
+  countChanges,
+  countChangesBySection,
+} from '../components/settingsFields';
 import { ThemeToggle } from '../components/ThemeToggle';
 import { useThemeStore } from '../stores/themeStore';
+import { PricingEngineSettings } from './PricingSettings';
 
 /**
  * Platform risk configuration (spec sections 13, 15, 17).
@@ -45,6 +56,8 @@ export function SettingsPage() {
   const formRef = useRef<HTMLFormElement>(null);
   /** Fields that differ from the published version. */
   const [changes, setChanges] = useState(0);
+  /** The same per collapsible pricing group (data-section). */
+  const [sectionChanges, setSectionChanges] = useState<Record<string, number>>({});
   /** Bumped by Discard: remounts the fields with the published values. */
   const [formKey, setFormKey] = useState(0);
 
@@ -54,18 +67,28 @@ export function SettingsPage() {
     mutationFn: (input: Record<string, unknown>) => api.risk.updateConfig(input),
     onSuccess: (config) => {
       void queryClient.invalidateQueries({ queryKey: ['risk'] });
+      // New payouts: the live board and the asset pages refetch.
+      void queryClient.invalidateQueries({ queryKey: ['pricing'] });
       setNote('');
       toast('success', 'Risk configuration v' + config.version + ' published');
     },
-    onError: (err) => toast('error', 'Update failed', err instanceof ApiRequestError ? err.message : undefined),
+    onError: (err) => toast('error', 'Update failed', err instanceof ApiRequestError ? errorText(err) : undefined),
   });
+
+  /** Recounts the unsaved changes; also called when a table gains or loses a row, which fires no change event. */
+  const recount = useCallback(() => {
+    const form = formRef.current;
+    if (!form) return;
+    setChanges(countChanges(form));
+    setSectionChanges(countChangesBySection(form));
+  }, []);
 
   // A new version (ours, or another admin's) moves the published values the
   // fields compare against, so recount once it has rendered.
   const config = query.data?.config;
   useEffect(() => {
-    if (formRef.current) setChanges(countChanges(formRef.current));
-  }, [config, formKey]);
+    recount();
+  }, [config, formKey, recount]);
 
   if (query.isLoading || !query.data || !config) return <Skeleton className="h-96 w-full" />;
   const { versions } = query.data;
@@ -94,16 +117,42 @@ export function SettingsPage() {
         key={formKey}
         ref={formRef}
         className="space-y-4"
-        onChange={(event) => setChanges(countChanges(event.currentTarget))}
+        onChange={recount}
         onSubmit={(event) => {
           event.preventDefault();
-          const data = new FormData(event.currentTarget);
+          const form = event.currentTarget;
+          const data = new FormData(form);
           const number = (key: string) => Number(data.get(key));
           const money = (key: string) => toMinor(Number(data.get(key)));
           // Fields an older server does not send are not rendered, and not sent.
           const optional = (key: string) => (data.has(key) ? Number(data.get(key)) : undefined);
 
+          // The pricing engine card shows operator units; buildPricingPatch
+          // converts them back to the API's exactly. Checked here first so a
+          // refusal names the field as the operator sees it.
+          let pricing: Record<string, unknown> = {};
+          if (hasPricing(config)) {
+            const values = new Map<string, string>();
+            data.forEach((value, key) => {
+              if (typeof value === 'string') values.set(key, value);
+            });
+            const issues = checkPricingForm(values);
+            if (issues.length > 0) {
+              const first = issues.slice(0, 3).map((issue) => issue.message);
+              toast('error', 'Check the pricing engine values', first.join(' · '));
+              // Open every collapsed group around the first one, then focus it.
+              const target = form.querySelector<HTMLElement>('[name="' + CSS.escape(issues[0].name) + '"]');
+              for (let group = target?.closest('details'); group; group = group.parentElement?.closest('details')) {
+                group.open = true;
+              }
+              target?.focus();
+              return;
+            }
+            pricing = buildPricingPatch(values);
+          }
+
           mutation.mutate({
+            ...pricing,
             maxAssetExposure: money('maxAssetExposure'),
             maxUserExposure: money('maxUserExposure'),
             maxGrossExposure: money('maxGrossExposure'),
@@ -565,6 +614,15 @@ export function SettingsPage() {
           </div>
         </div>
 
+        {hasPricing(config) ? (
+          <PricingEngineSettings
+            config={config}
+            writable={writable}
+            sectionChanges={sectionChanges}
+            onRowsChange={recount}
+          />
+        ) : null}
+
         {writable ? (
           <div className="sticky bottom-3 z-10">
             <div className="panel flex flex-wrap items-end gap-3 px-4 py-3 shadow-overlay">
@@ -601,6 +659,7 @@ export function SettingsPage() {
                   onClick={() => {
                     setFormKey((key) => key + 1);
                     setChanges(0);
+                    setSectionChanges({});
                   }}
                 >
                   <RotateCcw className="h-4 w-4" />
@@ -680,306 +739,13 @@ export function SettingsPage() {
 }
 
 /**
- * How many fields differ from the published version. Each field carries the
- * published value as data-published (React keeps a data attribute current,
- * where it never moves a select's defaultSelected), so this needs no second
- * list of the fields. The change note has none and is not counted.
+ * The server's reason for a refused change, with the fields a validation
+ * error names ("pricingSymbolRules.0.basePayout: Number must be less than or
+ * equal to 1"), so the operator sees what to fix rather than "Invalid request
+ * body".
  */
-function countChanges(form: HTMLFormElement): number {
-  let count = 0;
-  for (const element of Array.from(form.elements)) {
-    if (!(element instanceof HTMLInputElement || element instanceof HTMLSelectElement)) continue;
-    const published = element.dataset.published;
-    if (published === undefined) continue;
-    const current =
-      element instanceof HTMLInputElement && element.type === 'checkbox'
-        ? element.checked
-          ? 'on'
-          : 'off'
-        : element.value;
-    if (current !== published) count += 1;
-  }
-  return count;
-}
-
-/** One settings group: a card with an icon, a title and a one-line description. */
-function Section({
-  icon: Icon,
-  title,
-  description,
-  toggles,
-  children,
-}: {
-  icon: LucideIcon;
-  title: string;
-  description: string;
-  /** A list of switches, one to a row in the two-column layout. */
-  toggles?: boolean;
-  children: ReactNode;
-}) {
-  const id = useId();
-  return (
-    <fieldset aria-labelledby={id} className="panel min-w-0">
-      <div className="flex items-start gap-3 border-b border-surface-800 px-4 py-3">
-        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-surface-700 bg-surface-850 text-accent">
-          <Icon className="h-4 w-4" />
-        </span>
-        <div className="min-w-0">
-          <h3 id={id} className="text-sm font-semibold text-content-100">
-            {title}
-          </h3>
-          <p className="mt-0.5 text-xs text-content-400">{description}</p>
-        </div>
-      </div>
-      <div
-        className={clsx(
-          'grid p-4',
-          toggles ? 'gap-3 sm:grid-cols-3 xl:grid-cols-1' : 'gap-x-3 gap-y-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-2',
-        )}
-      >
-        {children}
-      </div>
-    </fieldset>
-  );
-}
-
-/** A full-width explanatory paragraph inside a section. */
-function Note({ children }: { children: ReactNode }) {
-  return <p className="col-span-full text-xs leading-relaxed text-content-400">{children}</p>;
-}
-
-/** The label row shared by every field, with an "Off" badge for a 0 = off setting at 0. */
-function FieldLabel({ htmlFor, label, off }: { htmlFor: string; label: string; off?: boolean }) {
-  return (
-    <div className="mb-1.5 flex min-h-[20px] items-center gap-2">
-      <label className="text-xs font-medium text-content-200" htmlFor={htmlFor}>
-        {label}
-      </label>
-      {off ? (
-        <Badge className="ml-auto" tone="neutral">
-          Off
-        </Badge>
-      ) : null}
-    </div>
-  );
-}
-
-/** The line under an input: a live reading of the value, a hint, or nothing. */
-function FieldHelp({ children }: { children: ReactNode }) {
-  return <p className="mt-1 min-h-[16px] text-[11px] leading-4 text-content-400">{children}</p>;
-}
-
-/**
- * Tracks what is typed in an uncontrolled input, for the help line. Re-reads
- * the input when the published value changes, because React then moves an
- * untouched field to the new value without an input event.
- */
-function useTyped(initial: string) {
-  const ref = useRef<HTMLInputElement>(null);
-  const [typed, setTyped] = useState(initial);
-  useEffect(() => {
-    setTyped(ref.current ? ref.current.value : initial);
-  }, [initial]);
-  return { ref, typed, setTyped };
-}
-
-/**
- * Money: typed in rupees, submitted in paise (toMinor in the submit handler).
- * Shows the ₹ sign in the field and the amount with Indian grouping and in
- * words under it.
- */
-function MoneyField({
-  name,
-  label,
-  value,
-  offAtZero,
-  disabled,
-}: {
-  name: string;
-  label: string;
-  /** Paise, as the API sends it. */
-  value: number;
-  /** 0 disables the rule this field sets. */
-  offAtZero?: boolean;
-  disabled?: boolean;
-}) {
-  const initial = String(fromMinor(value));
-  const { ref, typed, setTyped } = useTyped(initial);
-  const rupees = typed.trim() === '' ? NaN : Number(typed);
-  const off = offAtZero && rupees === 0;
-  const words = Number.isFinite(rupees) ? rupeesInWords(rupees) : '';
-
-  return (
-    <div className="flex min-w-0 flex-col">
-      <FieldLabel htmlFor={name} label={label} off={off} />
-      <div className="relative mt-auto">
-        <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-sm font-semibold text-content-300">
-          ₹
-        </span>
-        <input
-          ref={ref}
-          id={name}
-          name={name}
-          type="number"
-          step="1"
-          inputMode="decimal"
-          defaultValue={initial}
-          data-published={initial}
-          disabled={disabled}
-          onChange={(event) => setTyped(event.target.value)}
-          className="field no-spin pl-7 tnum"
-        />
-      </div>
-      <FieldHelp>
-        {!Number.isFinite(rupees) ? (
-          'Enter an amount in rupees'
-        ) : off ? (
-          'Off - no limit'
-        ) : (
-          <>
-            <span className="font-medium text-content-200 tnum">{formatRupees(rupees)}</span>
-            {words ? ' · ' + words : null}
-            {offAtZero ? ' · 0 turns it off' : null}
-          </>
-        )}
-      </FieldHelp>
-    </div>
-  );
-}
-
-/** A number with its unit drawn inside the field; ms values are also read out in s / min / h. */
-function NumberField({
-  name,
-  label,
-  value,
-  unit,
-  step,
-  hint,
-  offAtZero,
-  offText = 'Off',
-  disabled,
-}: {
-  name: string;
-  label: string;
-  value: number;
-  unit?: string;
-  step?: string;
-  hint?: string;
-  /** 0 disables the rule this field sets. */
-  offAtZero?: boolean;
-  offText?: string;
-  disabled?: boolean;
-}) {
-  const initial = String(value);
-  const { ref, typed, setTyped } = useTyped(initial);
-  const current = typed.trim() === '' ? NaN : Number(typed);
-  const off = offAtZero && current === 0;
-  const readable = unit === 'ms' && Number.isFinite(current) ? formatMs(current) : '';
-  const help = off
-    ? offText
-    : [readable ? '= ' + readable : '', hint ?? '', offAtZero ? '0 turns it off' : ''].filter(Boolean).join(' · ');
-
-  return (
-    <div className="flex min-w-0 flex-col">
-      <FieldLabel htmlFor={name} label={label} off={off} />
-      <div className="relative mt-auto">
-        <input
-          ref={ref}
-          id={name}
-          name={name}
-          type="number"
-          step={step ?? '1'}
-          defaultValue={initial}
-          data-published={initial}
-          disabled={disabled}
-          onChange={(event) => setTyped(event.target.value)}
-          className={clsx('field no-spin tnum', unit ? (unit.length > 2 ? 'pr-16' : 'pr-10') : null)}
-        />
-        {unit ? (
-          <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs font-semibold text-content-400">
-            {unit}
-          </span>
-        ) : null}
-      </div>
-      <FieldHelp>{help}</FieldHelp>
-    </div>
-  );
-}
-
-/** A number field for a setting an older server may not send. */
-function OptNumberField(props: Omit<Parameters<typeof NumberField>[0], 'value'> & { value: number | undefined }) {
-  if (props.value === undefined) return null;
-  return <NumberField {...props} value={props.value} />;
-}
-
-function SelectField({
-  name,
-  label,
-  value,
-  options,
-  disabled,
-}: {
-  name: string;
-  label: string;
-  /** Undefined only from an older server: the browser then shows the first option. */
-  value: string | undefined;
-  options: Array<[string, string]>;
-  disabled?: boolean;
-}) {
-  return (
-    <div className="flex min-w-0 flex-col">
-      <FieldLabel htmlFor={name} label={label} />
-      <select
-        id={name}
-        name={name}
-        className="field mt-auto"
-        defaultValue={value}
-        data-published={value ?? options[0]?.[0]}
-        disabled={disabled}
-      >
-        {options.map(([optionValue, text]) => (
-          <option key={optionValue} value={optionValue}>
-            {text}
-          </option>
-        ))}
-      </select>
-      <FieldHelp>{null}</FieldHelp>
-    </div>
-  );
-}
-
-function Toggle({
-  name,
-  label,
-  defaultChecked,
-  disabled,
-  danger,
-}: {
-  name: string;
-  label: string;
-  defaultChecked: boolean;
-  disabled?: boolean;
-  danger?: boolean;
-}) {
-  return (
-    <label
-      className={clsx(
-        'flex cursor-pointer items-center gap-3 rounded-lg border px-4 py-3 text-sm font-medium transition',
-        danger
-          ? 'border-critical/50 bg-critical/10 text-content-100 hover:border-critical/70'
-          : 'border-surface-700 bg-surface-850 text-content-200 hover:border-surface-600 hover:text-content-100',
-        disabled ? 'cursor-not-allowed opacity-70' : null,
-      )}
-    >
-      <input
-        type="checkbox"
-        className="h-4 w-4 shrink-0"
-        name={name}
-        defaultChecked={defaultChecked}
-        data-published={defaultChecked ? 'on' : 'off'}
-        disabled={disabled}
-      />
-      {label}
-    </label>
-  );
+function errorText(err: ApiRequestError): string {
+  const issues = Array.isArray(err.details) ? (err.details as Array<{ path?: string; message?: string }>) : [];
+  const named = issues.slice(0, 3).map((issue) => (issue.path ? issue.path + ': ' : '') + (issue.message ?? ''));
+  return [err.message, ...named].join(' · ');
 }

@@ -1383,6 +1383,36 @@ Fields an older server does not send are neither rendered nor sent. The server e
 (`server-go/internal/service/riskconfig/policy_validate.go`); see
 [disclosures.md](../audit/customer/disclosures.md) and [feed-rules.md](../audit/operations/feed-rules.md).
 
+**Pricing engine** (`pages/PricingSettings.tsx`, part of the same form; `utils/pricingSettings.ts`).
+Every dynamic-pricing parameter of the risk configuration
+([pricing-spec.md](../audit/pricing/pricing-spec.md) section 11) is edited here and goes out in the
+same `PUT /admin/settings/risk`, versioned, with the same change note and audit entry, and counts in
+the sticky bar. The card opens with "What happens when you change this": payouts change for new
+offers only, open trades keep their terms, and each change is a new version whose rule version
+(`label+rc<version>+p<row>`) is recorded on every offer and trade. Collapsible groups (each shows
+"N changes" while it holds unsaved edits, from `data-section`): *Mode and rule set*, *Volatility*,
+*Spread and exposure*, *Market data checks*, *Expiry factors* (a table: expiry -> factor; rows can
+be added and removed), *Rounding and offers*, *Safety guard*, *Hedge cost*, *Sell-now pricing*
+(`earlyCloseMinProbabilityPercent`) and *Instrument rules* (a small table per symbol: BTC/USD and
+ETH/USD, then EUR/USD, GBP/USD and XAU/USD marked "not offered at launch" but editable; XAU/USD has
+no rule until **Create a rule** starts one, switched off, from the forex terms). Each field shows a
+plain label, what it does, its unit inside the field, the specification default ("Default 6 pts")
+and, once edited, the published value ("was 6 pts").
+
+Operator units, converted exactly (`shiftDecimal`, a decimal shift on the number's text - never a
+float multiply, so `7` points is sent as exactly `0.07`): payout terms (k_vol, k_spread,
+k_exposure, the caps, the payout step, the hedge-outage deduction, an instrument's hedge cost and
+margin) in **points** (x 10^-2); base, floor and ceiling in **%** (x 10^-2); baseline volatility in
+**x10^-5 per √s** (with the annual figure under it); exposure limit and stake range in **rupees**
+(paise via `toMinor`); the rest as the API has them (ms, bps, x, %, quotes). Each value is checked
+against the server's bounds as it is typed, and `checkPricingForm` blocks the publish (toast, focus
+on the first field, its group opened) on a value out of range, floor <= base <= ceiling, a floor or
+ceiling off the payout-step grid, a duplicate expiry or an inverted stake range; a server refusal is
+shown with the fields it names. Without `risk:write` every field is disabled and the add, remove
+and create buttons and the save bar are not shown. Live payouts and the halt switches stay on the
+Payouts page (`PricingConsole.tsx`); each expiry's base payout and its min/max/margin overrides stay
+on the asset page. Tests: `admin/tests/pricing-settings.test.ts`.
+
 **Money corrections** (operator side; [02-money-wallets-payments.md](02-money-wallets-payments.md)
 sections 7 and 9.6).
 

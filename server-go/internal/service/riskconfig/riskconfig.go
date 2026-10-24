@@ -341,6 +341,15 @@ func UpdateRiskConfig(ctx context.Context, patch RiskConfigPatch, actorID string
 	if err := ValidateConfig(next); err != nil {
 		return nil, nil, err
 	}
+	// The pricing fields the patch changes (pricing_validate.go).
+	if err := validatePricingPatch(&patch, next); err != nil {
+		return nil, nil, err
+	}
+	if patch.PricingSymbolRules != nil {
+		if err := checkRuleSymbols(ctx, before, next.PricingSymbolRules); err != nil {
+			return nil, nil, err
+		}
+	}
 
 	nextVersion := before.Version + 1
 	coll := mongox.C(models.CollRiskConfigs)

@@ -274,8 +274,9 @@ the spec's order:
 2. not halted (`HaltFor`);
 3. expiry offered (active payout row and a supported expiry ->
    otherwise `EXPIRY_NOT_OFFERED`);
-4. stake within bounds (`StakeBounds`: asset, risk config and payout row
-   limits -> `STAKE_OUT_OF_RANGE`);
+4. stake within bounds (`StakeBounds`: the narrowest of the asset's, the
+   risk config's, the instrument rule's (`minStake` / `maxStake`, 0 = none)
+   and the payout row's limits -> `STAKE_OUT_OF_RANGE`);
 5. fresh market data -> otherwise `STALE_MARKET_DATA`: **the freshness rule
    shared with acceptance** (`service/marketdata/freshness.go`
    `AssessFreshness`): the last accepted quote received within
@@ -521,6 +522,57 @@ All rules are fields of the versioned risk configuration
 `PUT /admin/settings/risk`, validated in `service/riskconfig/riskconfig.go`
 `validatePricing`). No environment variables were added.
 
+**Where they are changed.** Every parameter below (except the halts) is
+edited in the admin console, Settings, *Pricing engine* card
+(`admin/src/pages/PricingSettings.tsx`), published with the rest of the risk
+configuration as a new version with a change note and an audit entry
+(`risk_config.updated`, before and after). The console shows payout terms in
+points and percent, baseline volatility in units of 10^-5 per sqrt(second)
+and money in rupees, and converts back exactly
+(`admin/src/utils/pricingSettings.ts` `shiftDecimal`); the API takes the
+units in the table. A change applies to offers issued after it: an offer
+already issued keeps its terms until it expires (3 s), and a trade keeps the
+terms it was accepted on (`TestConfigChangeDuringAnOffer`). Live payouts and
+the halts stay on the Payouts page; each expiry's base payout and its
+min/max/margin overrides on the asset page.
+
+**What the server refuses** (422 `VALIDATION_ERROR`, with the field and the
+rule; nothing is published):
+
+- per field, in the admin API (`api/admin/core.go` `parseRiskPatch`): each
+  value's type and range, e.g. `pricingEwmaLambda` 0.5 to 0.9999,
+  `pricingOfferTtlMs` 500 to 60,000, `pricingPayoutStep` 0.0001 to 0.1,
+  every k, cap, cost and bps figure at least 0, an expiry factor 0.01 to 10
+  for an expiry of 1 to 86,400 s, an instrument's base, min and max payout at
+  most 1 (100%), `maxExposure` above 0, `minStake` / `maxStake` whole paise,
+  at least 0;
+- on the whole configuration (`ValidateConfig` `validatePricing`):
+  `pricingMode` DYNAMIC or FIXED, `pricingHedgeUnavailableAction` WIDEN or
+  REFUSE, lambda strictly between 0 and 1, step above 0, `pricingVolBlockRatio`
+  above 1, at least one jump confirmation, stale-after at least 100 ms, offer
+  TTL at least 500 ms, each expiry once with a factor above 0, each symbol
+  once, min and max payout on the step grid, baseline volatility above 0, no
+  negative hedge cost or margin;
+- on what the change sets (`service/riskconfig/pricing_validate.go`
+  `validatePricingPatch`): `min <= base <= max <= 1` for every instrument
+  rule, a stake range that is not negative or inverted, no negative k, cap,
+  cost, deduction, slippage or tolerance, `pricingMaxSpreadBps` above 0 and
+  `pricingPendingOutlierMaxAgeMs` at least 100 (0 is not "off" there: the
+  normaliser would quietly use its built-in 8 bps / 5000 ms), at most 32
+  expiry factors and 64 instrument rules. These are checked only for the
+  fields a change sets, so a halt is never refused because of a value stored
+  under an older, looser rule;
+- an instrument rule for a symbol that no asset is listed under and that has
+  no rule yet (`checkRuleSymbols`: "unknown symbol BTC/USDT").
+
+Tests: `TestPricingPatchValidation` (table-driven, every refusal and the
+accepted operator values, a halt over a legacy rule),
+`TestUpdateRiskConfigChecksRuleSymbols`, `TestParseRiskPatchAcceptsEveryPricingField`,
+`TestParseRiskPatchRefusesUnsafePricingValues`, `TestPricingSettingsOverHTTP`
+(stored exactly, audited, refused values change nothing, `risk:read` without
+`risk:write` cannot publish), `TestStakeBoundsWithTheInstrumentRule`;
+console: `admin/tests/pricing-settings.test.ts`.
+
 | Key | Default | Spec |
 |---|---|---|
 | `pricingMode` | `DYNAMIC` (`FIXED` = the payout row's percent) | - |
@@ -549,7 +601,10 @@ All rules are fields of the versioned risk configuration
 | `pricingHalts`, `tradingHalted`, `tradingHaltReason` | none | kill switch |
 | `settlementMaxTickAgeMs` (settlement policy) | 2000 | settle tolerance 2 s |
 
-Per-instrument rules (`models.DefaultPricingSymbolRules`):
+Per-instrument rules (`models.DefaultPricingSymbolRules`; each also has
+`minStake` / `maxStake`, minor units, default 0 = no limit of its own, which
+narrows the asset's, the risk configuration's and the payout row's stake
+limits in `StakeBounds` and raises the reference stake to its minimum):
 
 | Symbol | Enabled | base / min / max | baseline_vol | hedge_cost | margin | max_exposure (minor units) |
 |---|---|---|---|---|---|---|
@@ -665,6 +720,7 @@ DOWN (L(DOWN) negative) still quotes 76.5%. At util above 1 UP blocks.
 | `GET /admin/pricing/market`, `/models`, `/models/active` | Normaliser counters, volatility state and recent rejections; guard model versions. `payouts:read`. |
 | `POST /admin/pricing/halt`, `/resume` | Kill switch (section 5.3). `risk:write`, audited. |
 | `POST /admin/assets/:id/payouts` | Optional `minPayoutPercent`, `maxPayoutPercent`, `marginPercent` (new payout row version). |
+| `PUT /admin/settings/risk` | Takes every pricing parameter of section 11 (`risk:write`, audited); instrument rules gain optional `minStake` / `maxStake`; the bounds and refusals of section 11. |
 | `GET /admin/binary/trades/:id` | Additive `pricing` record. |
 
 Apps:
@@ -677,9 +733,10 @@ Apps:
   trader to confirm.
 - Admin: Payouts page *Pricing engine* panel (`PricingConsole.tsx`: live
   UP/DOWN payouts, base, min/max, margin, vol ratio, spread, deductions,
-  guard edge, rule version, model version, kill switch); asset page (live
-  terms per expiry, min/max/margin inputs); trade page (offer id, rule
-  version, every component).
+  guard edge, rule version, model version, kill switch); Settings page
+  *Pricing engine* card (`PricingSettings.tsx`: every parameter of section
+  11, see there); asset page (live terms per expiry, min/max/margin inputs);
+  trade page (offer id, rule version, every component).
 - Old app builds keep working (section 6.4).
 
 ## 15. Deviations from the owner's specification
@@ -760,7 +817,9 @@ Run from `server-go/` with `GOFLAGS=-p=1`; integration tests need MongoDB
 
 | Package | Tests (pricing-related) |
 |---|---|
-| `./internal/service/pricing/` | `TestSpecWorkedExample`, `TestVolatilitySpike`, `TestExposureBlocksTheLoadedSideOnly`, `TestFinalExposureCheckUsesTheRealPayout`, `TestClampAndFloor`, `TestHedgeUnavailableWidensOrRefuses`, `TestPayoutProperties`, `TestRulesFromDefaults`, `TestHaltFor`, `TestGuard`, `TestDefaultHedgeEstimate`, `TestSourceAllowed`, `TestEmbeddedModel`, `TestComputeFeatures`, `TestComputeFeaturesMomentumSign`, `TestFitLogisticRecoversParameters`, `TestCalibrateEntryOnSyntheticRandomWalk`, `TestCalibrateEntryRefusesShortHistory`, `TestWilsonAndQuantile` |
+| `./internal/service/riskconfig/` | `TestPricingPatchValidation`, `TestPricingPatchApplyKeepsExactValues`, `TestUpdateRiskConfigChecksRuleSymbols` (with the existing `TestValidateConfig`, settlement and early-close tests) |
+| `./internal/api/admin/` | `TestParseRiskPatchAcceptsEveryPricingField`, `TestParseRiskPatchRefusesUnsafePricingValues`, `TestPricingSettingsOverHTTP` |
+| `./internal/service/pricing/` | `TestSpecWorkedExample`, `TestStakeBoundsWithTheInstrumentRule`, `TestVolatilitySpike`, `TestExposureBlocksTheLoadedSideOnly`, `TestFinalExposureCheckUsesTheRealPayout`, `TestClampAndFloor`, `TestHedgeUnavailableWidensOrRefuses`, `TestPayoutProperties`, `TestRulesFromDefaults`, `TestHaltFor`, `TestGuard`, `TestDefaultHedgeEstimate`, `TestSourceAllowed`, `TestEmbeddedModel`, `TestComputeFeatures`, `TestComputeFeaturesMomentumSign`, `TestFitLogisticRecoversParameters`, `TestCalibrateEntryOnSyntheticRandomWalk`, `TestCalibrateEntryRefusesShortHistory`, `TestWilsonAndQuantile` |
 | `./internal/service/marketdata/` | `TestAssessFreshness`, `TestFeedLeaseGatesIngestion`, `TestNormalizationChecksInOrder`, `TestRejectedQuoteNeverChangesState`, `TestOutlierFilter`, `TestPendingOutliersAgeOut`, `TestDuplicateAndOutOfOrderFloods`, `TestProviderOutage`, `TestEWMAVolatility`, `TestIngestionNormalisesAndPersists` |
 | `./internal/service/marketdata/providers/` | `TestBinanceBookTicker`, `TestSimulatedWalk` |
 | `./internal/service/exposure/` | `TestSideLiabilityIsAtomic` |
@@ -769,6 +828,7 @@ Run from `server-go/` with `GOFLAGS=-p=1`; integration tests need MongoDB
 | `./internal/service/settlement/` | the existing suite, unchanged, with the 2 s tolerance |
 | `./internal/api/public/` | `TestPublicMarketsListsOnlyActivePricedAssetsWithoutASession` (and `TestPublicPayoutsAndRange` in `./internal/service/pricing/`) |
 | `client/`, `mobile/` | `tests/live-payout.test.ts` (offer selection, re-quote codes), `tests/landing-markets.test.ts` (landing market list, no figures without the server) |
+| `admin/` | `tests/pricing-settings.test.ts` (exact unit conversions, the patch sent, the checks before sending) |
 
 Spec §16 coverage: calm payout within bounds (`TestSpecWorkedExample`,
 `TestPayoutProperties`); outlier rejection and stale-feed blocking

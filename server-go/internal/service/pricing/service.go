@@ -100,16 +100,29 @@ func feedProviderOf(ctx context.Context, assetID string) string {
 // ReferenceStake is the stake an indicative price is computed for.
 func ReferenceStake(cfg *models.RiskConfig, asset *models.Asset, row *models.PayoutConfig) int64 {
 	s := max(asset.MinStake, cfg.MinTradeAmount, 1)
+	if sr := FindSymbolRule(cfg, asset.Symbol); sr != nil && sr.MinStake > 0 {
+		s = max(s, sr.MinStake)
+	}
 	if row != nil && row.MinStake != nil {
 		s = max(s, *row.MinStake)
 	}
 	return s
 }
 
-// StakeBounds are the effective stake limits of an (asset, expiry).
+// StakeBounds are the effective stake limits of an (asset, expiry): the
+// narrowest of the asset's, the risk configuration's, the instrument rule's
+// (0 = none) and the payout row's.
 func StakeBounds(cfg *models.RiskConfig, asset *models.Asset, row *models.PayoutConfig) (int64, int64) {
 	lo := max(asset.MinStake, cfg.MinTradeAmount)
 	hi := min(asset.MaxStake, cfg.MaxTradeAmount)
+	if sr := FindSymbolRule(cfg, asset.Symbol); sr != nil {
+		if sr.MinStake > 0 {
+			lo = max(lo, sr.MinStake)
+		}
+		if sr.MaxStake > 0 {
+			hi = min(hi, sr.MaxStake)
+		}
+	}
 	if row != nil && row.MinStake != nil {
 		lo = max(lo, *row.MinStake)
 	}

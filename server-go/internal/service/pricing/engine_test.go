@@ -254,6 +254,41 @@ func TestHaltFor(t *testing.T) {
 	}
 }
 
+// The instrument rule's stake range narrows the asset's, the configuration's
+// and the payout row's limits; 0 leaves them as they are.
+func TestStakeBoundsWithTheInstrumentRule(t *testing.T) {
+	cfg := models.DefaultRiskConfig() // 10.00 to 1,00,000.00
+	asset := &models.Asset{Symbol: "BTC/USD", MinStake: 5_00, MaxStake: 200_000_00}
+	i64 := func(v int64) *int64 { return &v }
+	cases := []struct {
+		name             string
+		ruleMin, ruleMax int64
+		row              *models.PayoutConfig
+		lo, hi, ref      int64
+	}{
+		{"no rule limits", 0, 0, nil, 10_00, 100_000_00, 10_00},
+		{"rule narrows both ends", 50_00, 25_000_00, nil, 50_00, 25_000_00, 50_00},
+		{"rule wider than the config changes nothing", 1_00, 500_000_00, nil, 10_00, 100_000_00, 10_00},
+		{"payout row narrows further", 50_00, 25_000_00, &models.PayoutConfig{MinStake: i64(100_00), MaxStake: i64(10_000_00)}, 100_00, 10_000_00, 100_00},
+		{"only a maximum", 0, 2_000_00, nil, 10_00, 2_000_00, 10_00},
+	}
+	for _, c := range cases {
+		cfg.PricingSymbolRules[0].MinStake, cfg.PricingSymbolRules[0].MaxStake = c.ruleMin, c.ruleMax
+		lo, hi := StakeBounds(&cfg, asset, c.row)
+		if lo != c.lo || hi != c.hi {
+			t.Errorf("%s: bounds %d..%d, want %d..%d", c.name, lo, hi, c.lo, c.hi)
+		}
+		if ref := ReferenceStake(&cfg, asset, c.row); ref != c.ref {
+			t.Errorf("%s: reference stake %d, want %d", c.name, ref, c.ref)
+		}
+	}
+	// Another instrument's rule does not apply.
+	cfg.PricingSymbolRules[0].MinStake = 50_00
+	if lo, _ := StakeBounds(&cfg, &models.Asset{Symbol: "ETH/USD", MinStake: 5_00, MaxStake: 200_000_00}, nil); lo != 10_00 {
+		t.Fatalf("ETH/USD took BTC/USD's minimum: %d", lo)
+	}
+}
+
 // ── the calibrated guard ────────────────────────────────────────────────
 
 func guardEntry() *models.PricingModelEntry {

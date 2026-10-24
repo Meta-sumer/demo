@@ -282,7 +282,7 @@ func parseRiskPatch(r *http.Request) (riskconfig.RiskConfigPatch, *string, error
 					continue
 				}
 				fb := &body{f: obj, v: b.v}
-				exp, _ := fb.nestedNum(path, "expirySeconds", numRule{Int: true, Positive: true})
+				exp, _ := fb.nestedNum(path, "expirySeconds", numRule{Int: true, Positive: true, Max: f(86_400)})
 				fac, _ := fb.nestedNum(path, "factor", numRule{Min: f(0.01), Max: f(10)})
 				factors = append(factors, models.PricingExpiryFactor{ExpirySeconds: int64(exp), Factor: fac})
 			}
@@ -319,14 +319,26 @@ func parseRiskPatch(r *http.Request) (riskconfig.RiskConfigPatch, *string, error
 				if raw, ok := rb.get("disabledReason"); ok {
 					sr.DisabledReason, _ = checkStr(b.v, sub(path, "disabledReason"), raw, 0, 200)
 				}
-				sr.BasePayout, _ = rb.nestedNum(path, "basePayout", numRule{Min: f(0.01), Max: f(5)})
-				sr.MinPayout, _ = rb.nestedNum(path, "minPayout", numRule{Min: f(0.005), Max: f(5)})
-				sr.MaxPayout, _ = rb.nestedNum(path, "maxPayout", numRule{Min: f(0.005), Max: f(5)})
+				// Payouts are fractions of the stake, at most 1 (100%);
+				// riskconfig checks min <= base <= max.
+				sr.BasePayout, _ = rb.nestedNum(path, "basePayout", numRule{Min: f(0.01), Max: f(1)})
+				sr.MinPayout, _ = rb.nestedNum(path, "minPayout", numRule{Min: f(0.005), Max: f(1)})
+				sr.MaxPayout, _ = rb.nestedNum(path, "maxPayout", numRule{Min: f(0.005), Max: f(1)})
 				sr.BaselineVol, _ = rb.nestedNum(path, "baselineVol", numRule{Min: f(1e-9), Max: f(0.1)})
 				sr.HedgeCost, _ = rb.nestedNum(path, "hedgeCost", numRule{Min: f(0), Max: f(1)})
 				sr.Margin, _ = rb.nestedNum(path, "margin", numRule{Min: f(0), Max: f(1)})
 				mx, _ := rb.nestedNum(path, "maxExposure", numRule{Int: true, Positive: true})
 				sr.MaxExposure = int64(mx)
+				// Optional stake range, minor units; absent or 0 = no limit
+				// of the instrument's own.
+				if raw, ok := rb.get("minStake"); ok {
+					v, _ := checkNum(b.v, sub(path, "minStake"), raw, numRule{Int: true, Min: f(0)})
+					sr.MinStake = int64(v)
+				}
+				if raw, ok := rb.get("maxStake"); ok {
+					v, _ := checkNum(b.v, sub(path, "maxStake"), raw, numRule{Int: true, Min: f(0)})
+					sr.MaxStake = int64(v)
+				}
 				rules = append(rules, sr)
 			}
 			p.PricingSymbolRules = rules
